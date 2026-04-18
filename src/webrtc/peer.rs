@@ -360,10 +360,23 @@ async fn handle_command(
                 .map_err(|e| anyhow!("accept_offer: {e}"))?;
             let _ = evt_tx.send(PeerEvent::Answer(answer.to_sdp_string()));
         }
-        PeerCommand::RemoteIce(cand) => match Candidate::from_sdp_string(&cand) {
-            Ok(c) => rtc.add_remote_candidate(c),
-            Err(e) => warn!(error = %e, "parse remote candidate"),
-        },
+        PeerCommand::RemoteIce(cand) => {
+            // Chrome hides local IPs behind mDNS `.local` hostnames by default
+            // (chrome://flags/#enable-webrtc-hide-local-ips-with-mdns). str0m's
+            // SDP parser cannot handle these, so silently drop them here and
+            // rely on peer-reflexive candidate learning (the remote peer will
+            // still hit our advertised LAN IPs and we'll learn its real
+            // srcaddr from the incoming STUN binding). Keep warn! for other
+            // parse errors so real issues stay visible.
+            if is_mdns_candidate(&cand) {
+                debug!(candidate = %cand, "ignoring mDNS .local remote candidate (relying on peer-reflexive)");
+            } else {
+                match Candidate::from_sdp_string(&cand) {
+                    Ok(c) => rtc.add_remote_candidate(c),
+                    Err(e) => warn!(error = %e, "parse remote candidate"),
+                }
+            }
+        }
         PeerCommand::WriteVideo(frame) => {
             if let Some(mid) = state.video_mid {
                 let writer = match rtc.writer(mid) {
@@ -487,4 +500,56 @@ struct PeerState {
     control_channel: Option<ChannelId>,
     ice_servers: Vec<IceServer>,
     ice_gather_wait: Duration,
+}
+
+/// Detect Chrome's mDNS-hidden ICE candidates (`xxx.local`).
+///
+/// Format reference (RFC 8839 §5.1):
+///
+/// ```text
+/// candidate:<foundation> <component> <transport> <priority> \
+///     <connection-address> <port> typ <type> ...
+/// ```
+///
+/// The 5th space-separated field is the connection address; if it ends
+/// with `.local` (case-insensitive), it's an mDNS hostname that str0m's
+/// parser cannot resolve.
+fn is_mdns_candidate(sdp_line: &str) -> bool {
+    let line = sdp_line.strip_prefix("candidate:").unwrap_or(sdp_line);
+    line.split_ascii_whitespace()
+        .nth(4)
+        .map(|addr| addr.to_ascii_lowercase().ends_with(".local"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod mdns_tests {
+    use super::is_mdns_candidate;
+
+    #[test]
+    fn detects_mdns_hostname() {
+        let cand = "candidate:2200977846 1 udp 2113937151 \
+            71aada4d-e490-4a53-b326-c39343708736.local 60405 typ host \
+            generation 0 ufrag H2gb network-cost 999";
+        assert!(is_mdns_candidate(cand));
+    }
+
+    #[test]
+    fn detects_mdns_with_prefix() {
+        let cand = "a=candidate:1 1 udp 2113937151 abc.LOCAL 60000 typ host";
+        assert!(is_mdns_candidate(cand.trim_start_matches("a=")));
+    }
+
+    #[test]
+    fn ignores_ipv4_host() {
+        let cand = "candidate:1 1 udp 2113937151 192.168.3.192 60000 typ host";
+        assert!(!is_mdns_candidate(cand));
+    }
+
+    #[test]
+    fn ignores_srflx() {
+        let cand = "candidate:1 1 udp 1677729535 203.0.113.10 50000 typ srflx \
+            raddr 192.168.1.2 rport 60000";
+        assert!(!is_mdns_candidate(cand));
+    }
 }

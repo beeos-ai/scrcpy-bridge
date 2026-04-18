@@ -125,6 +125,13 @@ base64 = "0.22"
 # UUID generation for request nonces.
 uuid = { version = "1.10", features = ["v4"] }
 
+# Enumerate local network interfaces so we can advertise real LAN IPs as
+# ICE host candidates even when bound to 0.0.0.0. Without this, browsers
+# that use mDNS (.local) candidates (Chrome/Safari default) can't
+# reach a loopback-only bridge, because str0m rejects mDNS hostnames on
+# the remote side. `if-addrs` is a tiny pure-Rust crate with no deps.
+if-addrs = "0.13"
+
 [dev-dependencies]
 tokio = { version = "1.41", features = ["full", "test-util"] }
 pretty_assertions = "1.4"

@@ -230,7 +230,7 @@ impl Bridge {
         }
 
         // 4. Spawn WebRTC peer.
-        let extra_local_ips = self
+        let mut extra_local_ips = self
             .cli
             .public_ips
             .iter()
@@ -243,6 +243,44 @@ impl Bridge {
                 }
             })
             .collect::<Vec<_>>();
+
+        // Auto-enumerate local interfaces when the operator didn't pin a
+        // specific set via --public-ips. This is the critical path for
+        // same-LAN / same-host dev: Chrome/Safari replace their real IPs
+        // with `.local` mDNS candidates, which str0m 0.9 refuses to
+        // parse. Unless we advertise a concrete LAN IP the browser can
+        // reach us at, the ICE agent never completes connectivity
+        // checks and the peer silently goes to Disconnected after ~20s.
+        // Skipping IPv6 link-local (fe80::/10) and loopback — the
+        // wildcard-fallback in run_peer already covers 127.0.0.1.
+        if extra_local_ips.is_empty() {
+            match if_addrs::get_if_addrs() {
+                Ok(ifaces) => {
+                    for iface in ifaces {
+                        let ip = iface.ip();
+                        if ip.is_loopback() || ip.is_unspecified() {
+                            continue;
+                        }
+                        if let std::net::IpAddr::V6(v6) = ip {
+                            // Link-local IPv6 requires a zone id which str0m's
+                            // Candidate API doesn't carry — skip to avoid
+                            // ICE_bad_candidate warnings downstream.
+                            let seg = v6.segments()[0];
+                            if (seg & 0xffc0) == 0xfe80 {
+                                continue;
+                            }
+                        }
+                        extra_local_ips.push(ip);
+                    }
+                    if extra_local_ips.is_empty() {
+                        warn!("no non-loopback interfaces found; WebRTC will only work over loopback");
+                    } else {
+                        info!(count = extra_local_ips.len(), ips = ?extra_local_ips, "auto-enumerated host candidate IPs");
+                    }
+                }
+                Err(e) => warn!(error = %e, "failed to enumerate interfaces for host candidates"),
+            }
+        }
         // Snapshot the currently-valid ICE servers. Primary source is the
         // Agent Gateway bootstrap response (Runtime TURN pool); CLI
         // `--ice-urls` only fills in when bootstrap was empty or when a
