@@ -69,11 +69,14 @@ jobs:
       - name: Package archive
         id: pack
         shell: bash
+        # Archive name is intentionally version-less so that the BeeOS CLI
+        # can resolve it via `/releases/latest/download/<name>` without
+        # first fetching the latest tag. See
+        # web/packages/core/src/runtime/scrcpy-bridge.ts:archiveName().
         run: |
-          ver="${{ needs.plan.outputs.version }}"
           bin="scrcpy-bridge"
           if [[ "${{ matrix.target }}" == *windows* ]]; then bin="scrcpy-bridge.exe"; fi
-          stage="scrcpy-bridge-${ver}-${{ matrix.target }}"
+          stage="scrcpy-bridge-${{ matrix.target }}"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/dist/${bin}" "$stage/"
           cp README.md LICENSE 2>/dev/null "$stage/" || true

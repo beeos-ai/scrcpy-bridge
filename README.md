@@ -73,23 +73,27 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 Release artifacts are produced on every `scrcpy-bridge-v*` git tag by the
 workflow in `.github/workflows/release.yml`:
 
-| Target                          | Artifact                                      | Consumer                   |
-|---------------------------------|-----------------------------------------------|----------------------------|
-| `x86_64-unknown-linux-gnu`      | `scrcpy-bridge-<ver>-*.tar.gz` (GitHub)        | Linux servers, edge-agent  |
-| `aarch64-unknown-linux-gnu`     | `…tar.gz`                                     | ARM64 Linux, Raspberry Pi  |
-| `x86_64-unknown-linux-musl`     | `…tar.gz` (static)                            | Alpine, distroless         |
-| `aarch64-unknown-linux-musl`    | `…tar.gz` (static)                            | ARM64 Alpine / distroless  |
-| `x86_64-apple-darwin`           | `…tar.gz`                                     | macOS Intel dev            |
-| `aarch64-apple-darwin`          | `…tar.gz`                                     | macOS Apple Silicon dev    |
-| `x86_64-pc-windows-msvc`        | `…zip`                                        | Windows dev                |
-| `ghcr.io/beeos-ai/scrcpy-bridge:<ver>` | distroless OCI image (amd64 + arm64)   | ReDroid Kubernetes sidecar |
+| Target                          | Artifact                                          | Consumer                   |
+|---------------------------------|---------------------------------------------------|----------------------------|
+| `x86_64-unknown-linux-gnu`      | `scrcpy-bridge-x86_64-unknown-linux-gnu.tar.gz`   | Linux servers, edge-agent  |
+| `aarch64-unknown-linux-gnu`     | `scrcpy-bridge-aarch64-unknown-linux-gnu.tar.gz`  | ARM64 Linux, Raspberry Pi  |
+| `x86_64-unknown-linux-musl`     | `scrcpy-bridge-x86_64-unknown-linux-musl.tar.gz`  | Alpine, distroless         |
+| `aarch64-unknown-linux-musl`    | `scrcpy-bridge-aarch64-unknown-linux-musl.tar.gz` | ARM64 Alpine / distroless  |
+| `x86_64-apple-darwin`           | `scrcpy-bridge-x86_64-apple-darwin.tar.gz`        | macOS Intel dev            |
+| `aarch64-apple-darwin`          | `scrcpy-bridge-aarch64-apple-darwin.tar.gz`       | macOS Apple Silicon dev    |
+| `x86_64-pc-windows-msvc`        | `scrcpy-bridge-x86_64-pc-windows-msvc.zip`        | Windows dev                |
+| `ghcr.io/beeos-ai/scrcpy-bridge:<ver>` | distroless OCI image (amd64 + arm64)       | ReDroid docker-compose / K8s sidecar |
+
+Archives are version-less by design so the BeeOS CLI can resolve them via
+`https://github.com/beeos-ai/scrcpy-bridge/releases/latest/download/<name>`
+without first fetching the latest tag.
 
 `@beeos-ai/cli` (`beeos device attach` / `beeos device upgrade`) resolves the
 binary in this order:
 `$BEEOS_SCRCPY_BRIDGE_BIN` → `scrcpy-bridge` on `PATH` → `~/.beeos/bin/scrcpy-bridge`.
 
 On first attach, if no binary is found the CLI downloads the matching
-`cargo-dist` archive from `https://github.com/beeos-ai/beeos/releases/latest`
+`cargo-dist` archive from `https://github.com/beeos-ai/scrcpy-bridge/releases/latest`
 and extracts it to `~/.beeos/bin/scrcpy-bridge[.exe]`. Mirror override:
 set `BEEOS_SCRCPY_BRIDGE_RELEASE_URL` to a base URL that serves the same
 `scrcpy-bridge-<target-triple>.{tar.gz,zip}` file names. `beeos device upgrade`
