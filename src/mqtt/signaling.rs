@@ -1,0 +1,319 @@
+//! MQTT-based WebRTC signaling client.
+//!
+//! Supports hot credential rotation: when the bootstrap refresher hands us a
+//! new broker URL/JWT via [`MqttSignaling::reconnect`], the internal event
+//! loop task is shut down and a fresh one is started with the new creds,
+//! while the externally-visible `mpsc::Receiver<SignalRequest>` stays alive.
+//! This lets the bridge rebuild the MQTT connection without losing its
+//! position in the signaling pipeline or having to re-register handlers.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use rumqttc::{AsyncClient, ClientError, Event, MqttOptions, Packet, QoS, Transport};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+use url::Url;
+
+use crate::observability::MQTT_RECONNECTS_TOTAL;
+
+#[derive(Debug, Clone)]
+pub struct MqttSignalingConfig {
+    pub broker_url: String,
+    pub username: String,
+    /// RS256 JWT string.
+    pub token: String,
+    /// MQTT topic prefix as issued by Runtime via the Agent Gateway
+    /// bootstrap response (field `deviceTopic`). Looks like
+    /// `devices/device-<instanceUUID>` — no trailing slash. All signaling
+    /// and telemetry topics are built by appending a sub-path to this
+    /// value. Do NOT confuse this with the bare instance ID; EMQX's JWT
+    /// ACL is scoped to exactly this prefix and any mismatch is rejected.
+    pub topic_prefix: String,
+    pub client_id: String,
+}
+
+/// Credentials subset used by [`MqttSignaling::reconnect`]. Everything else
+/// (client_id, device_id) is immutable for the lifetime of the bridge and
+/// stays on the struct itself.
+#[derive(Debug, Clone)]
+pub struct MqttCredentials {
+    pub broker_url: String,
+    pub username: String,
+    pub token: String,
+}
+
+/// Signaling request as it appears on the wire. Matches the Python / browser
+/// JSON shape exactly.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SignalRequest {
+    /// SDP offer from the browser.
+    Offer {
+        sdp: String,
+    },
+    /// Trickle ICE candidate from the browser.
+    Ice {
+        candidate: serde_json::Value,
+    },
+    /// Browser asked us to close the peer (optional).
+    Close {
+        #[serde(default)]
+        reason: String,
+    },
+}
+
+/// Response to publish on `signaling/response`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SignalResponse {
+    Answer { sdp: String },
+    Ice { candidate: serde_json::Value },
+}
+
+/// Client + shutdown handle for a single rumqttc AsyncClient lifetime.
+struct Session {
+    client: AsyncClient,
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+pub struct MqttSignaling {
+    inner: Arc<RwLock<Option<Session>>>,
+    topic_prefix: String,
+    client_id: String,
+    sig_tx: mpsc::Sender<SignalRequest>,
+}
+
+impl MqttSignaling {
+    /// Connect to the broker and return (signaling, request_rx).
+    ///
+    /// `request_rx` yields browser → device signaling messages parsed from
+    /// JSON. The caller uses [`MqttSignaling::publish_response`] for the
+    /// reverse path. When the underlying credentials expire the caller
+    /// should invoke [`MqttSignaling::reconnect`] which preserves
+    /// `request_rx`.
+    pub async fn connect(
+        cfg: MqttSignalingConfig,
+    ) -> Result<(Self, mpsc::Receiver<SignalRequest>)> {
+        if cfg.topic_prefix.trim().is_empty() {
+            return Err(anyhow!("MqttSignalingConfig.topic_prefix must not be empty"));
+        }
+        let (sig_tx, rx) = mpsc::channel::<SignalRequest>(32);
+        let session = start_session(
+            MqttCredentials {
+                broker_url: cfg.broker_url,
+                username: cfg.username,
+                token: cfg.token,
+            },
+            cfg.client_id.clone(),
+            cfg.topic_prefix.clone(),
+            sig_tx.clone(),
+        )
+        .await?;
+
+        Ok((
+            Self {
+                inner: Arc::new(RwLock::new(Some(session))),
+                topic_prefix: cfg.topic_prefix,
+                client_id: cfg.client_id,
+                sig_tx,
+            },
+            rx,
+        ))
+    }
+
+    /// Swap in fresh credentials. Internally:
+    ///   1. Signal the current event loop task to exit.
+    ///   2. Await its teardown (bounded by a short grace period).
+    ///   3. Start a new session with the new creds, re-subscribing to the
+    ///      same signaling topic.
+    ///
+    /// The externally-visible `Receiver<SignalRequest>` returned by
+    /// [`connect`] stays alive throughout. Publishes that race the swap
+    /// (e.g. an Answer emitted during the gap) will either succeed on the
+    /// fresh client or be dropped with a `warn!` — the browser's retry logic
+    /// handles the latter.
+    pub async fn reconnect(&self, creds: MqttCredentials) -> Result<()> {
+        MQTT_RECONNECTS_TOTAL.inc();
+        let new_session = start_session(
+            creds,
+            self.client_id.clone(),
+            self.topic_prefix.clone(),
+            self.sig_tx.clone(),
+        )
+        .await?;
+
+        let old = { self.inner.write().await.replace(new_session) };
+        if let Some(old) = old {
+            // Best-effort teardown. rumqttc's eventloop reacts to
+            // `AsyncClient::disconnect` by surfacing an error on the next
+            // `poll()`, which our task treats as a clean exit.
+            let _ = old.client.disconnect().await;
+            let _ = old.shutdown.send(());
+            // Give the task up to 2s to finish; beyond that we abort to
+            // avoid leaking the connection.
+            if tokio::time::timeout(Duration::from_secs(2), old.task).await.is_err() {
+                warn!("previous MQTT task did not exit cleanly within 2s");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn publish_response(&self, resp: &SignalResponse) -> Result<()> {
+        let topic = format!("{}/signaling/response", self.topic_prefix);
+        let payload = serde_json::to_vec(resp).context("encode signaling response")?;
+        let guard = self.inner.read().await;
+        let client = guard
+            .as_ref()
+            .map(|s| s.client.clone())
+            .ok_or_else(|| anyhow!("mqtt not connected"))?;
+        drop(guard);
+        client
+            .publish(topic, QoS::AtLeastOnce, false, payload)
+            .await
+            .map_err(|e: ClientError| anyhow!("mqtt publish: {e}"))
+    }
+
+    /// Publish generic device info or telemetry.
+    pub async fn publish_json(&self, suffix: &str, value: &serde_json::Value) -> Result<()> {
+        let topic = format!("{}/{}", self.topic_prefix, suffix);
+        let payload = serde_json::to_vec(value).context("encode mqtt json")?;
+        let guard = self.inner.read().await;
+        let client = guard
+            .as_ref()
+            .map(|s| s.client.clone())
+            .ok_or_else(|| anyhow!("mqtt not connected"))?;
+        drop(guard);
+        client
+            .publish(topic, QoS::AtMostOnce, false, payload)
+            .await
+            .map_err(|e: ClientError| anyhow!("mqtt publish: {e}"))
+    }
+}
+
+/// Build rumqttc options, connect, spawn the event-loop task, subscribe to
+/// the signaling topic. Extracted so both `connect` and `reconnect` share
+/// identical logic.
+async fn start_session(
+    creds: MqttCredentials,
+    client_id: String,
+    topic_prefix: String,
+    sig_tx: mpsc::Sender<SignalRequest>,
+) -> Result<Session> {
+    let url = Url::parse(&creds.broker_url).context("parse MQTT_URL")?;
+    let scheme = url.scheme().to_lowercase();
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("MQTT_URL missing host"))?
+        .to_string();
+    let port = url.port().unwrap_or(match scheme.as_str() {
+        "mqtt" => 1883,
+        "mqtts" => 8883,
+        "ws" => 80,
+        "wss" => 443,
+        _ => return Err(anyhow!("unsupported MQTT scheme {scheme}")),
+    });
+
+    // rumqttc 0.24 quirk: for TCP/TLS transports `MqttOptions::new(id, host, port)`
+    // wants a bare hostname; for Ws/Wss it instead treats `broker_addr` as a
+    // full URL and feeds it directly into `tungstenite::client::IntoClientRequest`
+    // via `split_url` (see rumqttc-0.24 src/eventloop.rs). Passing just the host
+    // there produces `Invalid Url: Couldn't parse host from url.` every poll.
+    let broker_addr = match scheme.as_str() {
+        "ws" | "wss" => {
+            let path = url.path();
+            let path = if path.is_empty() || path == "/" {
+                "/mqtt"
+            } else {
+                path
+            };
+            format!("{scheme}://{host}:{port}{path}")
+        }
+        _ => host,
+    };
+
+    let mut opts = MqttOptions::new(client_id, broker_addr, port);
+    opts.set_credentials(creds.username, creds.token);
+    opts.set_keep_alive(Duration::from_secs(30));
+    opts.set_clean_session(true);
+    opts.set_max_packet_size(1024 * 1024, 1024 * 1024);
+
+    match scheme.as_str() {
+        "mqtts" => {
+            opts.set_transport(Transport::tls_with_default_config());
+        }
+        "wss" => {
+            opts.set_transport(Transport::wss_with_default_config());
+        }
+        "ws" => {
+            opts.set_transport(Transport::Ws);
+        }
+        "mqtt" => {
+            opts.set_transport(Transport::Tcp);
+        }
+        _ => unreachable!(),
+    }
+
+    let (client, mut eventloop) = AsyncClient::new(opts, 64);
+
+    let request_topic = format!("{}/signaling/request", topic_prefix);
+    client
+        .subscribe(&request_topic, QoS::AtLeastOnce)
+        .await
+        .context("mqtt subscribe")?;
+    info!(topic = %request_topic, "subscribed to MQTT signaling");
+
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let topic_for_log = topic_prefix.clone();
+    let expected_topic = request_topic.clone();
+
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    info!(topic_prefix = %topic_for_log, "mqtt event loop received shutdown signal");
+                    return;
+                }
+                evt = eventloop.poll() => {
+                    match evt {
+                        Ok(Event::Incoming(Packet::Publish(p))) => {
+                            if p.topic != expected_topic {
+                                continue;
+                            }
+                            match serde_json::from_slice::<SignalRequest>(&p.payload) {
+                                Ok(req) => {
+                                    if sig_tx.send(req).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        topic_prefix = %topic_for_log,
+                                        error = %e,
+                                        raw = %String::from_utf8_lossy(&p.payload),
+                                        "invalid signaling payload"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(e) => {
+                            warn!(error = %e, "MQTT eventloop error, waiting before retry");
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(Session {
+        client,
+        shutdown: shutdown_tx,
+        task,
+    })
+}

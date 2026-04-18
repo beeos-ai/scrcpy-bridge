@@ -1,0 +1,5 @@
+/target
+/assets/scrcpy-server.jar
+Cargo.lock.bak
+*.swp
+.DS_Store

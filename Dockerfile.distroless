@@ -1,0 +1,72 @@
+############################
+# Stage 1 — cargo builder (musl static)
+############################
+#
+# We build a fully static musl binary so the runtime image can be
+# `gcr.io/distroless/static` — no libc / ssl / openjdk needed.
+#
+FROM --platform=$BUILDPLATFORM rust:1.82-alpine AS builder
+
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static \
+        ca-certificates curl bash
+
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+      amd64)  echo "x86_64-unknown-linux-musl"  > /tmp/rust_target ;; \
+      arm64)  echo "aarch64-unknown-linux-musl" > /tmp/rust_target ;; \
+      *)      echo "unsupported arch ${TARGETARCH}" && exit 1 ;; \
+    esac
+
+RUN rustup target add "$(cat /tmp/rust_target)"
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock* rust-toolchain.toml build.rs ./
+COPY src ./src
+COPY assets ./assets
+
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --profile dist --locked --bin scrcpy-bridge \
+        --target "$(cat /tmp/rust_target)" \
+    && cp "target/$(cat /tmp/rust_target)/dist/scrcpy-bridge" /out/scrcpy-bridge \
+    || (mkdir -p /out && cp "target/$(cat /tmp/rust_target)/dist/scrcpy-bridge" /out/scrcpy-bridge)
+
+############################
+# Stage 2 — adb runtime (separate so we can copy just the binary)
+############################
+#
+# scrcpy-bridge shells out to `adb`. distroless has no apk, so we grab
+# the android-tools-static adb binary from Alpine and copy it in.
+#
+FROM alpine:3.20 AS adb
+
+RUN apk add --no-cache android-tools
+
+############################
+# Stage 3 — distroless runtime
+############################
+FROM gcr.io/distroless/static-debian12:nonroot
+
+ARG VERSION=dev
+LABEL org.opencontainers.image.source="https://github.com/beeos-ai/beeos" \
+      org.opencontainers.image.title="scrcpy-bridge" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="MIT"
+
+COPY --from=builder /out/scrcpy-bridge /usr/local/bin/scrcpy-bridge
+COPY --from=adb /usr/bin/adb /usr/local/bin/adb
+# Required shared libs for adb (distroless static has only ca-certificates).
+COPY --from=adb /lib/ld-musl-*.so.1 /lib/
+COPY --from=adb /usr/lib/libusb-1.0.so.0 /usr/lib/
+
+ENV ADB_HOST=127.0.0.1 \
+    ADB_PORT=5037 \
+    METRICS_PORT=9091 \
+    LOG_FORMAT=json
+
+EXPOSE 9091
+
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/scrcpy-bridge"]
