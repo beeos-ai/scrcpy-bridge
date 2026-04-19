@@ -29,7 +29,7 @@ pub mod protocol;
 pub mod server;
 pub mod video;
 
-pub use audio::AudioPacket;
+pub use audio::{AudioPacket, AudioReader};
 pub use control::ControlSocket;
-pub use server::{ScrcpyServer, ScrcpyServerConfig};
+pub use server::{ScrcpyServer, ScrcpyServerConfig, ScrcpySessionParts, ScrcpyShutdown};
 pub use video::{VideoFrame, VideoReader};

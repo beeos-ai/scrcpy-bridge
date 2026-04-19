@@ -173,6 +173,25 @@ pub struct Cli {
     #[arg(long, env = "BRIDGE_PUBLIC_KEY_FILE")]
     pub bridge_public_key_file: String,
 
+    /// Wheel-to-scroll sensitivity multiplier applied to the *coalesced*
+    /// browser wheel delta (one accumulated send per physical gesture —
+    /// see the device-viewer `InputHandler` state machine) before it is
+    /// clamped to scrcpy's scroll intensity ceiling (`±0.3`, see
+    /// `datachannel::wheel_to_scroll`).
+    ///
+    /// The client is responsible for gesture shaping — it folds 30 ms of
+    /// initial impulse into a single send — so the server no longer
+    /// compensates for rapid-fire events and just treats its input as
+    /// linear raw wheel delta. A 1-notch wheel click (`|dy|≈100`) at
+    /// `sensitivity=1.0` produces `|sy|≈0.83` which the `±0.3` ceiling
+    /// caps to `0.3` — exactly the empirically-measured "one page flip"
+    /// magnitude on page-snap apps (TikTok / Douyin / Reels). Lower the
+    /// sensitivity if inputs feel too aggressive; raise the cap in
+    /// `wheel_to_scroll` only if target apps genuinely need higher
+    /// per-event intensity.
+    #[arg(long, env = "SCROLL_SENSITIVITY", default_value_t = 1.0)]
+    pub scroll_sensitivity: f32,
+
     /// Seconds before JWT expiry to refresh. Default 60s.
     #[arg(long, env = "JWT_REFRESH_LEAD_SECS", default_value_t = 60)]
     pub jwt_refresh_lead_secs: u64,

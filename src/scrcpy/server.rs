@@ -5,6 +5,7 @@
 //! but written in Rust so the critical H.264 path never decodes/re-encodes.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -211,6 +212,65 @@ impl ScrcpyServer {
 
     /// Graceful shutdown: kill the adb subprocess and clear the forward rule.
     pub async fn stop(&mut self) {
+        let mut shutdown = ScrcpyShutdown {
+            process: self.process.take(),
+            stderr_log: self.stderr_log.take(),
+            adb: self.adb.clone(),
+            local_port: self.local_port,
+        };
+        self.local_port = 0;
+        shutdown.shutdown().await;
+    }
+
+    /// Decompose a running scrcpy session into the three independently
+    /// owned I/O halves plus a shutdown handle. After this call the
+    /// `ScrcpyServer` is consumed; callers must move the returned parts
+    /// into their respective tasks and call `ScrcpyShutdown::shutdown`
+    /// exactly once when the session is being torn down.
+    pub fn split(mut self) -> ScrcpySessionParts {
+        let video = self.video.take();
+        let audio = self.audio.take();
+        let control = self.control.take().map(Arc::new);
+        let shutdown = ScrcpyShutdown {
+            process: self.process.take(),
+            stderr_log: self.stderr_log.take(),
+            adb: self.adb.clone(),
+            local_port: self.local_port,
+        };
+        // `self` is dropped here; `Child` has `kill_on_drop(true)`, but we
+        // zero `process` out above so the real reaping happens through
+        // `ScrcpyShutdown::shutdown` (which also waits, logs, and clears
+        // the adb forward). Drop of the empty `ScrcpyServer` is a no-op.
+        ScrcpySessionParts {
+            video,
+            audio,
+            control,
+            shutdown,
+        }
+    }
+}
+
+/// Result of [`ScrcpyServer::split`]. Each field moves into the task that
+/// owns it; `shutdown` moves into the session supervisor.
+pub struct ScrcpySessionParts {
+    pub video: Option<VideoReader>,
+    pub audio: Option<AudioReader>,
+    pub control: Option<Arc<ControlSocket>>,
+    pub shutdown: ScrcpyShutdown,
+}
+
+/// Owns the pieces that must be torn down when a session ends: the
+/// `adb shell app_process` child, its stderr pump, and the reverse-forward
+/// rule. Safe to call `shutdown()` exactly once.
+pub struct ScrcpyShutdown {
+    process: Option<Child>,
+    stderr_log: Option<JoinHandle<()>>,
+    adb: Adb,
+    local_port: u16,
+}
+
+impl ScrcpyShutdown {
+    pub async fn shutdown(&mut self) {
         if let Some(mut p) = self.process.take() {
             let _ = p.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(3), p.wait()).await;
@@ -220,6 +280,7 @@ impl ScrcpyServer {
         }
         if self.local_port != 0 {
             let _ = self.adb.remove_forward(self.local_port).await;
+            self.local_port = 0;
         }
     }
 }

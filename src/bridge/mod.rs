@@ -15,8 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::adb::Adb;
@@ -30,17 +32,97 @@ use crate::mqtt::{
     MqttCredentials, MqttSignaling, MqttSignalingConfig, SignalRequest, SignalResponse,
 };
 use crate::observability::{
-    HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, CONTROL_MESSAGES_TOTAL,
-    SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_TOTAL, VIEWER_BITRATE_BPS,
-    VIEWER_CONNECTED, VIEWER_FPS, VIEWER_PACKETS_LOST, VIEWER_RTT_MS,
+    HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, CONTROL_MESSAGES_TOTAL, PLI_COUNT_TOTAL,
+    SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED, VIDEO_FRAMES_TOTAL,
+    VIEWER_BITRATE_BPS, VIEWER_CONNECTED, VIEWER_FPS, VIEWER_PACKETS_LOST, VIEWER_RTT_MS,
 };
 use crate::scrcpy::protocol::{KeyAction, TouchAction};
-use crate::scrcpy::{ScrcpyServer, ScrcpyServerConfig};
+use crate::scrcpy::{
+    AudioReader, ControlSocket, ScrcpyServer, ScrcpyServerConfig, ScrcpyShutdown, VideoReader,
+};
 use crate::webrtc::{IceServer, PeerEvent, PeerOptions, WebRtcPeer};
 
 /// MQTT username expected by the EMQX JWT auth plugin. All device-scoped
 /// connections log in as `device`; the JWT payload carries the true identity.
 const MQTT_USERNAME: &str = "device";
+
+/// How long we keep a scrcpy session + str0m peer alive after the viewer
+/// appears to be gone (ICE disconnected/failed, or explicit `Close`
+/// request). Inside this window:
+///
+///   * a subsequent `Offer` from the same `viewer_id` is handled as a
+///     cheap ICE restart on the existing `WebRtcPeer` — no scrcpy bounce,
+///     no black frame;
+///   * an `Offer` from a different `viewer_id` (or timeout) tears down
+///     the stale session first, restoring the "most recent viewer wins"
+///     semantics.
+///
+/// 30 s is a sweet spot: long enough to survive `window.onbeforeunload`
+/// + page reload, wifi handoff, tab backgrounding on mobile Safari; short
+/// enough that a real device abandonment doesn't pin the encoder.
+const SESSION_GRACE: Duration = Duration::from_secs(30);
+
+/// Control messages the event pump fires into `Bridge::run`'s main loop
+/// so the grace-timer state machine lives in exactly one place. The
+/// event pump is per-session and must not own grace state directly — it
+/// only knows viewer identity and health transitions.
+#[derive(Debug)]
+enum BridgeInternalEvent {
+    /// Peer reached `Connected` (or came back after an ICE blip). The
+    /// main loop clears grace if it was armed for the matching viewer.
+    ViewerConnected { viewer_id: String },
+    /// Peer observed something that might turn into session death:
+    /// `IceConnectionState::Disconnected` (transient) or `Failed`
+    /// (requires ICE restart to recover). The main loop arms / extends
+    /// the grace window; no teardown happens unless the window expires.
+    ViewerUnhealthy {
+        viewer_id: String,
+        reason: &'static str,
+    },
+    /// The named viewer's session is being (or has already been) torn
+    /// down deliberately — by a newer viewer replacing it (`on_offer`
+    /// kick path) or by scrcpy dying underneath it (`run_video_pump`
+    /// video-eof). The main loop uses this to drop any grace window
+    /// still pointing at the dead viewer so it can't expire later and
+    /// accidentally shut down a freshly installed session belonging
+    /// to someone else.
+    ClearGraceFor { viewer_id: String },
+}
+
+/// Grace-window state held locally by `Bridge::run`. Never shared
+/// beyond the main loop.
+struct SessionGrace {
+    viewer_id: String,
+    deadline: tokio::time::Instant,
+    reason: &'static str,
+}
+
+fn arm_grace(slot: &mut Option<SessionGrace>, viewer_id: String, reason: &'static str) {
+    let deadline = tokio::time::Instant::now() + SESSION_GRACE;
+    match slot {
+        Some(g) if g.viewer_id == viewer_id => {
+            // Extend the existing window — repeated health signals for
+            // the same viewer reset the clock so a viewer that keeps
+            // flapping doesn't get kicked out by our grace timer.
+            g.deadline = deadline;
+            g.reason = reason;
+            debug!(viewer = %g.viewer_id, %reason, "extended session grace");
+        }
+        _ => {
+            info!(
+                viewer = %viewer_id,
+                %reason,
+                grace_secs = SESSION_GRACE.as_secs(),
+                "armed session grace — holding scrcpy + peer for reconnection"
+            );
+            *slot = Some(SessionGrace {
+                viewer_id,
+                deadline,
+                reason,
+            });
+        }
+    }
+}
 
 pub struct Bridge {
     cli: Cli,
@@ -124,46 +206,187 @@ impl Bridge {
             .await
             .context("start bootstrap refresher")?;
 
-        // 4. Peer state (one active peer + one active scrcpy session at a time).
-        //    The scrcpy encoder config lives in its own Arc so the DataChannel
+        // 4. Session state (one active session at a time).
+        //
+        //    A `Session` bundles the peer, the scrcpy control sender, the
+        //    spawned tasks (video/audio/event pump) and a `CancellationToken`
+        //    that lets us tear all three down atomically. Starting a new
+        //    session first cancels + joins the previous one, guaranteeing
+        //    no zombie tasks ever touch a reborn scrcpy socket.
+        //
+        //    The encoder config lives in its own Arc so the DataChannel
         //    `configure` handler can mutate it between sessions (G8 hot
         //    reconfigure). Every `on_offer` snapshots this Arc when spawning
         //    a new ScrcpyServer.
-        let peer_slot: Arc<Mutex<Option<WebRtcPeer>>> = Arc::new(Mutex::new(None));
-        let scrcpy_slot: Arc<Mutex<Option<ScrcpyServer>>> = Arc::new(Mutex::new(None));
+        let current_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
         let scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>> =
             Arc::new(RwLock::new(self.initial_scrcpy_config()));
 
-        while let Some(req) = sig_rx.recv().await {
-            match req {
-                SignalRequest::Offer { sdp } => {
-                    if let Err(e) = self
-                        .on_offer(sdp, &mqtt, &peer_slot, &scrcpy_slot, &scrcpy_cfg)
-                        .await
-                    {
-                        error!(error = %e, "handle offer failed");
-                    }
+        // Health signals from the per-session event pump flow through a
+        // single mpsc so grace-window decisions live in one place. Cloned
+        // into each new `run_event_pump` via `on_offer`.
+        let (internal_tx, mut internal_rx) = mpsc::channel::<BridgeInternalEvent>(16);
+        let mut grace: Option<SessionGrace> = None;
+
+        loop {
+            // `sleep_until` on a missing grace blocks forever; we want
+            // the branch to never fire in that case. Using `pending`
+            // keeps `select!` polling only the real inputs.
+            let grace_fire = async {
+                match grace.as_ref() {
+                    Some(g) => tokio::time::sleep_until(g.deadline).await,
+                    None => std::future::pending::<()>().await,
                 }
-                SignalRequest::Ice { candidate } => {
-                    let peer = peer_slot.lock().await;
-                    if let Some(peer) = peer.as_ref() {
-                        if let Some(cand_str) = candidate_as_string(&candidate) {
-                            let _ = peer.add_remote_ice(cand_str).await;
+            };
+
+            tokio::select! {
+                biased;
+
+                _ = grace_fire => {
+                    if let Some(g) = grace.take() {
+                        // Verify the active session still belongs to
+                        // the viewer whose grace we armed. Between
+                        // arming and expiry a different viewer may
+                        // have replaced the session via `on_offer`,
+                        // and we must NOT tear that one down. The
+                        // `on_offer` kick path also sends
+                        // `ClearGraceFor` to pre-empt this race, but
+                        // this check is the authoritative safety net.
+                        let mut guard = current_session.lock().await;
+                        let owned = guard
+                            .as_ref()
+                            .map(|s| s.viewer_id == g.viewer_id)
+                            .unwrap_or(false);
+                        if owned {
+                            if let Some(session) = guard.take() {
+                                drop(guard);
+                                info!(
+                                    viewer = %g.viewer_id,
+                                    reason = %g.reason,
+                                    "session grace expired — shutting down scrcpy"
+                                );
+                                session.shutdown().await;
+                                self.health.scrcpy_running.store(false, Ordering::Relaxed);
+                                SCRCPY_RUNNING.set(0);
+                                VIEWER_CONNECTED.set(0);
+                            }
+                        } else {
+                            info!(
+                                viewer = %g.viewer_id,
+                                reason = %g.reason,
+                                "grace expired but session ownership changed — no teardown"
+                            );
                         }
-                    } else {
-                        warn!("ICE candidate received before peer was created");
                     }
                 }
-                SignalRequest::Close { reason } => {
-                    info!(%reason, "browser requested close");
-                    if let Some(peer) = peer_slot.lock().await.take() {
-                        peer.close().await;
+
+                maybe_ev = internal_rx.recv() => {
+                    let Some(ev) = maybe_ev else {
+                        // Dropped only at process shutdown; exit cleanly.
+                        break;
+                    };
+                    match ev {
+                        BridgeInternalEvent::ViewerConnected { viewer_id } => {
+                            if matches!(&grace, Some(g) if g.viewer_id == viewer_id) {
+                                info!(viewer = %viewer_id, "viewer healthy again — cancelling grace");
+                                grace = None;
+                            }
+                        }
+                        BridgeInternalEvent::ViewerUnhealthy { viewer_id, reason } => {
+                            // Only arm grace if this viewer is still the
+                            // owner of the active session. A stale event
+                            // for an already-replaced viewer would keep
+                            // the new viewer's session on the hook.
+                            let still_owner = {
+                                let guard = current_session.lock().await;
+                                guard.as_ref().map(|s| s.viewer_id == viewer_id).unwrap_or(false)
+                            };
+                            if still_owner {
+                                arm_grace(&mut grace, viewer_id, reason);
+                            }
+                        }
+                        BridgeInternalEvent::ClearGraceFor { viewer_id } => {
+                            if matches!(&grace, Some(g) if g.viewer_id == viewer_id) {
+                                info!(
+                                    viewer = %viewer_id,
+                                    "grace cleared — owning viewer is being torn down deliberately"
+                                );
+                                grace = None;
+                            }
+                        }
                     }
-                    if let Some(mut s) = scrcpy_slot.lock().await.take() {
-                        s.stop().await;
+                }
+
+                maybe_req = sig_rx.recv() => {
+                    let Some(req) = maybe_req else { break; };
+                    match req {
+                        SignalRequest::Offer { sdp, viewer_id } => {
+                            // Offer arriving inside our grace window
+                            // for the same viewer cancels it — the
+                            // viewer is driving a successful recovery.
+                            if matches!(&grace, Some(g) if g.viewer_id == viewer_id) {
+                                info!(viewer = %viewer_id, "offer arrived inside grace window — cancelling grace");
+                                grace = None;
+                            }
+                            if let Err(e) = self
+                                .on_offer(
+                                    viewer_id,
+                                    sdp,
+                                    &mqtt,
+                                    &current_session,
+                                    &scrcpy_cfg,
+                                    internal_tx.clone(),
+                                )
+                                .await
+                            {
+                                error!(error = format!("{:#}", e), "handle offer failed");
+                            }
+                        }
+                        SignalRequest::Ice { candidate } => {
+                            let guard = current_session.lock().await;
+                            if let Some(session) = guard.as_ref() {
+                                if let Some(cand_str) = candidate_as_string(&candidate) {
+                                    let _ = session.peer.add_remote_ice(cand_str).await;
+                                }
+                            } else {
+                                warn!("ICE candidate received before peer was created");
+                            }
+                        }
+                        SignalRequest::Close { reason, viewer_id } => {
+                            // Don't tear down immediately — a viewer
+                            // "close" is frequently followed by an
+                            // automatic reconnect (page nav, tab
+                            // switch, mobile backgrounding). Arm grace
+                            // so the scrcpy encoder survives.
+                            //
+                            // Filter by viewer_id when the payload
+                            // carries one: a stale tab closing after
+                            // it was already replaced must NOT arm
+                            // grace against the live session.
+                            let owner = {
+                                let guard = current_session.lock().await;
+                                guard.as_ref().map(|s| s.viewer_id.clone())
+                            };
+                            match owner {
+                                Some(v) => {
+                                    if !viewer_id.is_empty() && viewer_id != v {
+                                        info!(
+                                            %reason,
+                                            close_viewer = %viewer_id,
+                                            session_viewer = %v,
+                                            "stale viewer close — ignoring"
+                                        );
+                                    } else {
+                                        info!(%reason, viewer = %v, "viewer close — entering session grace");
+                                        arm_grace(&mut grace, v, "viewer close");
+                                    }
+                                }
+                                None => {
+                                    info!(%reason, "viewer close received but no active session");
+                                }
+                            }
+                        }
                     }
-                    self.health.scrcpy_running.store(false, Ordering::Relaxed);
-                    SCRCPY_RUNNING.set(0);
                 }
             }
         }
@@ -190,46 +413,269 @@ impl Bridge {
 
     async fn on_offer(
         &self,
+        viewer_id: String,
         offer_sdp: String,
         mqtt: &Arc<MqttSignaling>,
-        peer_slot: &Arc<Mutex<Option<WebRtcPeer>>>,
-        scrcpy_slot: &Arc<Mutex<Option<ScrcpyServer>>>,
+        current_session: &Arc<Mutex<Option<Session>>>,
         scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
+        internal_tx: mpsc::Sender<BridgeInternalEvent>,
     ) -> Result<()> {
-        info!("received WebRTC offer");
-        // Replace any existing peer (page refresh or another viewer). Send
-        // `viewer_kicked` first so the previous browser surfaces a clear
-        // reason in its UI instead of an opaque connection close.
-        if let Some(p) = peer_slot.lock().await.take() {
-            let _ = p
-                .send_control_text(datachannel::build_viewer_kicked("replaced by another viewer"))
-                .await;
-            // Small delay so the kicked notice actually ships before the
-            // peer tears down.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            p.close().await;
-        }
+        info!(viewer = %viewer_id, "received WebRTC offer");
 
-        // 3. Ensure scrcpy is running.
-        let mut scrcpy_guard = scrcpy_slot.lock().await;
-        if scrcpy_guard.is_none() {
-            let adb = Adb {
-                serial: self.cli.adb_serial.clone(),
-                host: self.cli.adb_host.clone(),
-                port: self.cli.adb_port,
+        // Fast path — same viewer, live peer:
+        //   * The viewer side just re-ran `createOffer({iceRestart:
+        //     true})` after detecting unhealthy (A2) or as part of a
+        //     recovery from within our grace window.
+        //   * str0m's `sdp_api().accept_offer` detects the new
+        //     ice-ufrag/ice-pwd and performs a proper ICE restart
+        //     without touching the DTLS session or the media track
+        //     assignments, so there is zero black frame and no scrcpy
+        //     bounce.
+        //
+        // Eligibility: non-empty viewer id (legacy viewers that
+        // predate B3 sent empty strings and must not cross-contaminate
+        // sessions) AND the viewer is still the owner of the current
+        // session. str0m 0.9 has no "unrecoverable" state we can
+        // check — if accept_offer itself fails we fall through to
+        // the replace path below (Fix B).
+        if !viewer_id.is_empty() {
+            let peer_opt = {
+                let guard = current_session.lock().await;
+                guard
+                    .as_ref()
+                    .filter(|s| s.viewer_id == viewer_id)
+                    .map(|s| s.peer.clone())
             };
-            // Snapshot the current encoder config. Any DataChannel
-            // `configure` applied while we were idle is picked up here.
-            let cfg_snapshot = scrcpy_cfg.read().await.clone();
-            let mut server = ScrcpyServer::new(adb, cfg_snapshot);
-            server.start().await.context("start scrcpy server")?;
-            self.health.scrcpy_running.store(true, Ordering::Relaxed);
-            SCRCPY_RUNNING.set(1);
-            SCRCPY_RECONNECTS_TOTAL.inc();
-            *scrcpy_guard = Some(server);
+            if let Some(peer) = peer_opt {
+                info!(
+                    viewer = %viewer_id,
+                    "same-viewer offer → ICE restart on existing peer (scrcpy preserved)"
+                );
+                // Clone the SDP so the replace path below can still
+                // consume it if str0m refuses the fast-path offer
+                // (e.g. the peer is in a state the SDP-state-machine
+                // can't reconcile). String clone is negligible vs.
+                // the alternative of losing a recovery opportunity.
+                match peer.accept_offer(offer_sdp.clone()).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        warn!(
+                            viewer = %viewer_id,
+                            error = %e,
+                            "fast-path accept_offer failed — falling back to full session rebuild"
+                        );
+                        // Fall through to the replace path below.
+                        // The next block takes current_session, which
+                        // will kick this (now-wedged) peer + scrcpy
+                        // and spawn a fresh session — same semantics
+                        // as a different-viewer takeover.
+                    }
+                }
+            }
         }
 
-        // 4. Spawn WebRTC peer.
+        // Replace any existing session. Two distinct cases land here:
+        //
+        //   1. Different viewer taking over (`old.viewer_id != viewer_id`).
+        //      The previous browser is still live and needs to be told
+        //      explicitly why its session died — otherwise it would
+        //      just see its DataChannel disappear and schedule endless
+        //      reconnect attempts. Send `viewer_kicked` so its UI can
+        //      surface the real reason.
+        //
+        //   2. Same viewer rebuilding after fast-path `accept_offer`
+        //      refused to reconcile (`old.viewer_id == viewer_id`, see
+        //      the fall-through comment above). This is the client's
+        //      own ICE-restart retry hitting a wedged str0m peer — it
+        //      is already waiting on MQTT for the answer to its new
+        //      offer, and the "old" peer is the exact same browser tab.
+        //      Sending `viewer_kicked` here would make the browser
+        //      flip into its terminal `kicked` state ("Another viewer
+        //      has connected — this session has ended") and ignore the
+        //      fresh answer we're about to publish, stranding the user.
+        //      For this case we MUST rebuild silently: the client will
+        //      receive the new answer and seamlessly resume.
+        //
+        // Either way we atomically cancel + join + shut down the scrcpy
+        // side before starting the new session. This guarantees no
+        // zombie task ever touches a reborn scrcpy socket.
+        if let Some(old) = current_session.lock().await.take() {
+            // Invalidate any grace window still pointing at the old
+            // viewer — otherwise, if A was in grace and B just took
+            // over, A's grace timer would expire later and shut down
+            // B's freshly installed session (see the ownership check
+            // in the `grace_fire` branch for the matching safety net).
+            let _ = internal_tx
+                .send(BridgeInternalEvent::ClearGraceFor {
+                    viewer_id: old.viewer_id.clone(),
+                })
+                .await;
+            if old.viewer_id != viewer_id {
+                info!(
+                    old_viewer = %old.viewer_id,
+                    new_viewer = %viewer_id,
+                    "different viewer takeover — notifying old browser via viewer_kicked"
+                );
+                let _ = old
+                    .peer
+                    .send_control_text(datachannel::build_viewer_kicked(
+                        "replaced by another viewer",
+                    ))
+                    .await;
+                // Give the DataChannel a moment to flush the kick
+                // payload before we rip the peer down.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } else {
+                info!(
+                    viewer = %viewer_id,
+                    "same-viewer rebuild (fast-path unavailable) — silent teardown, no kick"
+                );
+            }
+            old.shutdown().await;
+        }
+
+        // 1. Start a fresh scrcpy session. Every offer gets a clean
+        //    app_process + sockets — simpler invariants and matches how
+        //    the Python agent behaves.
+        let adb = Adb {
+            serial: self.cli.adb_serial.clone(),
+            host: self.cli.adb_host.clone(),
+            port: self.cli.adb_port,
+        };
+        let cfg_snapshot = scrcpy_cfg.read().await.clone();
+        let mut server = ScrcpyServer::new(adb, cfg_snapshot);
+        server.start().await.context("start scrcpy server")?;
+        self.health.scrcpy_running.store(true, Ordering::Relaxed);
+        SCRCPY_RUNNING.set(1);
+        SCRCPY_RECONNECTS_TOTAL.inc();
+
+        let parts = server.split();
+        let video_reader = parts.video;
+        let audio_reader = parts.audio;
+        let control_sender = parts.control;
+        let mut shutdown = parts.shutdown;
+
+        // 2. Spawn WebRTC peer.
+        //
+        // Fallibility budget: once `server.start()` above succeeds we
+        // hold a live `app_process` child + an adb reverse-forward
+        // rule. Any `?`-propagated failure from here on (peer spawn
+        // refused by str0m, accept_offer rejected the SDP, ...) must
+        // reap them before returning, or the next offer's
+        // `ScrcpyServer::new + start` would collide on the same adb
+        // forward port. The async block consolidates the two fallible
+        // ops so there's a single cleanup site.
+        let construct = async {
+            let extra_local_ips = self.resolve_extra_local_ips();
+            let ice_servers = self.ice_servers.read().await.clone();
+            let peer_opts = PeerOptions {
+                ice_servers,
+                local_bind: "0.0.0.0:0".parse().unwrap(),
+                extra_local_ips,
+                ice_gather_wait: Duration::from_millis(self.cli.ice_gather_wait_ms),
+            };
+            let peer = WebRtcPeer::spawn(peer_opts)?;
+            peer.accept_offer(offer_sdp).await?;
+            anyhow::Ok(peer)
+        };
+        let peer = match construct.await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    error = format!("{:#}", e),
+                    viewer = %viewer_id,
+                    "new session construction failed — reaping scrcpy server + adb forward"
+                );
+                shutdown.shutdown().await;
+                self.health.scrcpy_running.store(false, Ordering::Relaxed);
+                SCRCPY_RUNNING.set(0);
+                return Err(e);
+            }
+        };
+
+        // 3. Per-session plumbing.
+        let cancel = CancellationToken::new();
+        let mut tasks: JoinSet<()> = JoinSet::new();
+
+        // 3a. Event pump: peer -> MQTT + control forwarding + PLI handling.
+        {
+            let peer_for_evt = peer.clone();
+            let mqtt_evt = mqtt.clone();
+            let control_for_evt = control_sender.clone();
+            let scrcpy_cfg_for_evt = scrcpy_cfg.clone();
+            let health = self.health.clone();
+            let session_flag_for_evt = current_session.clone();
+            let cancel_for_evt = cancel.clone();
+            let scroll_sensitivity = self.cli.scroll_sensitivity;
+            let viewer_for_evt = viewer_id.clone();
+            let internal_tx_for_evt = internal_tx.clone();
+            tasks.spawn(async move {
+                run_event_pump(
+                    peer_for_evt,
+                    mqtt_evt,
+                    control_for_evt,
+                    scrcpy_cfg_for_evt,
+                    session_flag_for_evt,
+                    health,
+                    cancel_for_evt,
+                    scroll_sensitivity,
+                    viewer_for_evt,
+                    internal_tx_for_evt,
+                )
+                .await;
+            });
+        }
+
+        // 3b. Video pump: scrcpy VideoReader -> peer RTP.
+        if let Some(reader) = video_reader {
+            let peer_for_video = peer.clone();
+            let cancel_for_video = cancel.clone();
+            let session_flag_for_video = current_session.clone();
+            let viewer_for_video = viewer_id.clone();
+            let internal_tx_for_video = internal_tx.clone();
+            tasks.spawn(async move {
+                run_video_pump(
+                    reader,
+                    peer_for_video,
+                    cancel_for_video,
+                    session_flag_for_video,
+                    viewer_for_video,
+                    internal_tx_for_video,
+                )
+                .await;
+            });
+        } else {
+            warn!("scrcpy video socket was not open — session starts without video");
+        }
+
+        // 3c. Audio pump: scrcpy AudioReader -> peer RTP.
+        if let Some(reader) = audio_reader {
+            let peer_for_audio = peer.clone();
+            let cancel_for_audio = cancel.clone();
+            tasks.spawn(async move {
+                run_audio_pump(reader, peer_for_audio, cancel_for_audio).await;
+            });
+        }
+
+        // Suppress the unused-binding lint: control_sender lives only via
+        // the `Arc` clone captured by the event pump; when that task exits
+        // (on `cancel`), the last clone drops and the drainer aborts.
+        drop(control_sender);
+
+        *current_session.lock().await = Some(Session {
+            viewer_id,
+            peer,
+            cancel,
+            tasks,
+            shutdown,
+        });
+        Ok(())
+    }
+
+    /// Resolve the concrete IPs to advertise as ICE host candidates. Prefers
+    /// operator-pinned `--public-ips`; otherwise enumerates local interfaces
+    /// (skipping loopback + IPv6 link-local, which str0m can't parse).
+    fn resolve_extra_local_ips(&self) -> Vec<std::net::IpAddr> {
         let mut extra_local_ips = self
             .cli
             .public_ips
@@ -244,15 +690,6 @@ impl Bridge {
             })
             .collect::<Vec<_>>();
 
-        // Auto-enumerate local interfaces when the operator didn't pin a
-        // specific set via --public-ips. This is the critical path for
-        // same-LAN / same-host dev: Chrome/Safari replace their real IPs
-        // with `.local` mDNS candidates, which str0m 0.9 refuses to
-        // parse. Unless we advertise a concrete LAN IP the browser can
-        // reach us at, the ICE agent never completes connectivity
-        // checks and the peer silently goes to Disconnected after ~20s.
-        // Skipping IPv6 link-local (fe80::/10) and loopback — the
-        // wildcard-fallback in run_peer already covers 127.0.0.1.
         if extra_local_ips.is_empty() {
             match if_addrs::get_if_addrs() {
                 Ok(ifaces) => {
@@ -262,9 +699,6 @@ impl Bridge {
                             continue;
                         }
                         if let std::net::IpAddr::V6(v6) = ip {
-                            // Link-local IPv6 requires a zone id which str0m's
-                            // Candidate API doesn't carry — skip to avoid
-                            // ICE_bad_candidate warnings downstream.
                             let seg = v6.segments()[0];
                             if (seg & 0xffc0) == 0xfe80 {
                                 continue;
@@ -281,183 +715,7 @@ impl Bridge {
                 Err(e) => warn!(error = %e, "failed to enumerate interfaces for host candidates"),
             }
         }
-        // Snapshot the currently-valid ICE servers. Primary source is the
-        // Agent Gateway bootstrap response (Runtime TURN pool); CLI
-        // `--ice-urls` only fills in when bootstrap was empty or when a
-        // local dev operator explicitly added an extra STUN/TURN entry.
-        // See `merge_ice_servers` for the merge rules.
-        let ice_servers = self.ice_servers.read().await.clone();
-        let peer_opts = PeerOptions {
-            ice_servers,
-            local_bind: "0.0.0.0:0".parse().unwrap(),
-            extra_local_ips,
-            ice_gather_wait: Duration::from_millis(self.cli.ice_gather_wait_ms),
-        };
-        let peer = WebRtcPeer::spawn(peer_opts)?;
-        peer.accept_offer(offer_sdp).await?;
-
-        // 5. Pump events from the peer → MQTT + scrcpy.
-        let mut evt_rx = peer.subscribe();
-        let mqtt_evt = mqtt.clone();
-        let scrcpy_for_ctrl = scrcpy_slot.clone();
-        let scrcpy_cfg_for_ctrl = scrcpy_cfg.clone();
-        let peer_for_reply = peer.clone();
-        let health = self.health.clone();
-        tokio::spawn(async move {
-            while let Ok(evt) = evt_rx.recv().await {
-                match evt {
-                    PeerEvent::Answer(sdp) => {
-                        if let Err(e) = mqtt_evt
-                            .publish_response(&SignalResponse::Answer { sdp })
-                            .await
-                        {
-                            warn!(error = %e, "publish answer");
-                        }
-                    }
-                    PeerEvent::LocalIce(cand) => {
-                        let payload = serde_json::json!({
-                            "candidate": cand,
-                            "sdpMid": "0",
-                            "sdpMLineIndex": 0,
-                        });
-                        if let Err(e) = mqtt_evt
-                            .publish_response(&SignalResponse::Ice { candidate: payload })
-                            .await
-                        {
-                            warn!(error = %e, "publish local ice");
-                        }
-                    }
-                    PeerEvent::Connected => {
-                        VIEWER_CONNECTED.set(1);
-                        info!("viewer connected");
-                    }
-                    PeerEvent::Disconnected => {
-                        VIEWER_CONNECTED.set(0);
-                        info!("viewer disconnected");
-                    }
-                    PeerEvent::ControlMessage(text) => {
-                        if let Err(e) = forward_control(
-                            &text,
-                            &scrcpy_for_ctrl,
-                            &scrcpy_cfg_for_ctrl,
-                            &peer_for_reply,
-                            &health,
-                        )
-                        .await
-                        {
-                            warn!(error = %e, "forward control");
-                        }
-                    }
-                    PeerEvent::Error(e) => {
-                        warn!(%e, "peer error event");
-                    }
-                }
-            }
-        });
-
-        // 6. Pump video frames from scrcpy → peer (H.264 AUs).
-        let scrcpy_for_video = scrcpy_slot.clone();
-        let peer_for_video = peer.clone();
-        let scrcpy_for_video_cleanup = scrcpy_slot.clone();
-        tokio::spawn(async move {
-            let start = Instant::now();
-            let exit_reason: &'static str = loop {
-                let mut guard = scrcpy_for_video.lock().await;
-                let Some(server) = guard.as_mut() else {
-                    break "scrcpy-gone";
-                };
-                let Some(video) = server.video.as_mut() else {
-                    drop(guard);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                };
-                let frame = match video.next_frame().await {
-                    Ok(Some(f)) => f,
-                    Ok(None) => {
-                        info!("scrcpy video socket closed");
-                        break "video-eof";
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "video read error");
-                        break "video-error";
-                    }
-                };
-                drop(guard);
-                let kind = if frame.is_config {
-                    "config"
-                } else if frame.is_keyframe {
-                    "keyframe"
-                } else {
-                    "delta"
-                };
-                VIDEO_FRAMES_TOTAL.with_label_values(&[kind]).inc();
-                if let Err(e) = peer_for_video.write_video(frame).await {
-                    warn!(error = %e, "peer write_video");
-                    break "peer-write-error";
-                }
-                // Keep tokio scheduler happy.
-                if start.elapsed() > Duration::from_secs(86400) {
-                    break "soak-reset";
-                }
-            };
-
-            // scrcpy pipeline died. Tell the browser to reset its session
-            // without counting against the reconnect budget, and drop the
-            // now-stale ScrcpyServer so the next offer spins up a fresh
-            // one (push jar + reverse tunnel + app_process launch).
-            if matches!(exit_reason, "video-eof" | "video-error") {
-                let _ = peer_for_video
-                    .send_control_text(datachannel::build_stream_restarted())
-                    .await;
-            }
-            if let Some(mut server) = scrcpy_for_video_cleanup.lock().await.take() {
-                let _ = server.stop().await;
-            }
-            SCRCPY_RUNNING.set(0);
-            debug!(reason = exit_reason, "video pump exited");
-        });
-
-        // 7. Pump OPUS audio packets from scrcpy → peer DataChannel (binary).
-        //    The browser-side `AudioPlayer` (see
-        //    `web/packages/device-viewer/src/audio-player.ts`) consumes these
-        //    as `event.data: ArrayBuffer` and feeds them into WebCodecs.
-        //    If the audio socket isn't available (disabled by device), we
-        //    simply exit the task quietly.
-        let scrcpy_for_audio = scrcpy_slot.clone();
-        let peer_for_audio = peer.clone();
-        tokio::spawn(async move {
-            loop {
-                let mut guard = scrcpy_for_audio.lock().await;
-                let Some(server) = guard.as_mut() else {
-                    break;
-                };
-                let Some(audio) = server.audio.as_mut() else {
-                    // Audio disabled or not connected — exit cleanly without
-                    // spinning.
-                    break;
-                };
-                let pkt = match audio.next_packet().await {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        info!("scrcpy audio socket closed");
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "audio read error");
-                        break;
-                    }
-                };
-                drop(guard);
-                let kind = if pkt.is_config { "config" } else { "data" };
-                AUDIO_PACKETS_TOTAL.with_label_values(&[kind]).inc();
-                if !peer_for_audio.try_send_control_binary(pkt.data) {
-                    AUDIO_PACKETS_DROPPED.inc();
-                }
-            }
-        });
-
-        *peer_slot.lock().await = Some(peer);
-        Ok(())
+        extra_local_ips
     }
 
     /// Pull credentials from Agent Gateway's `/api/v1/device/bootstrap`.
@@ -656,15 +914,319 @@ fn mask_broker(url: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Session plumbing
+// ---------------------------------------------------------------------------
+
+/// Grouping of everything that belongs to a single browser connection. The
+/// `Bridge::run` main loop holds at most one `Session` at a time and drops
+/// the previous one (via `shutdown()`) before starting a new one, so three
+/// invariants always hold:
+///
+/// 1. scrcpy sockets have exactly one reader/writer task each;
+/// 2. cancelling the token causes all spawned tasks to exit on the next
+///    await point (they all `select!` on `cancel.cancelled()`);
+/// 3. scrcpy process is reaped after — not before — its readers have
+///    observed EOF and exited.
+pub(crate) struct Session {
+    /// Stable per-browser identifier, echoed back by the viewer on
+    /// every Offer. Used by the grace-window state machine to
+    /// distinguish "same viewer reconnecting" (keep scrcpy) from
+    /// "different viewer stealing the device" (kick + rebuild).
+    viewer_id: String,
+    peer: WebRtcPeer,
+    cancel: CancellationToken,
+    tasks: JoinSet<()>,
+    shutdown: ScrcpyShutdown,
+}
+
+impl Session {
+    /// Cancel all tasks, wait for them to exit, then tear down scrcpy.
+    /// After returning, the underlying adb forward rule is cleared and
+    /// the scrcpy `app_process` has been reaped.
+    pub(crate) async fn shutdown(mut self) {
+        self.cancel.cancel();
+        // Close the peer synchronously (this drops the str0m Rtc, which
+        // also drops the UDP socket — unblocking any reader task).
+        self.peer.close().await;
+        // Drain tasks; they each race a `cancel.cancelled()` branch.
+        while self.tasks.join_next().await.is_some() {}
+        self.shutdown.shutdown().await;
+    }
+}
+
+/// Pump peer events out to MQTT, back into scrcpy control (PLI → reset_video,
+/// DataChannel control messages → touches/keys/etc), and surface connection
+/// state changes to the observability layer.
+async fn run_event_pump(
+    peer: WebRtcPeer,
+    mqtt: Arc<MqttSignaling>,
+    control: Option<Arc<ControlSocket>>,
+    scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
+    current_session: Arc<Mutex<Option<Session>>>,
+    health: HealthFlags,
+    cancel: CancellationToken,
+    scroll_sensitivity: f32,
+    viewer_id: String,
+    internal_tx: mpsc::Sender<BridgeInternalEvent>,
+) {
+    let mut evt_rx = peer.subscribe();
+    // Browsers emit PLI roughly every 200 ms after any packet loss. Scrcpy
+    // needs ~1 encode cycle to emit a new IDR, so we rate-limit how often
+    // we actually poke the device. The `StreamReady` edge is NOT subject
+    // to this throttle — it fires exactly once per ICE session and is
+    // what gets the very first frame on screen without waiting for PLI.
+    const PLI_THROTTLE: Duration = Duration::from_millis(200);
+    let mut last_reset_video = Instant::now() - Duration::from_secs(5);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                debug!("event pump cancelled");
+                return;
+            }
+            recv = evt_rx.recv() => {
+                let evt = match recv {
+                    Ok(e) => e,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(lagged = n, "event pump lagged");
+                        continue;
+                    }
+                };
+                match evt {
+                    PeerEvent::Answer(sdp) => {
+                        if let Err(e) = mqtt.publish_response(&SignalResponse::Answer { sdp }).await {
+                            warn!(error = %e, "publish answer");
+                        }
+                    }
+                    PeerEvent::LocalIce(cand) => {
+                        let payload = serde_json::json!({
+                            "candidate": cand,
+                            "sdpMid": "0",
+                            "sdpMLineIndex": 0,
+                        });
+                        if let Err(e) = mqtt
+                            .publish_response(&SignalResponse::Ice { candidate: payload })
+                            .await
+                        {
+                            warn!(error = %e, "publish local ice");
+                        }
+                    }
+                    PeerEvent::Connected => {
+                        VIEWER_CONNECTED.set(1);
+                        // Clear any stale grace decision for this
+                        // viewer — we're healthy again.
+                        info!(viewer = %viewer_id, "viewer connected");
+                        let _ = internal_tx
+                            .send(BridgeInternalEvent::ViewerConnected {
+                                viewer_id: viewer_id.clone(),
+                            })
+                            .await;
+                    }
+                    PeerEvent::StreamReady => {
+                        // ICE is up AND the video mid is negotiated. We used
+                        // to proactively call `reset_video` here to prime an
+                        // IDR, but scrcpy's Controller.resetVideo() triggers
+                        // SurfaceCapture.invalidate(), which NPEs if the
+                        // capture's CaptureListener has not attached yet — a
+                        // startup race we lose ~100% of the time because
+                        // `server.start()` returns as soon as the sockets
+                        // accept, well before the capture pipeline is wired.
+                        //
+                        // This is also just unnecessary: every `on_offer`
+                        // boots a fresh scrcpy process whose very first
+                        // emitted NAL unit is an IDR keyframe. So the first
+                        // frame is already a keyframe without any prompting.
+                        // Mid-stream keyframe recovery is handled by the
+                        // `KeyframeRequested` (PLI) branch below, which
+                        // fires only after capture is fully initialized.
+                        debug!("stream ready — relying on natural initial IDR");
+                    }
+                    PeerEvent::Disconnected => {
+                        VIEWER_CONNECTED.set(0);
+                        info!(viewer = %viewer_id, "viewer ICE disconnected");
+                        // str0m 0.9 does not distinguish transient vs
+                        // fatal ICE failure — both collapse to the
+                        // single `Disconnected` event here. We don't
+                        // touch the session ourselves; the grace
+                        // timer armed by the main loop is the only
+                        // arbiter of teardown. If the same viewer
+                        // comes back with a new offer, on_offer's
+                        // fast path tries an ICE restart and falls
+                        // back to a full rebuild iff str0m refuses.
+                        let _ = internal_tx
+                            .send(BridgeInternalEvent::ViewerUnhealthy {
+                                viewer_id: viewer_id.clone(),
+                                reason: "ice disconnected",
+                            })
+                            .await;
+                    }
+                    PeerEvent::ControlMessage(text) => {
+                        if let Err(e) =
+                            forward_control(&text, control.as_ref(), &scrcpy_cfg, &peer, &health,
+                                &current_session, scroll_sensitivity).await
+                        {
+                            warn!(error = %e, "forward control");
+                        }
+                    }
+                    PeerEvent::KeyframeRequested => {
+                        PLI_COUNT_TOTAL.inc();
+                        let now = Instant::now();
+                        if now.duration_since(last_reset_video) < PLI_THROTTLE {
+                            continue;
+                        }
+                        last_reset_video = now;
+                        if let Some(ctrl) = control.as_ref() {
+                            info!("PLI received — asking scrcpy for keyframe");
+                            if let Err(e) = ctrl.reset_video().await {
+                                warn!(error = %e, "scrcpy reset_video on PLI");
+                            }
+                        }
+                    }
+                    PeerEvent::Error(e) => {
+                        warn!(%e, "peer error event");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Pump H.264 NAL units from scrcpy's video socket into the WebRTC peer as
+/// native RTP. Keyframe and codec-config frames block until accepted (they
+/// are correctness-critical); delta frames fall back to drop-newest so a
+/// temporarily slow peer task never backs up the device-side encoder.
+async fn run_video_pump(
+    mut reader: VideoReader,
+    peer: WebRtcPeer,
+    cancel: CancellationToken,
+    current_session: Arc<Mutex<Option<Session>>>,
+    viewer_id: String,
+    internal_tx: mpsc::Sender<BridgeInternalEvent>,
+) {
+    let exit_reason: &'static str = loop {
+        let frame = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break "cancelled",
+            next = reader.next_frame() => match next {
+                Ok(Some(f)) => f,
+                Ok(None) => break "video-eof",
+                Err(e) => {
+                    warn!(error = %e, "video read error");
+                    break "video-error";
+                }
+            }
+        };
+
+        let kind = if frame.is_config {
+            "config"
+        } else if frame.is_keyframe {
+            "keyframe"
+        } else {
+            "delta"
+        };
+        VIDEO_FRAMES_TOTAL.with_label_values(&[kind]).inc();
+
+        // Keyframes and SPS/PPS config packets MUST reach the peer — losing
+        // them would strand the decoder until the next IDR interval.
+        // Delta frames are eligible for drop-newest backpressure: if the
+        // peer command queue happens to be full at this moment, skipping
+        // one P-frame produces at most one visual glitch and the decoder
+        // recovers on the next keyframe.
+        let must_deliver = frame.is_keyframe || frame.is_config;
+        if must_deliver {
+            if let Err(e) = peer.write_video(frame).await {
+                warn!(error = %e, "peer write_video (keyframe/config)");
+                break "peer-write-error";
+            }
+        } else if !peer.try_write_video(frame) {
+            VIDEO_FRAMES_DROPPED.with_label_values(&["queue_full"]).inc();
+        }
+    };
+
+    // scrcpy video pipeline ended. Only tell the browser to reset its
+    // session when the scrcpy side itself went away; `cancelled` means
+    // the supervisor is tearing us down on purpose (page refresh / new
+    // offer) and the browser already knows.
+    if matches!(exit_reason, "video-eof" | "video-error") {
+        let _ = peer
+            .send_control_text(datachannel::build_stream_restarted())
+            .await;
+        // Invalidate any grace window still pointing at this viewer —
+        // the session we would have held onto during grace is gone,
+        // so a future same-viewer offer must go through the full
+        // rebuild path. Without this, grace could expire ~30 s later
+        // and (through the ownership check) log spuriously or — if a
+        // new viewer has replaced us — just be a noisy no-op.
+        let _ = internal_tx
+            .send(BridgeInternalEvent::ClearGraceFor {
+                viewer_id: viewer_id.clone(),
+            })
+            .await;
+        // Drop the whole session so the next offer spawns a clean one.
+        if let Some(session) = current_session.lock().await.take() {
+            // Avoid blocking the current task on its own JoinSet join
+            // (we're inside one of the joined tasks) — spawn the shutdown.
+            tokio::spawn(async move {
+                session.shutdown().await;
+            });
+        }
+        SCRCPY_RUNNING.set(0);
+    }
+    debug!(reason = exit_reason, "video pump exited");
+}
+
+/// Pump Opus packets from scrcpy's audio socket into the WebRTC peer as
+/// native RTP. Audio is always drop-newest: a stale 20 ms Opus frame has
+/// no audible value, and the backlog latency it would introduce is worse
+/// than the single-packet gap. Config (OpusHead) is filtered inside the
+/// peer task since that's where codec knowledge lives.
+async fn run_audio_pump(
+    mut reader: AudioReader,
+    peer: WebRtcPeer,
+    cancel: CancellationToken,
+) {
+    loop {
+        let pkt = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                debug!("audio pump cancelled");
+                return;
+            }
+            next = reader.next_packet() => match next {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    info!("scrcpy audio socket closed");
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, "audio read error");
+                    return;
+                }
+            }
+        };
+
+        let kind = if pkt.is_config { "config" } else { "data" };
+        AUDIO_PACKETS_TOTAL.with_label_values(&[kind]).inc();
+        if !peer.try_write_audio(pkt) {
+            AUDIO_PACKETS_DROPPED.inc();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 /// Translate a browser DataChannel message into scrcpy control socket calls
 /// or metrics updates. `peer` is used to send replies (pong, ack) back.
 async fn forward_control(
     text: &str,
-    scrcpy_slot: &Arc<Mutex<Option<ScrcpyServer>>>,
+    control: Option<&Arc<ControlSocket>>,
     scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
     peer: &WebRtcPeer,
     _health: &HealthFlags,
+    current_session: &Arc<Mutex<Option<Session>>>,
+    scroll_sensitivity: f32,
 ) -> Result<()> {
     let msg = datachannel::parse(text.as_bytes())?;
     let kind = msg_kind(&msg);
@@ -758,8 +1320,14 @@ async fn forward_control(
             let _ = peer
                 .send_control_text(datachannel::build_stream_restarted())
                 .await;
-            if let Some(mut s) = scrcpy_slot.lock().await.take() {
-                s.stop().await;
+            if let Some(session) = current_session.lock().await.take() {
+                // Session::shutdown cancels tasks and reaps scrcpy. The
+                // browser's `stream_restarted` handler reconnects shortly
+                // after and picks up the fresh encoder config on the
+                // next offer.
+                tokio::spawn(async move {
+                    session.shutdown().await;
+                });
             }
             SCRCPY_RUNNING.set(0);
             return Ok(());
@@ -767,11 +1335,7 @@ async fn forward_control(
         _ => {}
     }
 
-    let guard = scrcpy_slot.lock().await;
-    let Some(server) = guard.as_ref() else {
-        return Ok(());
-    };
-    let Some(control) = server.control.as_ref() else {
+    let Some(control) = control else {
         return Ok(());
     };
 
@@ -799,7 +1363,8 @@ async fn forward_control(
             screen_width,
             screen_height,
         } => {
-            let (sx, sy) = datachannel::wheel_to_scroll(dx, dy, 1.0);
+            let (sx, sy) = datachannel::wheel_to_scroll(dx, dy, scroll_sensitivity);
+            debug!(dx, dy, sx, sy, scroll_sensitivity, "scroll");
             let _ = control
                 .inject_scroll(x, y, screen_width.max(1), screen_height.max(1), sx, sy)
                 .await;
@@ -898,6 +1463,7 @@ mod tests {
             agent_gateway_url: "http://127.0.0.1:1".into(),
             bridge_private_key_file: String::new(),
             bridge_public_key_file: String::new(),
+            scroll_sensitivity: 1.0,
             jwt_refresh_lead_secs: 60,
             jwt_refresh_min_interval_secs: 30,
         }

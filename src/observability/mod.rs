@@ -31,6 +31,19 @@ pub static VIDEO_FRAMES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static VIDEO_FRAMES_DROPPED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        prometheus::Opts::new(
+            "scrcpy_bridge_video_frames_dropped_total",
+            "H.264 frames dropped by the bridge before reaching the WebRTC peer",
+        ),
+        &["reason"], // queue_full
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 pub static CONTROL_MESSAGES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         prometheus::Opts::new(
@@ -80,7 +93,7 @@ pub static AUDIO_PACKETS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 pub static AUDIO_PACKETS_DROPPED: Lazy<prometheus::IntCounter> = Lazy::new(|| {
     let c = prometheus::IntCounter::new(
         "scrcpy_bridge_audio_packets_dropped_total",
-        "OPUS audio packets dropped because the DataChannel backpressure queue was full",
+        "OPUS audio packets dropped by the bridge before reaching the WebRTC peer (drop-newest backpressure on the RTP path)",
     )
     .unwrap();
     REGISTRY.register(Box::new(c.clone())).unwrap();
@@ -165,11 +178,9 @@ pub static SCRCPY_RECONNECTS_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| 
     c
 });
 
-/// Cumulative count of RTCP PLI (Picture Loss Indication) messages received
-/// from the browser. str0m 0.9 doesn't surface PLI events through the public
-/// API we use today, so this is wired up as a zero counter for now — it keeps
-/// the metric visible in dashboards so alerts can be authored ahead of time
-/// and will light up once the str0m RTCP event plumbing lands in Phase 3.
+/// Cumulative count of RTCP PLI (Picture Loss Indication) / FIR messages
+/// received from the browser. Incremented in the bridge event pump on
+/// `PeerEvent::KeyframeRequested`.
 pub static PLI_COUNT_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
     let c = prometheus::IntCounter::new(
         "scrcpy_bridge_pli_count_total",
@@ -185,6 +196,7 @@ pub static PLI_COUNT_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
 /// to author against counters that always exist (even at value 0).
 pub fn init_metrics() {
     Lazy::force(&VIDEO_FRAMES_TOTAL);
+    Lazy::force(&VIDEO_FRAMES_DROPPED);
     Lazy::force(&CONTROL_MESSAGES_TOTAL);
     Lazy::force(&VIEWER_CONNECTED);
     Lazy::force(&SCRCPY_RUNNING);

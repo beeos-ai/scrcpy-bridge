@@ -141,15 +141,50 @@ pub fn build_viewer_kicked(reason: &str) -> String {
     json!({ "type": "viewer_kicked", "reason": reason }).to_string()
 }
 
-/// Translate the browser's wheel delta into scrcpy's `[-1.0, 1.0]` range,
-/// matching the Python implementation so UX stays identical.
+/// Translate the browser's accumulated wheel delta into scrcpy's
+/// scroll intensity (`AXIS_HSCROLL` / `AXIS_VSCROLL` of the injected
+/// `MotionEvent`).
+///
+/// ### Why purely linear
+///
+/// Earlier versions ran the delta through `|v|^0.6 * sign(v)`, a curve
+/// that *boosts* small values and compresses large ones — the wrong
+/// direction for modern touch-oriented apps. Page-snap apps (TikTok /
+/// Douyin / Reels) treat any non-zero `AXIS_VSCROLL` as "advance one
+/// item" regardless of sign, and some devices multiply `VSCROLL=1.0`
+/// by `ViewConfiguration.getScaledVerticalScrollFactor()` (often 64+
+/// px) which can produce enough motion to fling *multiple* items per
+/// event. A plain `delta/120 * sensitivity` with a hard output ceiling
+/// lets us keep a predictable "one gesture → one item" mapping.
+///
+/// ### Output ceiling (`MAX_ABS`)
+///
+/// We clamp the final value to `±0.3` rather than `±1.0`. macOS
+/// trackpads coalesce into a single browser-side debounce window
+/// with `|dy| ≈ 600–2000`, which at any reasonable sensitivity
+/// would otherwise saturate at ±1.0 on every fast flick. Capping at
+/// 0.3 keeps one physical gesture to roughly *one* page-snap on
+/// Douyin-class apps while still leaving enough headroom for
+/// in-content scrolling in non-snap apps.
+///
+/// ### Default sensitivity (`1.0`, linear passthrough)
+///
+/// The client-side `InputHandler` now shapes each physical gesture
+/// into exactly one send whose delta is the accumulated impulse from
+/// a short gather window (~30 ms). With that upstream contract there's
+/// no need for the server to further attenuate or debounce — we just
+/// pass `dy/120` straight through and rely on the `±0.3` ceiling to
+/// cap per-event intensity. A 1-notch wheel click (`|dy|=100`) lands
+/// at `|sy|=0.83 → clamp 0.3`, which empirically maps to exactly one
+/// page flip on TikTok/Douyin/Reels. Tune `SCROLL_SENSITIVITY` down
+/// if a particular handset's `scaleFactor` is unusually large.
 pub fn wheel_to_scroll(dx: f32, dy: f32, sensitivity: f32) -> (f32, f32) {
+    const MAX_ABS: f32 = 0.3;
     let raw_x = -dx / 120.0;
     let raw_y = -dy / 120.0;
-    let compress = |v: f32| v.abs().powf(0.6).copysign(v);
     (
-        (compress(raw_x) * sensitivity).clamp(-1.0, 1.0),
-        (compress(raw_y) * sensitivity).clamp(-1.0, 1.0),
+        (raw_x * sensitivity).clamp(-MAX_ABS, MAX_ABS),
+        (raw_y * sensitivity).clamp(-MAX_ABS, MAX_ABS),
     )
 }
 
@@ -179,10 +214,28 @@ mod tests {
     }
 
     #[test]
-    fn wheel_math_matches_python() {
+    fn wheel_is_linear_and_clamped() {
+        // Sign convention: positive browser deltaY means "scroll down"; the
+        // device expects the opposite sign convention (VSCROLL>0 means
+        // "content moves up / user moves fingers up"). The output is
+        // capped at the 0.3 ceiling (see `wheel_to_scroll` docs for why).
         let (sx, sy) = wheel_to_scroll(0.0, 120.0, 1.0);
         assert_eq!(sx, 0.0);
-        assert!(sy < 0.0);
+        assert!((sy - -0.3).abs() < f32::EPSILON);
+
+        // Linear scaling below the cap: small deltas + small sensitivity
+        // pass through unclamped.
+        let (_, sy_low) = wheel_to_scroll(0.0, 120.0, 0.1);
+        assert!((sy_low - -0.1).abs() < f32::EPSILON);
+
+        // Saturation at the clamp boundary regardless of how large the delta is.
+        let (_, sy_big) = wheel_to_scroll(0.0, 5000.0, 1.0);
+        assert_eq!(sy_big, -0.3);
+
+        // Low-sensitivity stays low for small deltas (used to be boosted
+        // by the `v^0.6` curve this function historically had).
+        let (_, sy_tiny) = wheel_to_scroll(0.0, 24.0, 0.08);
+        assert!((sy_tiny - -0.016).abs() < 1e-6);
     }
 
     #[test]
