@@ -7,6 +7,18 @@ name: release-scrcpy-bridge
 #   2. A distroless multi-arch Docker image, pushed to GHCR. Consumed by
 #      the ReDroid Pod sidecar in `deploy/redroid/pod.yaml`.
 #
+# Tag format conventions:
+#   - `scrcpy-bridge-v0.1.0`        -> stable release (updates `:latest`)
+#   - `scrcpy-bridge-v0.1.0-rc.1`   -> prerelease (does NOT update `:latest`,
+#                                      GH release marked prerelease)
+#   - `scrcpy-bridge-v0.1.0-staging.1` -> same prerelease semantics, for
+#                                         staging-only validation
+#
+# Any semver-style pre-release suffix (a `-` after the version) flips the
+# release into prerelease mode so staging consumers can pin to the specific
+# `:<version>` tag via `SCRCPY_BRIDGE_IMAGE` without affecting production
+# ReDroid Pods that track `:latest`.
+#
 # See Cargo.toml `[package.metadata.dist]` for the list of targets.
 on:
   push:
@@ -24,11 +36,17 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.derive.outputs.version }}
+      prerelease: ${{ steps.derive.outputs.prerelease }}
     steps:
       - id: derive
         run: |
           tag="${GITHUB_REF_NAME#scrcpy-bridge-v}"
           echo "version=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$tag" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
   binaries:
     name: binaries (${{ matrix.target }})
@@ -93,6 +111,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: ${{ steps.pack.outputs.asset }}
           fail_on_unmatched_files: true
+          prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
 
   docker:
     name: distroless docker image
@@ -110,6 +129,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: imgtags
+        shell: bash
+        run: |
+          ver="${{ needs.plan.outputs.version }}"
+          {
+            echo "tags<<EOF"
+            echo "ghcr.io/beeos-ai/scrcpy-bridge:${ver}"
+            if [[ "${{ needs.plan.outputs.prerelease }}" != "true" ]]; then
+              echo "ghcr.io/beeos-ai/scrcpy-bridge:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build & push multi-arch image
         uses: docker/build-push-action@v6
         with:
@@ -117,9 +150,7 @@ jobs:
           file: Dockerfile.distroless
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/beeos-ai/scrcpy-bridge:${{ needs.plan.outputs.version }}
-            ghcr.io/beeos-ai/scrcpy-bridge:latest
+          tags: ${{ steps.imgtags.outputs.tags }}
           build-args: |
             VERSION=${{ needs.plan.outputs.version }}
           cache-from: type=gha
