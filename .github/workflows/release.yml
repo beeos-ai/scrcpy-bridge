@@ -87,10 +87,13 @@ jobs:
       - name: Package archive
         id: pack
         shell: bash
-        # Archive name is intentionally version-less so that the BeeOS CLI
-        # can resolve it via `/releases/latest/download/<name>` without
-        # first fetching the latest tag. See
-        # web/packages/core/src/runtime/scrcpy-bridge.ts:archiveName().
+        # Archive name is intentionally version-less so the BeeOS CLI can
+        # fetch it at a stable URL:
+        #   /releases/latest/download/scrcpy-bridge-<target>.tar.gz
+        # GitHub redirects `latest/download` to whichever tag is marked
+        # "latest" in the repo's Releases page. See
+        # web/packages/core/src/sidecars/cargo-dist.ts (archiveName +
+        # releaseBaseUrl).
         run: |
           bin="scrcpy-bridge"
           if [[ "${{ matrix.target }}" == *windows* ]]; then bin="scrcpy-bridge.exe"; fi
@@ -100,16 +103,30 @@ jobs:
           cp README.md LICENSE 2>/dev/null "$stage/" || true
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             7z a "${stage}.zip" "$stage"
-            echo "asset=${stage}.zip" >> "$GITHUB_OUTPUT"
+            archive="${stage}.zip"
           else
             tar -czf "${stage}.tar.gz" "$stage"
-            echo "asset=${stage}.tar.gz" >> "$GITHUB_OUTPUT"
+            archive="${stage}.tar.gz"
           fi
+          # Publish SHA256 sidecar alongside the archive — the CLI
+          # validates archive integrity against this digest (see
+          # cargo-dist.ts). Missing digest is a soft warning for
+          # back-compat but we always ship it in prod releases to
+          # catch truncated downloads / CDN tampering.
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$archive" | awk '{print $1"  "$2}' > "${archive}.sha256"
+          else
+            sha256sum "$archive" | awk '{print $1"  "$2}' > "${archive}.sha256"
+          fi
+          echo "asset=$archive"            >> "$GITHUB_OUTPUT"
+          echo "digest=${archive}.sha256"  >> "$GITHUB_OUTPUT"
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: ${{ steps.pack.outputs.asset }}
+          files: |
+            ${{ steps.pack.outputs.asset }}
+            ${{ steps.pack.outputs.digest }}
           fail_on_unmatched_files: true
           prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
 
