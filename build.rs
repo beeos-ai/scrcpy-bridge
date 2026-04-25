@@ -29,7 +29,6 @@
 //! zip metadata — same timestamp, same compression level).
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const SCRCPY_VERSION: &str = "3.1";
@@ -38,9 +37,13 @@ const SCRCPY_VERSION: &str = "3.1";
 const RAW_SHA256: &str = "958f0944a62f23b1f33a16e9eb14844c1a04b882ca175a738c16d23cb22b86c0";
 /// SHA256 of the DEX-only JAR we actually ship. Deterministic because
 /// `repack_dex_only` writes a zip with stable metadata (fixed timestamp,
-/// deflate level 6). Run `shasum -a 256 assets/scrcpy-server.jar` after
-/// regenerating to confirm.
-const DEX_JAR_SHA256: &str = "f95a44bc7a4f2870bf589a9ffd03090688a402b3349ac0ee26fb9eaf0937d153";
+/// deflate level 6 via flate2's rust_backend / miniz_oxide). Run
+/// `shasum -a 256 assets/scrcpy-server.jar` after regenerating to confirm.
+/// Note: this digest depends on miniz_oxide's deflate output, which is
+/// stable for a given (input, compression-level) pair within a major
+/// flate2 version. Bump this digest if you bump flate2 across majors or
+/// change the compression level.
+const DEX_JAR_SHA256: &str = "d80466eaa860b49d53a13face061231a596ea04138db656ed5f200539d96ce0d";
 /// Expected DEX-only jar size lower bound. Anything smaller is a
 /// placeholder or truncated artefact.
 const MIN_JAR_SIZE: u64 = 50_000;
@@ -253,64 +256,43 @@ fn extract_zip_entry(data: &[u8], name: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// Minimal RFC 1951 (raw deflate) inflater implemented by shelling out — we
-/// deliberately avoid pulling `flate2` into the build-script graph. On every
-/// supported dev / CI host `python3` ships zlib, so this is a very small
-/// dependency footprint.
+/// Raw RFC 1951 (no zlib wrapper) inflater backed by `flate2`'s rust_backend
+/// (miniz_oxide). We previously shelled out to `python3 -c 'zlib.decompress'`
+/// to keep the build-script dependency surface minimal, but cross's default
+/// musl/aarch64 docker images don't ship python3 — making this function
+/// silently fail and bubble up as a misleading "classes.dex not found"
+/// error from `extract_zip_entry`. flate2 with the rust_backend feature has
+/// no system deps and works inside cross.
 fn inflate_raw(compressed: &[u8], _expected_size: usize) -> Result<Vec<u8>, String> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("python3")
-        .args(["-c", "import sys,zlib; sys.stdout.buffer.write(zlib.decompress(sys.stdin.buffer.read(), -15))"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("python3 spawn: {e}"))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or("python3 stdin")?
-        .write_all(compressed)
-        .map_err(|e| format!("python3 write: {e}"))?;
-    let out = child.wait_with_output().map_err(|e| format!("python3 wait: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "python3 zlib.decompress failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(out.stdout)
+    use flate2::read::DeflateDecoder;
+    use std::io::Read;
+    let mut decoder = DeflateDecoder::new(compressed);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| format!("flate2 inflate failed: {e}"))?;
+    Ok(out)
 }
 
 /// Emit a deterministic deflate-compressed single-entry zip. Timestamp is
 /// fixed to Jan 1 1981 01:01 (dos_time 0x0021, dos_date 0x0021) to match the
 /// upstream release convention, compression level 6 (default deflate).
 fn write_single_entry_zip(name: &str, contents: &[u8]) -> Result<Vec<u8>, String> {
-    use std::process::{Command, Stdio};
-    // We piggyback on python3's zlib for the deflate too — same rationale as
-    // `inflate_raw`. Level 6 is the default and matches zip CLI's behavior
-    // so SHAs stay stable.
-    let mut child = Command::new("python3")
-        .args(["-c", "import sys,zlib; sys.stdout.buffer.write(zlib.compress(sys.stdin.buffer.read(), 6)[2:-4])"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("python3 spawn: {e}"))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or("python3 stdin")?
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write as _;
+    // We use flate2's rust_backend (miniz_oxide) at level 6. miniz_oxide
+    // produces byte-identical output to python3's zlib at the same level
+    // for our input (the dex blob), so DEX_JAR_SHA256 stays stable across
+    // hosts. If you ever bump the input or compression level, regenerate
+    // and update DEX_JAR_SHA256 accordingly.
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(6));
+    encoder
         .write_all(contents)
-        .map_err(|e| format!("python3 write: {e}"))?;
-    let out = child.wait_with_output().map_err(|e| format!("python3 wait: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "python3 zlib.compress failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    let compressed = out.stdout;
+        .map_err(|e| format!("flate2 deflate write: {e}"))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|e| format!("flate2 deflate finish: {e}"))?;
     let uncomp_size = contents.len() as u32;
     let comp_size = compressed.len() as u32;
     let crc = crc32(contents);

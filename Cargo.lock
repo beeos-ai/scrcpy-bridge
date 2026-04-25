@@ -1750,6 +1750,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "flate2",
  "futures",
  "hex",
  "http-body-util",

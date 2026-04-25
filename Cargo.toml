@@ -132,6 +132,18 @@ uuid = { version = "1.10", features = ["v4"] }
 # the remote side. `if-addrs` is a tiny pure-Rust crate with no deps.
 if-addrs = "0.13"
 
+[build-dependencies]
+# Pure-Rust raw deflate for build.rs. Used to extract `classes.dex` out of
+# the upstream scrcpy-server APK without shelling out to `python3 -c
+# 'zlib.decompress(...)'`. The python fallback worked on dev hosts and on
+# the GitHub-hosted Ubuntu runners, but cross's default musl/aarch64
+# images don't ship python3 — making the previous implementation silently
+# return None inside extract_zip_entry and panic with the misleading
+# "classes.dex not found in upstream release" error. flate2 is a tiny
+# crate with a vendored miniz_oxide backend that builds inside cross
+# without any runtime tools.
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+
 [dev-dependencies]
 tokio = { version = "1.41", features = ["full", "test-util"] }
 pretty_assertions = "1.4"
