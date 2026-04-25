@@ -59,7 +59,13 @@ jobs:
           - { target: aarch64-unknown-linux-gnu,  runner: ubuntu-22.04, cross: true }
           - { target: x86_64-unknown-linux-musl,  runner: ubuntu-22.04, cross: true }
           - { target: aarch64-unknown-linux-musl, runner: ubuntu-22.04, cross: true }
-          - { target: x86_64-apple-darwin,        runner: macos-13 }
+          # x86_64 macs are cross-compiled on a macos-14 (Apple Silicon)
+          # runner. macos-13 (Intel) runners are heavily oversubscribed
+          # in the GitHub-hosted pool and frequently take 30+ minutes
+          # to allocate; cross-compiling from arm to x86 on darwin works
+          # natively because Xcode ships both SDKs, and dtolnay's action
+          # installs the rustup target via `targets:` below.
+          - { target: x86_64-apple-darwin,        runner: macos-14 }
           - { target: aarch64-apple-darwin,       runner: macos-14 }
           - { target: x86_64-pc-windows-msvc,     runner: windows-2022 }
     runs-on: ${{ matrix.runner }}
