@@ -1,11 +1,11 @@
 [package]
 name = "scrcpy-bridge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 description = "Bridge scrcpy H.264 streams to WebRTC. sibling process to Python device-agent."
 license = "MIT"
-repository = "https://github.com/beeos-ai/beeos"
+repository = "https://github.com/beeos-ai/scrcpy-bridge"
 default-run = "scrcpy-bridge"
 
 # ── cargo-dist configuration (workspace-local) ─────────────────

@@ -74,15 +74,19 @@ jobs:
         if: matrix.cross == true
         run: cargo install cross --locked
 
+      # Note: --release is the alias for --profile release; cargo 1.95+
+      # rejects combining it with an explicit --profile <other>. The
+      # `dist` profile defined in Cargo.toml already implies release-grade
+      # optimization, so we drop --release.
       - name: Build (native)
         if: matrix.cross != true
         working-directory: .
-        run: cargo build --release --target ${{ matrix.target }} --profile dist --locked
+        run: cargo build --target ${{ matrix.target }} --profile dist --locked
 
       - name: Build (cross)
         if: matrix.cross == true
         working-directory: .
-        run: cross build --release --target ${{ matrix.target }} --profile dist --locked
+        run: cross build --target ${{ matrix.target }} --profile dist --locked
 
       - name: Package archive
         id: pack
