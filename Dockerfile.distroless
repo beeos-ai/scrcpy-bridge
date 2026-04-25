@@ -38,14 +38,17 @@ RUN set -eux; \
       arm64)  ARCH="aarch64-unknown-linux-musl" ;; \
       *)      echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    URL="https://github.com/beeos-ai/scrcpy-bridge/releases/download/scrcpy-bridge-v${VERSION}/scrcpy-bridge-${ARCH}.tar.gz"; \
-    SUM_URL="${URL}.sha256"; \
+    ARCHIVE="scrcpy-bridge-${ARCH}.tar.gz"; \
+    URL="https://github.com/beeos-ai/scrcpy-bridge/releases/download/scrcpy-bridge-v${VERSION}/${ARCHIVE}"; \
+    cd /tmp; \
     echo "fetching ${URL}"; \
-    curl -fSL --retry 5 --retry-delay 3 -o /tmp/sb.tgz       "${URL}"; \
-    curl -fSL --retry 5 --retry-delay 3 -o /tmp/sb.tgz.sha256 "${SUM_URL}"; \
-    cd /tmp && sha256sum -c sb.tgz.sha256 \
+    # Download to the *original* filename so sha256sum -c can match the
+    # entry in the sidecar (sha256sum verifies "<digest>  <filename>" pairs).
+    curl -fSL --retry 5 --retry-delay 3 -o "${ARCHIVE}"        "${URL}"; \
+    curl -fSL --retry 5 --retry-delay 3 -o "${ARCHIVE}.sha256" "${URL}.sha256"; \
+    sha256sum -c "${ARCHIVE}.sha256" \
       || (echo "sha256 mismatch — release artifact tampered or truncated" >&2; exit 1); \
-    tar -xzf sb.tgz; \
+    tar -xzf "${ARCHIVE}"; \
     install -m 0755 "/tmp/scrcpy-bridge-${ARCH}/scrcpy-bridge" /scrcpy-bridge; \
     /scrcpy-bridge --version 2>/dev/null || true
 
