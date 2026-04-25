@@ -1,44 +1,60 @@
 ############################
-# Stage 1 — cargo builder (musl static)
+# Stage 1 — fetch the prebuilt musl binary from this tag's GitHub Release
 ############################
 #
-# We build a fully static musl binary so the runtime image can be
-# `gcr.io/distroless/static` — no libc / ssl / openjdk needed.
+# We deliberately don't compile Rust inside the container. The previous
+# `cargo build --target ${TARGETARCH}-unknown-linux-musl` in `rust:alpine`
+# tripped over two cross-compile gaps:
 #
-FROM --platform=$BUILDPLATFORM rust:1.82-alpine AS builder
+#   1. openssl-sys's vendored OpenSSL build refused to configure on the
+#      arm64 path even with `apk add openssl-dev openssl-libs-static`,
+#      because some transitive dep enabled the `vendored` feature.
+#   2. `rustup target add aarch64-unknown-linux-musl` plants the std
+#      libs but alpine's musl-dev only ships the *host* gcc; the cross
+#      compile then fails with `can't find crate for 'core'` for any
+#      proc-macro the foreign target has to materialize.
+#
+# Instead, the binaries matrix in `.github/workflows/release.yml`
+# already produces a fully-static musl binary per arch and uploads it to
+# the GitHub Release. The docker job depends on that matrix completing,
+# so by the time we run, the tarballs exist at predictable URLs:
+#
+#   https://github.com/beeos-ai/scrcpy-bridge/releases/download/
+#     scrcpy-bridge-v${VERSION}/scrcpy-bridge-${ARCH}-unknown-linux-musl.tar.gz
+#
+# Buildx fans this stage out across `linux/amd64,linux/arm64`, so each
+# platform pulls its own tarball without any cross-compilation tooling.
+#
+FROM --platform=$BUILDPLATFORM alpine:3.20 AS fetcher
 
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static \
-        ca-certificates curl bash
-
+ARG VERSION=dev
 ARG TARGETARCH
-RUN case "${TARGETARCH}" in \
-      amd64)  echo "x86_64-unknown-linux-musl"  > /tmp/rust_target ;; \
-      arm64)  echo "aarch64-unknown-linux-musl" > /tmp/rust_target ;; \
-      *)      echo "unsupported arch ${TARGETARCH}" && exit 1 ;; \
-    esac
 
-RUN rustup target add "$(cat /tmp/rust_target)"
+RUN apk add --no-cache curl tar coreutils
 
-WORKDIR /src
-COPY Cargo.toml Cargo.lock* rust-toolchain.toml build.rs ./
-COPY src ./src
-COPY assets ./assets
-
-ENV RUSTFLAGS="-C target-feature=+crt-static"
-
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --profile dist --locked --bin scrcpy-bridge \
-        --target "$(cat /tmp/rust_target)" \
-    && cp "target/$(cat /tmp/rust_target)/dist/scrcpy-bridge" /out/scrcpy-bridge \
-    || (mkdir -p /out && cp "target/$(cat /tmp/rust_target)/dist/scrcpy-bridge" /out/scrcpy-bridge)
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64)  ARCH="x86_64-unknown-linux-musl" ;; \
+      arm64)  ARCH="aarch64-unknown-linux-musl" ;; \
+      *)      echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    URL="https://github.com/beeos-ai/scrcpy-bridge/releases/download/scrcpy-bridge-v${VERSION}/scrcpy-bridge-${ARCH}.tar.gz"; \
+    SUM_URL="${URL}.sha256"; \
+    echo "fetching ${URL}"; \
+    curl -fSL --retry 5 --retry-delay 3 -o /tmp/sb.tgz       "${URL}"; \
+    curl -fSL --retry 5 --retry-delay 3 -o /tmp/sb.tgz.sha256 "${SUM_URL}"; \
+    cd /tmp && sha256sum -c sb.tgz.sha256 \
+      || (echo "sha256 mismatch — release artifact tampered or truncated" >&2; exit 1); \
+    tar -xzf sb.tgz; \
+    install -m 0755 "/tmp/scrcpy-bridge-${ARCH}/scrcpy-bridge" /scrcpy-bridge; \
+    /scrcpy-bridge --version 2>/dev/null || true
 
 ############################
 # Stage 2 — adb runtime (separate so we can copy just the binary)
 ############################
 #
 # scrcpy-bridge shells out to `adb`. distroless has no apk, so we grab
-# the android-tools-static adb binary from Alpine and copy it in.
+# the android-tools adb binary from Alpine and copy it in.
 #
 FROM alpine:3.20 AS adb
 
@@ -50,12 +66,13 @@ RUN apk add --no-cache android-tools
 FROM gcr.io/distroless/static-debian12:nonroot
 
 ARG VERSION=dev
-LABEL org.opencontainers.image.source="https://github.com/beeos-ai/beeos" \
+LABEL org.opencontainers.image.source="https://github.com/beeos-ai/scrcpy-bridge" \
       org.opencontainers.image.title="scrcpy-bridge" \
+      org.opencontainers.image.description="WebRTC bridge for scrcpy H.264 streams" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT"
 
-COPY --from=builder /out/scrcpy-bridge /usr/local/bin/scrcpy-bridge
+COPY --from=fetcher /scrcpy-bridge /usr/local/bin/scrcpy-bridge
 COPY --from=adb /usr/bin/adb /usr/local/bin/adb
 # Required shared libs for adb (distroless static has only ca-certificates).
 COPY --from=adb /lib/ld-musl-*.so.1 /lib/
