@@ -13,6 +13,15 @@ use scrcpy_bridge::observability::{self, HealthFlags};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 panics on the first TLS handshake unless a process-wide
+    // CryptoProvider is installed. Feature unification across rumqttc /
+    // reqwest / tungstenite proved unreliable, so we install `aws-lc-rs`
+    // explicitly here before ANY TLS code path runs (rumqttc to MQTT,
+    // reqwest to Agent Gateway, etc). `.ok()` makes this idempotent in
+    // case some upstream already raced us — install_default returns Err
+    // on second call, never panics.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse_args();
     init_tracing(&cli.log_format);
 

@@ -1,6 +1,6 @@
 [package]
 name = "scrcpy-bridge"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Bridge scrcpy H.264 streams to WebRTC. sibling process to Python device-agent."
@@ -73,6 +73,16 @@ hex = "0.4"
 
 # MQTT client
 rumqttc = { version = "0.25", features = ["use-rustls", "websocket"] }
+
+# rustls 0.23 stopped picking a default CryptoProvider automatically: when
+# multiple transitive crates (rumqttc/reqwest/tungstenite) disable rustls'
+# default features, the runtime can't tell which provider to use and panics
+# on the first TLS handshake with `Could not automatically determine the
+# process-level CryptoProvider`. We explicitly install `aws-lc-rs` once in
+# `main.rs` BEFORE any TLS path is exercised — no Cargo feature wrangling
+# needed (which never converged on "exactly one provider" across
+# transitive deps).
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
 # str0m (via its default features) enables the `asm` feature of the `sha1`
 # crate, which on aarch64 pulls in `sha1-asm` 0.5.3 → buggy on Apple Silicon
