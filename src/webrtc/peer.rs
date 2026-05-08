@@ -17,6 +17,7 @@
 //! behind a coturn instance with `TURN_URLS` pre-configured in the SDP.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,40 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::scrcpy::{AudioPacket, VideoFrame};
+
+/// Outgoing video transport. Switchable at runtime via
+/// [`WebRtcPeer::set_video_transport`] in response to a `set_video_transport`
+/// control message from the viewer.
+///
+/// - `Rtp`: write H.264 NAL units to the negotiated video m-line as native
+///   WebRTC RTP (str0m packetises). Default; matches what every browser-side
+///   viewer expects.
+/// - `DataChannel`: bypass the video m-line entirely and send each H.264 NAL
+///   as a binary message over a dedicated `label="video"` DataChannel. Used
+///   by the iOS native client to side-step Apple's WebRTC SDK
+///   `RTCVideoTrack` broadcaster bug (decoder runs but
+///   `framesDecoded`-vs-`OnFrame` never resolves), and to feed H.264 into
+///   `AVSampleBufferDisplayLayer` directly with VideoToolbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoTransport {
+    Rtp,
+    DataChannel,
+}
+
+impl VideoTransport {
+    fn as_u8(self) -> u8 {
+        match self {
+            VideoTransport::Rtp => 0,
+            VideoTransport::DataChannel => 1,
+        }
+    }
+    fn from_u8(v: u8) -> VideoTransport {
+        match v {
+            1 => VideoTransport::DataChannel,
+            _ => VideoTransport::Rtp,
+        }
+    }
+}
 
 /// TURN/STUN server description (same shape as the browser-side
 /// `RTCIceServer` object we receive from the control plane).
@@ -79,6 +114,11 @@ pub enum PeerCommand {
     RemoteIce(String),
     /// Write a H.264 AU to the video track (config or full frame).
     WriteVideo(VideoFrame),
+    /// Write a pre-framed H.264 payload as a binary message on the `video`
+    /// DataChannel (see [`VideoTransport::DataChannel`]). Caller is
+    /// responsible for fragmentation/framing — the peer task just hands the
+    /// bytes to str0m's DC writer with `binary=true`.
+    WriteVideoBinary(Vec<u8>),
     /// Write an Opus packet to the audio track as native WebRTC RTP.
     WriteAudio(AudioPacket),
     /// Send a UTF-8 text message on the `control` data channel.
@@ -125,6 +165,10 @@ pub struct WebRtcPeer {
     cmd_tx: mpsc::Sender<PeerCommand>,
     evt_rx: Arc<tokio::sync::Mutex<broadcast::Receiver<PeerEvent>>>,
     evt_tx: broadcast::Sender<PeerEvent>,
+    /// Shared video-transport selector, readable from outside the peer task
+    /// (e.g. `run_video_pump`) without taking the command channel. Updated
+    /// via [`WebRtcPeer::set_video_transport`].
+    video_transport: Arc<AtomicU8>,
 }
 
 impl WebRtcPeer {
@@ -142,6 +186,7 @@ impl WebRtcPeer {
             cmd_tx,
             evt_rx: Arc::new(tokio::sync::Mutex::new(evt_rx)),
             evt_tx,
+            video_transport: Arc::new(AtomicU8::new(VideoTransport::Rtp.as_u8())),
         })
     }
 
@@ -174,6 +219,38 @@ impl WebRtcPeer {
         self.cmd_tx
             .try_send(PeerCommand::WriteVideo(frame))
             .is_ok()
+    }
+
+    /// Send a pre-framed H.264 payload on the binary `video` DataChannel.
+    /// Drops the payload if the command queue is full (drop-newest backpressure
+    /// matching `try_write_video`'s policy for delta frames).
+    ///
+    /// Returns `false` when dropped. Caller (`run_video_pump`) increments
+    /// the dropped-frames metric in that case.
+    pub fn try_write_video_binary(&self, payload: Vec<u8>) -> bool {
+        self.cmd_tx
+            .try_send(PeerCommand::WriteVideoBinary(payload))
+            .is_ok()
+    }
+
+    /// Blocking send variant for keyframe / config payloads where loss would
+    /// strand the iOS decoder until the next IDR.
+    pub async fn write_video_binary(&self, payload: Vec<u8>) -> Result<()> {
+        self.cmd_tx
+            .send(PeerCommand::WriteVideoBinary(payload))
+            .await
+            .map_err(|_| anyhow!("peer task has exited"))
+    }
+
+    /// Atomically switch the outgoing video transport. Visible immediately to
+    /// any reader of [`Self::video_transport`] including `run_video_pump`.
+    pub fn set_video_transport(&self, mode: VideoTransport) {
+        self.video_transport.store(mode.as_u8(), Ordering::Release);
+    }
+
+    /// Returns the current outgoing video transport.
+    pub fn video_transport(&self) -> VideoTransport {
+        VideoTransport::from_u8(self.video_transport.load(Ordering::Acquire))
     }
 
     pub async fn write_audio(&self, pkt: AudioPacket) -> Result<()> {
@@ -242,10 +319,48 @@ async fn run_peer(
     let local_addr = socket.local_addr()?;
     info!(%local_addr, "WebRTC UDP socket bound");
 
-    let mut rtc = Rtc::builder()
+    let mut rtc_config = Rtc::builder()
         .set_rtp_mode(false)
-        .enable_raw_packets(false)
-        .build();
+        .enable_raw_packets(false);
+
+    // Add support for Apple iOS WebRTC.framework's preferred H.264
+    // profile-level-ids (Level 4.1 variants).
+    //
+    // Background: str0m's `enable_h264()` PARAMS table only contains
+    // Level 3.1 entries (`42001f` / `42e01f` / `4d001f` / `64001f`).
+    // Apple's `RTCDefaultVideoEncoderFactory` on iOS 26 / iPhone 16
+    // ONLY exposes H.264 capabilities at Level 4.1 (`42e029`
+    // Constrained Baseline 4.1, `640c29` Constrained High 4.1) —
+    // verified empirically via `factory.rtpReceiverCapabilitiesForKind`
+    // dump. Without this addition, str0m's `match_h264_score` returns
+    // None for every H.264 PT in iOS's offer (because exact
+    // `H264ProfileLevel` struct comparison rejects level mismatches),
+    // and the bridge's answer falls back to VP8/VP9 — which scrcpy
+    // CANNOT actually encode (it's H.264 pass-through), so RTP packets
+    // flow but iOS never decodes a frame.
+    //
+    // Adding these entries lets iOS's natural offer negotiate H.264
+    // directly, no client-side SDP munging required, and the answer's
+    // profile-level-id matches both Apple's decoder-factory caps and
+    // the actual H.264 bitstream from scrcpy.
+    //
+    // PTs picked from the dynamic range (96-127) to avoid colliding
+    // with str0m's defaults (VP8=96/97, VP9=98/99, H.264 defaults at
+    // 35/36/107/108/109/119-127).
+    //
+    // Only `0x42e029` (Constrained Baseline Level 4.1) is added —
+    // str0m's `H264ProfileLevel` PROFILES table doesn't recognize
+    // Constrained High (`0x640c29`, profile_iop=0x0c) because it
+    // only has the plain "High" pattern (profile_iop=0x00). Apple's
+    // encoder factory exposes BOTH `42e029` and `640c29` as receiver
+    // capabilities, so str0m matching the `42e029` entry is enough
+    // to lock H.264 in the answer; the `640c29` capability is just
+    // ignored and that's fine.
+    rtc_config.codec_config().add_h264(
+        110_u8.into(), Some(111_u8.into()), true, 0x42e029,
+    );
+
+    let mut rtc = rtc_config.build();
 
     // Host candidates must be concrete addresses — str0m/ICE rejects
     // `0.0.0.0` / `::`. When we bind to a wildcard (`opts.local_bind =
@@ -467,6 +582,21 @@ async fn handle_command(
                 }
             }
         }
+        PeerCommand::WriteVideoBinary(payload) => {
+            // Sent as `binary=true` so the iOS DataChannel delegate
+            // receives an `RTCDataBuffer` with `isBinary=true` and
+            // `data` containing the framed H.264 NAL payload (see
+            // build_video_dc_payload in bridge/mod.rs).
+            if let Some(cid) = state.video_dc_channel {
+                if let Some(mut chan) = rtc.channel(cid) {
+                    if let Err(e) = chan.write(true, &payload) {
+                        warn!(error = %e, "video datachannel write");
+                    }
+                }
+            } else {
+                debug!("video datachannel not open; dropping video binary payload");
+            }
+        }
         PeerCommand::WriteAudio(pkt) => {
             // scrcpy emits a 19-byte `OpusHead` config packet as its first
             // audio frame. RTP Opus tracks negotiate sample-rate/channels
@@ -579,17 +709,40 @@ async fn handle_rtc_event(
         }
         RtcEvent::ChannelOpen(cid, label) => {
             info!(%label, "data channel open");
-            if label == "control" || state.control_channel.is_none() {
+            // The iOS native client opens a second DataChannel labelled
+            // "video" alongside "control", and pushes a
+            // `set_video_transport=datachannel` control message on the
+            // control DC right after open. We bind the video channel
+            // here so the subsequent
+            // [`PeerCommand::WriteVideoBinary`] writes resolve their
+            // target.
+            if label == "video" {
+                state.video_dc_channel = Some(cid);
+            } else if label == "control" || state.control_channel.is_none() {
                 state.control_channel = Some(cid);
             }
         }
         RtcEvent::ChannelData(d) => {
+            // Browsers may emit binary on the control channel for some
+            // future use; for now we only forward UTF-8 control JSON.
+            // The video DC is push-only (bridge → viewer) — anything
+            // received on it gets ignored.
+            if let Some(cid) = state.video_dc_channel {
+                if d.id == cid {
+                    return Ok(());
+                }
+            }
             if let Ok(text) = std::str::from_utf8(&d.data) {
                 let _ = evt_tx.send(PeerEvent::ControlMessage(text.to_string()));
             }
         }
-        RtcEvent::ChannelClose(_cid) => {
-            state.control_channel = None;
+        RtcEvent::ChannelClose(cid) => {
+            if state.video_dc_channel == Some(cid) {
+                state.video_dc_channel = None;
+            }
+            if state.control_channel == Some(cid) {
+                state.control_channel = None;
+            }
         }
         RtcEvent::KeyframeRequest(_) => {
             // Browser sent PLI/FIR — forward to the bridge so it can ask
@@ -613,6 +766,10 @@ struct PeerState {
     video_mid: Option<Mid>,
     audio_mid: Option<Mid>,
     control_channel: Option<ChannelId>,
+    /// Bound when the viewer opens a `label="video"` DataChannel and we want
+    /// to push H.264 NAL payloads as binary messages instead of (or in
+    /// addition to) RTP. See [`VideoTransport::DataChannel`].
+    video_dc_channel: Option<ChannelId>,
     ice_servers: Vec<IceServer>,
     ice_gather_wait: Duration,
     logged_first_packet: bool,

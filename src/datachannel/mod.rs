@@ -104,6 +104,24 @@ pub enum ControlIn {
         #[serde(default, rename = "roundTripTime")]
         round_trip_time: f64,
     },
+    /// iOS native client opt-in: switch outgoing video transport from RTP
+    /// (default, browser-compatible) to a binary DataChannel labelled
+    /// `video`. Sent right after the iOS DataChannel pair (`control` +
+    /// `video`) opens. See [`crate::webrtc::peer::VideoTransport`].
+    ///
+    /// Mode values: `"datachannel"` to opt in, `"rtp"` to revert.
+    /// Anything else is ignored.
+    #[serde(rename = "set_video_transport")]
+    SetVideoTransport {
+        #[serde(default)]
+        mode: String,
+    },
+    /// iOS native client request for a fresh keyframe (e.g. on first
+    /// `AVSampleBufferDisplayLayer.failed` or when bound the decoder
+    /// before SPS/PPS arrived). Bridge forwards as a scrcpy
+    /// `ResetVideo` control message.
+    #[serde(rename = "request_keyframe")]
+    RequestKeyframe,
     /// Catch-all for unknown types; we ignore these but don't error the pipe.
     #[serde(other)]
     Unknown,

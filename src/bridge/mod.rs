@@ -38,9 +38,10 @@ use crate::observability::{
 };
 use crate::scrcpy::protocol::{KeyAction, TouchAction};
 use crate::scrcpy::{
-    AudioReader, ControlSocket, ScrcpyServer, ScrcpyServerConfig, ScrcpyShutdown, VideoReader,
+    AudioReader, ControlSocket, ScrcpyServer, ScrcpyServerConfig, ScrcpyShutdown, VideoFrame,
+    VideoReader,
 };
-use crate::webrtc::{IceServer, PeerEvent, PeerOptions, WebRtcPeer};
+use crate::webrtc::{IceServer, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer};
 
 /// MQTT username expected by the EMQX JWT auth plugin. All device-scoped
 /// connections log in as `device`; the JWT payload carries the true identity.
@@ -1093,10 +1094,135 @@ async fn run_event_pump(
     }
 }
 
-/// Pump H.264 NAL units from scrcpy's video socket into the WebRTC peer as
-/// native RTP. Keyframe and codec-config frames block until accepted (they
-/// are correctness-critical); delta frames fall back to drop-newest so a
-/// temporarily slow peer task never backs up the device-side encoder.
+/// Magic prefix on every video DataChannel message (`b"SCRC"` —
+/// short, ASCII, big-endian on the wire so first-byte sniffing works).
+const VIDEO_DC_MAGIC: u32 = 0x53435243;
+
+/// Maximum bytes of *frame payload* per DataChannel message. Each
+/// message also carries a 24-byte header. We pick **60 KB** to leave
+/// safe headroom under the SCTP 64 KB default ceiling (sctp-proto
+/// `max_message_size = 65536`) after DTLS overhead and SCTP chunk
+/// framing. Chrome / iOS WebRTC negotiate at least this much so the
+/// receiver always handles single-message reads of any fragment.
+///
+/// Smaller fragments would lose throughput (more header overhead per
+/// kilobyte); larger fragments would risk hitting the per-stack
+/// 64 KB hard limit on lossy SCTP middleboxes.
+const VIDEO_DC_MAX_FRAGMENT_PAYLOAD: usize = 60 * 1024;
+
+/// Wire format for one H.264 frame on the binary `video` DataChannel.
+///
+/// Header is 24 bytes, big-endian throughout. Payload is raw Annex-B
+/// (the same bytes scrcpy emits on its video socket, no rewriting).
+///
+/// ```text
+/// offset  size  field
+/// ------  ----  -------------------------------------------------------
+///   0      4    magic = "SCRC" (0x53435243)
+///   4      1    flags     bit 0=config, bit 1=keyframe
+///   5      1    frag_idx  (u8, 0-based fragment index of this message)
+///   6      1    frag_count (u8, total fragments for the parent frame)
+///   7      1    reserved
+///   8      8    pts_us (BE u64; identical across all fragments of one frame)
+///  16      4    frag_payload_len (BE u32; bytes that follow this header)
+///  20      4    frame_id (BE u32; monotonic per-frame counter,
+///               same across all fragments of one frame; iOS uses it
+///               to group fragments belonging to the same frame even
+///               under future unreliable-DC modes where SCTP ordering
+///               doesn't apply)
+///  24      *    Annex-B payload (this fragment's slice)
+/// ```
+///
+/// Non-fragmented frames have `frag_idx=0, frag_count=1`. The iOS
+/// decoder treats `frag_count=1` as a fast path (no reassembly buffer).
+struct VideoDcFragments {
+    /// Each Vec<u8> is a complete DC message ready for
+    /// `chan.write(true, ...)`. Always non-empty (a 0-byte H.264 frame
+    /// emits one empty fragment so the iOS side gets a heartbeat).
+    messages: Vec<Vec<u8>>,
+}
+
+/// Per-peer monotonic frame counter. Used as `frame_id` in the wire
+/// header so the iOS reassembler can group fragments belonging to the
+/// same frame even if the transport ever delivers them out of order
+/// (today SCTP ordered+reliable so this is just a sanity check).
+fn next_frame_id() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static FRAME_ID: AtomicU32 = AtomicU32::new(0);
+    FRAME_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn build_video_dc_fragments(frame: &VideoFrame) -> VideoDcFragments {
+    const HEADER_LEN: usize = 24;
+    let frame_id = next_frame_id();
+    let total_len = frame.data.len();
+
+    // Compute fragment count. At least 1 even for an empty frame so the
+    // iOS side reliably sees per-frame heartbeats and can advance its
+    // bookkeeping (e.g. drop stale partial buffers if a frame was lost).
+    let frag_count_usize: usize = if total_len == 0 {
+        1
+    } else {
+        // ceil(total_len / VIDEO_DC_MAX_FRAGMENT_PAYLOAD)
+        (total_len + VIDEO_DC_MAX_FRAGMENT_PAYLOAD - 1) / VIDEO_DC_MAX_FRAGMENT_PAYLOAD
+    };
+    // The wire field is u8; refuse to ship a frame that would need
+    // more than 255 fragments (would mean a 15+ MB single H.264 AU,
+    // which already breaks scrcpy's own 10 MB sanity limit upstream).
+    let frag_count = frag_count_usize.min(255) as u8;
+
+    let mut flags: u8 = 0;
+    if frame.is_config {
+        flags |= 0b0000_0001;
+    }
+    if frame.is_keyframe {
+        flags |= 0b0000_0010;
+    }
+
+    let mut messages: Vec<Vec<u8>> = Vec::with_capacity(frag_count as usize);
+    for idx in 0..frag_count {
+        let start = (idx as usize) * VIDEO_DC_MAX_FRAGMENT_PAYLOAD;
+        let end = (start + VIDEO_DC_MAX_FRAGMENT_PAYLOAD).min(total_len);
+        let chunk = if start >= total_len {
+            &[][..]
+        } else {
+            &frame.data[start..end]
+        };
+
+        let mut buf = Vec::with_capacity(HEADER_LEN + chunk.len());
+        buf.extend_from_slice(&VIDEO_DC_MAGIC.to_be_bytes());
+        buf.push(flags);
+        buf.push(idx);
+        buf.push(frag_count);
+        buf.push(0); // reserved
+        buf.extend_from_slice(&frame.pts_us.to_be_bytes());
+        buf.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&frame_id.to_be_bytes());
+        buf.extend_from_slice(chunk);
+        messages.push(buf);
+    }
+    VideoDcFragments { messages }
+}
+
+/// Pump H.264 NAL units from scrcpy's video socket into the WebRTC peer.
+///
+/// Two transport paths, selected by the **viewer** at runtime via a
+/// `set_video_transport` control message and stored in
+/// `WebRtcPeer::video_transport()`:
+///
+/// 1. **`VideoTransport::Rtp` (default)** — each `VideoFrame` flows as
+///    `WriteVideo` to the peer task; str0m packetises it onto the
+///    negotiated `m=video` RTP track. This is what every browser viewer
+///    expects.
+/// 2. **`VideoTransport::DataChannel`** — we frame each `VideoFrame` and
+///    push it as `WriteVideoBinary` to the peer's `label="video"` binary
+///    DataChannel. Used by the iOS native client to feed the H.264
+///    elementary stream straight into `AVSampleBufferDisplayLayer`,
+///    bypassing Apple's broken `RTCVideoTrack` broadcaster.
+///
+/// Keyframe / codec-config frames always block until accepted (correctness
+/// critical); delta frames fall back to drop-newest so a slow peer task
+/// never backs up the device-side encoder.
 async fn run_video_pump(
     mut reader: VideoReader,
     peer: WebRtcPeer,
@@ -1128,20 +1254,82 @@ async fn run_video_pump(
         };
         VIDEO_FRAMES_TOTAL.with_label_values(&[kind]).inc();
 
-        // Keyframes and SPS/PPS config packets MUST reach the peer — losing
-        // them would strand the decoder until the next IDR interval.
-        // Delta frames are eligible for drop-newest backpressure: if the
-        // peer command queue happens to be full at this moment, skipping
-        // one P-frame produces at most one visual glitch and the decoder
-        // recovers on the next keyframe.
         let must_deliver = frame.is_keyframe || frame.is_config;
-        if must_deliver {
-            if let Err(e) = peer.write_video(frame).await {
-                warn!(error = %e, "peer write_video (keyframe/config)");
-                break "peer-write-error";
+        match peer.video_transport() {
+            VideoTransport::Rtp => {
+                // Keyframes and SPS/PPS config packets MUST reach the peer —
+                // losing them would strand the decoder until the next IDR
+                // interval. Delta frames are eligible for drop-newest
+                // backpressure.
+                if must_deliver {
+                    if let Err(e) = peer.write_video(frame).await {
+                        warn!(error = %e, "peer write_video (keyframe/config)");
+                        break "peer-write-error";
+                    }
+                } else if !peer.try_write_video(frame) {
+                    VIDEO_FRAMES_DROPPED.with_label_values(&["queue_full"]).inc();
+                }
             }
-        } else if !peer.try_write_video(frame) {
-            VIDEO_FRAMES_DROPPED.with_label_values(&["queue_full"]).inc();
+            VideoTransport::DataChannel => {
+                // Build self-describing wire fragments
+                // (see `build_video_dc_fragments` for the layout) and
+                // ship each as a binary DC message. SCTP's
+                // `max_message_size` (sctp-proto default 64 KB) caps
+                // a single message; 1080p IDR frames routinely exceed
+                // 100 KB so we always go through the fragmenter even
+                // when one fragment would suffice.
+                //
+                // Keyframe/config: every fragment blocks until accepted
+                // — losing any single fragment of a multi-fragment IDR
+                // strands the iOS decoder until the next IDR.
+                //
+                // Delta: drop-newest of the WHOLE fragment list as a
+                // unit if the first fragment can't enqueue (partial
+                // frame would just give the iOS decoder garbage).
+                let frags = build_video_dc_fragments(&frame);
+                if must_deliver {
+                    let mut any_failed = false;
+                    for msg in frags.messages {
+                        if let Err(e) = peer.write_video_binary(msg).await {
+                            warn!(error = %e, "peer write_video_binary fragment (keyframe/config)");
+                            any_failed = true;
+                            break;
+                        }
+                    }
+                    if any_failed {
+                        break "peer-write-error";
+                    }
+                } else {
+                    // Drop the whole frame atomically: try the first
+                    // fragment with try_send; if it fails, count as a
+                    // dropped frame and skip the remaining fragments
+                    // (sending only some fragments would be worse than
+                    // dropping the whole frame — the iOS reassembler
+                    // would buffer a partial frame forever).
+                    let mut iter = frags.messages.into_iter();
+                    if let Some(first) = iter.next() {
+                        if !peer.try_write_video_binary(first) {
+                            VIDEO_FRAMES_DROPPED
+                                .with_label_values(&["dc_queue_full"])
+                                .inc();
+                        } else {
+                            // First fragment accepted; the remaining
+                            // fragments use try_send too — if any of
+                            // them gets queue-rejected we count once
+                            // and drop the rest, since a partial frame
+                            // is unusable.
+                            for msg in iter {
+                                if !peer.try_write_video_binary(msg) {
+                                    VIDEO_FRAMES_DROPPED
+                                        .with_label_values(&["dc_queue_full_partial"])
+                                        .inc();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
 
@@ -1260,6 +1448,57 @@ async fn forward_control(
         }
         ControlIn::Unknown => {
             debug!("ignoring unknown datachannel message type");
+            return Ok(());
+        }
+        ControlIn::SetVideoTransport { mode } => {
+            // iOS native client opt-in for binary video transport. The
+            // selector is read by `run_video_pump` on every frame via
+            // `peer.video_transport()` (an Arc<AtomicU8>) — no command
+            // channel round-trip required.
+            //
+            // Browser viewers never send this; bridge default is
+            // `VideoTransport::Rtp`, which keeps the existing webrtc-client
+            // path on the `m=video` RTP track.
+            let new_mode = match mode.as_str() {
+                "datachannel" | "dc" | "data_channel" => Some(VideoTransport::DataChannel),
+                "rtp" => Some(VideoTransport::Rtp),
+                other => {
+                    warn!(mode = %other, "unknown set_video_transport mode; ignoring");
+                    None
+                }
+            };
+            if let Some(m) = new_mode {
+                info!(mode = ?m, "set_video_transport applied");
+                peer.set_video_transport(m);
+            }
+            return Ok(());
+        }
+        ControlIn::RequestKeyframe => {
+            // iOS native client asked for a fresh IDR (e.g. after
+            // displayLayer.failed or first NAL with no SPS). Forward as a
+            // scrcpy `ResetVideo` control message. Throttled identically
+            // to the browser-PLI path to avoid bursts during error
+            // recovery loops.
+            static LAST_REQ_KF: std::sync::atomic::AtomicI64 =
+                std::sync::atomic::AtomicI64::new(0);
+            const REQ_KF_THROTTLE_MS: i64 = 500;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let prev = LAST_REQ_KF.load(std::sync::atomic::Ordering::Relaxed);
+            if now_ms - prev < REQ_KF_THROTTLE_MS {
+                debug!("request_keyframe throttled");
+                return Ok(());
+            }
+            LAST_REQ_KF.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+            if let Some(ctrl) = control {
+                if let Err(e) = ctrl.reset_video().await {
+                    warn!(error = %e, "scrcpy reset_video on RequestKeyframe");
+                }
+            } else {
+                debug!("RequestKeyframe with no control socket; ignoring");
+            }
             return Ok(());
         }
         ControlIn::Configure {
@@ -1397,7 +1636,11 @@ async fn forward_control(
             // Handled pre-lock above; unreachable here.
         }
         // handled above
-        ControlIn::Ping { .. } | ControlIn::Stats { .. } | ControlIn::Unknown => {}
+        ControlIn::Ping { .. }
+        | ControlIn::Stats { .. }
+        | ControlIn::SetVideoTransport { .. }
+        | ControlIn::RequestKeyframe
+        | ControlIn::Unknown => {}
     }
     Ok(())
 }
@@ -1413,6 +1656,8 @@ fn msg_kind(msg: &ControlIn) -> &'static str {
         ControlIn::Configure { .. } => "configure",
         ControlIn::Ping { .. } => "ping",
         ControlIn::Stats { .. } => "stats",
+        ControlIn::SetVideoTransport { .. } => "set_video_transport",
+        ControlIn::RequestKeyframe => "request_keyframe",
         ControlIn::Unknown => "unknown",
     }
 }
