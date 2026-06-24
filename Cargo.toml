@@ -163,7 +163,14 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
-panic = "abort"
+# `unwind` (not `abort`) so a panic inside str0m 0.9 — notably the
+# `assert!(incoming.len() < 30_000)` in `crypto::ossl::io_buf` on
+# unconsumed DTLS data — can be caught at the `Rtc` driver boundary
+# (see `guard_str0m` in webrtc/peer.rs) and recovered as a session
+# rebuild, instead of SIGABRT'ing the whole bridge process. The unwind
+# tables are cold; this is network/codec-bound work so the codegen cost
+# is negligible. `[profile.dist]` inherits this.
+panic = "unwind"
 
 [profile.dist]
 inherits = "release"
