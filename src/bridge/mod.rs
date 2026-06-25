@@ -10,14 +10,14 @@
 //!   6. When the viewer disconnects, keep scrcpy running for a grace period
 //!      so a page refresh can reconnect without losing the encoder.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinSet;
-use tokio::time::Instant;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -32,9 +32,10 @@ use crate::mqtt::{
     MqttCredentials, MqttSignaling, MqttSignalingConfig, SignalRequest, SignalResponse,
 };
 use crate::observability::{
-    HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, CONTROL_MESSAGES_TOTAL, PLI_COUNT_TOTAL,
-    SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED, VIDEO_FRAMES_TOTAL,
-    VIEWER_BITRATE_BPS, VIEWER_CONNECTED, VIEWER_FPS, VIEWER_PACKETS_LOST, VIEWER_RTT_MS,
+    HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, CONTROL_MESSAGES_TOTAL,
+    PLI_COUNT_TOTAL, SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED,
+    VIDEO_FRAMES_TOTAL, VIEWER_BITRATE_BPS, VIEWER_CONNECTED, VIEWER_FPS, VIEWER_PACKETS_LOST,
+    VIEWER_RTT_MS,
 };
 use crate::scrcpy::protocol::{KeyAction, TouchAction};
 use crate::scrcpy::{
@@ -598,6 +599,13 @@ impl Bridge {
         let cancel = CancellationToken::new();
         let mut tasks: JoinSet<()> = JoinSet::new();
 
+        // Shared count of IDR keyframes the video pump has actually shipped
+        // to the peer. The event pump reads it to confirm that a
+        // `reset_video` issued on PLI really produced a fresh IDR (vs. a
+        // silently-wedged scrcpy capture), driving the keyframe-recovery
+        // escalation in `run_event_pump`.
+        let keyframes_observed = Arc::new(AtomicU64::new(0));
+
         // 3a. Event pump: peer -> MQTT + control forwarding + PLI handling.
         {
             let peer_for_evt = peer.clone();
@@ -610,6 +618,7 @@ impl Bridge {
             let scroll_sensitivity = self.cli.scroll_sensitivity;
             let viewer_for_evt = viewer_id.clone();
             let internal_tx_for_evt = internal_tx.clone();
+            let keyframes_for_evt = keyframes_observed.clone();
             tasks.spawn(async move {
                 run_event_pump(
                     peer_for_evt,
@@ -622,6 +631,7 @@ impl Bridge {
                     scroll_sensitivity,
                     viewer_for_evt,
                     internal_tx_for_evt,
+                    keyframes_for_evt,
                 )
                 .await;
             });
@@ -634,6 +644,7 @@ impl Bridge {
             let session_flag_for_video = current_session.clone();
             let viewer_for_video = viewer_id.clone();
             let internal_tx_for_video = internal_tx.clone();
+            let keyframes_for_video = keyframes_observed.clone();
             tasks.spawn(async move {
                 run_video_pump(
                     reader,
@@ -642,6 +653,7 @@ impl Bridge {
                     session_flag_for_video,
                     viewer_for_video,
                     internal_tx_for_video,
+                    keyframes_for_video,
                 )
                 .await;
             });
@@ -708,7 +720,9 @@ impl Bridge {
                         extra_local_ips.push(ip);
                     }
                     if extra_local_ips.is_empty() {
-                        warn!("no non-loopback interfaces found; WebRTC will only work over loopback");
+                        warn!(
+                            "no non-loopback interfaces found; WebRTC will only work over loopback"
+                        );
                     } else {
                         info!(count = extra_local_ips.len(), ips = ?extra_local_ips, "auto-enumerated host candidate IPs");
                     }
@@ -727,11 +741,8 @@ impl Bridge {
     /// **no** static `--mqtt-token` fallback: Runtime-issued JWTs expire in
     /// ~10 minutes and `rumqttc` reuses its initial password on reconnect,
     /// so a static token would guarantee a broken session at expiry.
-    async fn resolve_initial_credentials(
-        &self,
-    ) -> Result<(MqttCredentials, BootstrapResponse)> {
-        if self.cli.bridge_private_key_file.is_empty()
-            || self.cli.bridge_public_key_file.is_empty()
+    async fn resolve_initial_credentials(&self) -> Result<(MqttCredentials, BootstrapResponse)> {
+        if self.cli.bridge_private_key_file.is_empty() || self.cli.bridge_public_key_file.is_empty()
         {
             return Err(anyhow::anyhow!(
                 "BRIDGE_PRIVATE_KEY_FILE and BRIDGE_PUBLIC_KEY_FILE are required"
@@ -883,10 +894,8 @@ fn merge_ice_servers(bootstrap: &[IceServerPayload], cli: &Cli) -> Vec<IceServer
         })
         .collect();
 
-    let covered: std::collections::HashSet<String> = out
-        .iter()
-        .flat_map(|s| s.urls.iter().cloned())
-        .collect();
+    let covered: std::collections::HashSet<String> =
+        out.iter().flat_map(|s| s.urls.iter().cloned()).collect();
 
     for url in cli.ice_urls.iter() {
         let u = url.trim();
@@ -955,6 +964,80 @@ impl Session {
     }
 }
 
+/// In-flight keyframe-recovery attempt. Armed when a PLI triggers a
+/// `reset_video`; the watchdog tick later checks whether a fresh IDR
+/// actually landed (via the shared `keyframes_observed` counter) and
+/// either clears, retries, or escalates to a full session rebuild.
+struct VideoRecovery {
+    /// `keyframes_observed` snapshot at the moment the pending
+    /// `reset_video` was issued. A higher value at the deadline means an
+    /// IDR arrived and the decoder has recovered.
+    baseline: u64,
+    /// When to judge whether the reset took effect.
+    deadline: Instant,
+    /// `reset_video` attempts made so far this recovery cycle.
+    attempts: u32,
+}
+
+/// Slack after a `reset_video` before we judge whether scrcpy produced a
+/// fresh IDR. One encode cycle is ~50 ms at 20 fps; the rest is Wi-Fi /
+/// scheduling jitter. Too short risks escalating before a healthy reset
+/// lands; too long leaves the viewer green for longer.
+const RECOVERY_CONFIRM: Duration = Duration::from_millis(500);
+/// `reset_video` attempts before escalating to a full session rebuild.
+/// Two tries (~1 s) clears a transiently-wedged encoder without stalling
+/// the viewer on green indefinitely.
+const MAX_RESET_ATTEMPTS: u32 = 2;
+/// Floor between escalated session rebuilds, so a persistently broken
+/// device cannot bounce scrcpy in a tight loop.
+const REBUILD_THROTTLE: Duration = Duration::from_secs(5);
+/// How often the recovery watchdog wakes to evaluate a pending reset.
+const RECOVERY_TICK: Duration = Duration::from_millis(250);
+
+/// Outcome of evaluating an in-flight [`VideoRecovery`] at a watchdog tick.
+/// Pure data so the transition logic is unit-testable without async/IO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryDecision {
+    /// Confirm window not yet elapsed — keep waiting.
+    Pending,
+    /// A fresh IDR landed after the reset — clear recovery.
+    Confirmed,
+    /// No IDR yet, attempts remain — issue another `reset_video`.
+    Retry,
+    /// Out of reset attempts and a rebuild is allowed now — rebuild session.
+    Rebuild,
+    /// Out of reset attempts but a rebuild happened too recently — give up
+    /// this cycle and wait for the next PLI to re-arm.
+    RebuildThrottled,
+}
+
+/// Pure decision for the keyframe-recovery watchdog.
+///
+/// `seen`/`baseline` are the shared IDR counter now vs. when the pending
+/// `reset_video` was issued; `seen > baseline` means a new IDR arrived.
+fn evaluate_recovery(
+    seen: u64,
+    baseline: u64,
+    attempts: u32,
+    deadline_reached: bool,
+    rebuild_allowed: bool,
+) -> RecoveryDecision {
+    if !deadline_reached {
+        return RecoveryDecision::Pending;
+    }
+    if seen > baseline {
+        return RecoveryDecision::Confirmed;
+    }
+    if attempts < MAX_RESET_ATTEMPTS {
+        return RecoveryDecision::Retry;
+    }
+    if rebuild_allowed {
+        RecoveryDecision::Rebuild
+    } else {
+        RecoveryDecision::RebuildThrottled
+    }
+}
+
 /// Pump peer events out to MQTT, back into scrcpy control (PLI → reset_video,
 /// DataChannel control messages → touches/keys/etc), and surface connection
 /// state changes to the observability layer.
@@ -969,6 +1052,7 @@ async fn run_event_pump(
     scroll_sensitivity: f32,
     viewer_id: String,
     internal_tx: mpsc::Sender<BridgeInternalEvent>,
+    keyframes_observed: Arc<AtomicU64>,
 ) {
     let mut evt_rx = peer.subscribe();
     // Browsers emit PLI roughly every 200 ms after any packet loss. Scrcpy
@@ -979,12 +1063,77 @@ async fn run_event_pump(
     const PLI_THROTTLE: Duration = Duration::from_millis(200);
     let mut last_reset_video = Instant::now() - Duration::from_secs(5);
 
+    // Keyframe-recovery state machine (see `VideoRecovery`). `recovery` is
+    // `Some` only while we're waiting to confirm a reset_video took effect.
+    let mut recovery: Option<VideoRecovery> = None;
+    let mut last_rebuild = Instant::now() - REBUILD_THROTTLE;
+    let mut recovery_tick = tokio::time::interval(RECOVERY_TICK);
+    recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 debug!("event pump cancelled");
                 return;
+            }
+            _ = recovery_tick.tick() => {
+                let Some(state) = recovery.as_ref() else { continue };
+                let (baseline, attempts, deadline) =
+                    (state.baseline, state.attempts, state.deadline);
+                let seen = keyframes_observed.load(Ordering::Relaxed);
+                let decision = evaluate_recovery(
+                    seen,
+                    baseline,
+                    attempts,
+                    Instant::now() >= deadline,
+                    last_rebuild.elapsed() >= REBUILD_THROTTLE,
+                );
+                match decision {
+                    RecoveryDecision::Pending => {}
+                    RecoveryDecision::Confirmed => {
+                        debug!("keyframe recovery confirmed — IDR observed after reset_video");
+                        recovery = None;
+                    }
+                    RecoveryDecision::Retry => {
+                        let next_attempt = attempts + 1;
+                        warn!(attempt = next_attempt, "no IDR after reset_video — retrying");
+                        if let Some(ctrl) = control.as_ref() {
+                            if let Err(e) = ctrl.reset_video().await {
+                                warn!(error = %e, "scrcpy reset_video retry");
+                            }
+                        }
+                        recovery = Some(VideoRecovery {
+                            baseline: seen,
+                            deadline: Instant::now() + RECOVERY_CONFIRM,
+                            attempts: next_attempt,
+                        });
+                    }
+                    RecoveryDecision::RebuildThrottled => {
+                        recovery = None;
+                        warn!("keyframe recovery failed but rebuild throttled — waiting for next PLI");
+                    }
+                    RecoveryDecision::Rebuild => {
+                        // reset_video repeatedly failed to produce an IDR (e.g.
+                        // a silently-wedged capture). Rebuild the scrcpy session
+                        // the same way hot-reconfigure / video-eof do — emit
+                        // `stream_restarted` and drop the session so the browser
+                        // reconnects onto a fresh scrcpy whose first NAL is a
+                        // natural IDR.
+                        recovery = None;
+                        last_rebuild = Instant::now();
+                        warn!("video stuck after repeated reset_video — rebuilding scrcpy session");
+                        let _ = peer
+                            .send_control_text(datachannel::build_stream_restarted())
+                            .await;
+                        if let Some(session) = current_session.lock().await.take() {
+                            tokio::spawn(async move {
+                                session.shutdown().await;
+                            });
+                        }
+                        SCRCPY_RUNNING.set(0);
+                    }
+                }
             }
             recv = evt_rx.recv() => {
                 let evt = match recv {
@@ -1073,6 +1222,13 @@ async fn run_event_pump(
                     }
                     PeerEvent::KeyframeRequested => {
                         PLI_COUNT_TOTAL.inc();
+                        // Already recovering: we drive reset_video on our own
+                        // confirm-timeout schedule, so swallow the browser's
+                        // PLI storm (it repeats every ~200 ms until an IDR
+                        // lands) instead of re-issuing resets underneath it.
+                        if recovery.is_some() {
+                            continue;
+                        }
                         let now = Instant::now();
                         if now.duration_since(last_reset_video) < PLI_THROTTLE {
                             continue;
@@ -1080,13 +1236,47 @@ async fn run_event_pump(
                         last_reset_video = now;
                         if let Some(ctrl) = control.as_ref() {
                             info!("PLI received — asking scrcpy for keyframe");
+                            // Snapshot BEFORE the reset so a fresh IDR strictly
+                            // after this point is what confirms recovery.
+                            let baseline = keyframes_observed.load(Ordering::Relaxed);
                             if let Err(e) = ctrl.reset_video().await {
                                 warn!(error = %e, "scrcpy reset_video on PLI");
                             }
+                            recovery = Some(VideoRecovery {
+                                baseline,
+                                deadline: Instant::now() + RECOVERY_CONFIRM,
+                                attempts: 1,
+                            });
                         }
                     }
                     PeerEvent::Error(e) => {
-                        warn!(%e, "peer error event");
+                        // Fatal peer-loop exit — now also reached when
+                        // `guard_str0m` catches a str0m panic instead of
+                        // letting it abort the process. The WebRTC socket is
+                        // already closed, so reap this session (if we still
+                        // own it) the same way the video-eof path does and let
+                        // the browser's reconnect land on a fresh session via
+                        // `on_offer`. Without this the dead peer would linger
+                        // with scrcpy still encoding into a closed socket.
+                        warn!(%e, "peer error event — tearing down session for rebuild");
+                        let still_owner = {
+                            let guard = current_session.lock().await;
+                            guard.as_ref().map(|s| s.viewer_id == viewer_id).unwrap_or(false)
+                        };
+                        if still_owner {
+                            let _ = internal_tx
+                                .send(BridgeInternalEvent::ClearGraceFor {
+                                    viewer_id: viewer_id.clone(),
+                                })
+                                .await;
+                            if let Some(session) = current_session.lock().await.take() {
+                                tokio::spawn(async move {
+                                    session.shutdown().await;
+                                });
+                            }
+                            SCRCPY_RUNNING.set(0);
+                        }
+                        return;
                     }
                 }
             }
@@ -1204,6 +1394,80 @@ fn build_video_dc_fragments(frame: &VideoFrame) -> VideoDcFragments {
     VideoDcFragments { messages }
 }
 
+fn should_prepend_cached_config(
+    is_keyframe: bool,
+    previous_frame_was_config: bool,
+    has_cached_config: bool,
+) -> bool {
+    is_keyframe && !previous_frame_was_config && has_cached_config
+}
+
+async fn deliver_video_frame(peer: &WebRtcPeer, frame: VideoFrame) -> Result<bool> {
+    let must_deliver = frame.is_keyframe || frame.is_config;
+    match peer.video_transport() {
+        VideoTransport::Rtp => {
+            // Keyframes and SPS/PPS config packets MUST reach the peer —
+            // losing them would strand the decoder until the next IDR
+            // interval. Delta frames are eligible for drop-newest
+            // backpressure.
+            if must_deliver {
+                peer.write_video(frame).await?;
+                Ok(true)
+            } else if peer.try_write_video(frame) {
+                Ok(true)
+            } else {
+                VIDEO_FRAMES_DROPPED
+                    .with_label_values(&["queue_full"])
+                    .inc();
+                Ok(false)
+            }
+        }
+        VideoTransport::DataChannel => {
+            // Build self-describing wire fragments
+            // (see `build_video_dc_fragments` for the layout) and
+            // ship each as a binary DC message. SCTP's
+            // `max_message_size` (sctp-proto default 64 KB) caps
+            // a single message; 1080p IDR frames routinely exceed
+            // 100 KB so we always go through the fragmenter even
+            // when one fragment would suffice.
+            //
+            // Keyframe/config: every fragment blocks until accepted
+            // — losing any single fragment of a multi-fragment IDR
+            // strands the iOS decoder until the next IDR.
+            //
+            // Delta: drop-newest of the WHOLE fragment list as a
+            // unit if the first fragment can't enqueue (partial
+            // frame would just give the iOS decoder garbage).
+            let frags = build_video_dc_fragments(&frame);
+            if must_deliver {
+                for msg in frags.messages {
+                    peer.write_video_binary(msg).await?;
+                }
+                Ok(true)
+            } else {
+                let mut iter = frags.messages.into_iter();
+                if let Some(first) = iter.next() {
+                    if !peer.try_write_video_binary(first) {
+                        VIDEO_FRAMES_DROPPED
+                            .with_label_values(&["dc_queue_full"])
+                            .inc();
+                        return Ok(false);
+                    }
+                    for msg in iter {
+                        if !peer.try_write_video_binary(msg) {
+                            VIDEO_FRAMES_DROPPED
+                                .with_label_values(&["dc_queue_full_partial"])
+                                .inc();
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+}
+
 /// Pump H.264 NAL units from scrcpy's video socket into the WebRTC peer.
 ///
 /// Two transport paths, selected by the **viewer** at runtime via a
@@ -1230,7 +1494,11 @@ async fn run_video_pump(
     current_session: Arc<Mutex<Option<Session>>>,
     viewer_id: String,
     internal_tx: mpsc::Sender<BridgeInternalEvent>,
+    keyframes_observed: Arc<AtomicU64>,
 ) {
+    let mut latest_config: Option<VideoFrame> = None;
+    let mut previous_frame_was_config = false;
+
     let exit_reason: &'static str = loop {
         let frame = tokio::select! {
             biased;
@@ -1254,83 +1522,40 @@ async fn run_video_pump(
         };
         VIDEO_FRAMES_TOTAL.with_label_values(&[kind]).inc();
 
-        let must_deliver = frame.is_keyframe || frame.is_config;
-        match peer.video_transport() {
-            VideoTransport::Rtp => {
-                // Keyframes and SPS/PPS config packets MUST reach the peer —
-                // losing them would strand the decoder until the next IDR
-                // interval. Delta frames are eligible for drop-newest
-                // backpressure.
-                if must_deliver {
-                    if let Err(e) = peer.write_video(frame).await {
-                        warn!(error = %e, "peer write_video (keyframe/config)");
-                        break "peer-write-error";
-                    }
-                } else if !peer.try_write_video(frame) {
-                    VIDEO_FRAMES_DROPPED.with_label_values(&["queue_full"]).inc();
-                }
-            }
-            VideoTransport::DataChannel => {
-                // Build self-describing wire fragments
-                // (see `build_video_dc_fragments` for the layout) and
-                // ship each as a binary DC message. SCTP's
-                // `max_message_size` (sctp-proto default 64 KB) caps
-                // a single message; 1080p IDR frames routinely exceed
-                // 100 KB so we always go through the fragmenter even
-                // when one fragment would suffice.
-                //
-                // Keyframe/config: every fragment blocks until accepted
-                // — losing any single fragment of a multi-fragment IDR
-                // strands the iOS decoder until the next IDR.
-                //
-                // Delta: drop-newest of the WHOLE fragment list as a
-                // unit if the first fragment can't enqueue (partial
-                // frame would just give the iOS decoder garbage).
-                let frags = build_video_dc_fragments(&frame);
-                if must_deliver {
-                    let mut any_failed = false;
-                    for msg in frags.messages {
-                        if let Err(e) = peer.write_video_binary(msg).await {
-                            warn!(error = %e, "peer write_video_binary fragment (keyframe/config)");
-                            any_failed = true;
-                            break;
-                        }
-                    }
-                    if any_failed {
-                        break "peer-write-error";
-                    }
-                } else {
-                    // Drop the whole frame atomically: try the first
-                    // fragment with try_send; if it fails, count as a
-                    // dropped frame and skip the remaining fragments
-                    // (sending only some fragments would be worse than
-                    // dropping the whole frame — the iOS reassembler
-                    // would buffer a partial frame forever).
-                    let mut iter = frags.messages.into_iter();
-                    if let Some(first) = iter.next() {
-                        if !peer.try_write_video_binary(first) {
-                            VIDEO_FRAMES_DROPPED
-                                .with_label_values(&["dc_queue_full"])
-                                .inc();
-                        } else {
-                            // First fragment accepted; the remaining
-                            // fragments use try_send too — if any of
-                            // them gets queue-rejected we count once
-                            // and drop the rest, since a partial frame
-                            // is unusable.
-                            for msg in iter {
-                                if !peer.try_write_video_binary(msg) {
-                                    VIDEO_FRAMES_DROPPED
-                                        .with_label_values(&["dc_queue_full_partial"])
-                                        .inc();
-                                    break;
-                                }
-                            }
-                        }
-                    }
+        if frame.is_config {
+            latest_config = Some(frame.clone());
+        }
+
+        let is_keyframe = frame.is_keyframe;
+        let is_config = frame.is_config;
+        if should_prepend_cached_config(
+            is_keyframe,
+            previous_frame_was_config,
+            latest_config.is_some(),
+        ) {
+            if let Some(config) = latest_config.clone() {
+                debug!("prepending cached H.264 config before keyframe");
+                if let Err(e) = deliver_video_frame(&peer, config).await {
+                    warn!(error = %e, "peer write_video (cached config)");
+                    break "peer-write-error";
                 }
             }
         }
+
+        if let Err(e) = deliver_video_frame(&peer, frame).await {
+            warn!(error = %e, "peer write_video");
+            break "peer-write-error";
+        }
+
+        // The IDR above was accepted by the peer — any delivery failure
+        // would have `break`n the loop before reaching here. Bump only now
+        // so the recovery watchdog reads "confirmed" as "the decoder will
+        // receive a fresh IDR", not merely "scrcpy emitted one we then
+        // failed to ship".
+        if is_keyframe {
+            keyframes_observed.fetch_add(1, Ordering::Relaxed);
+        }
+        previous_frame_was_config = is_config;
     };
 
     // scrcpy video pipeline ended. Only tell the browser to reset its
@@ -1370,11 +1595,7 @@ async fn run_video_pump(
 /// no audible value, and the backlog latency it would introduce is worse
 /// than the single-packet gap. Config (OpusHead) is filtered inside the
 /// peer task since that's where codec knowledge lives.
-async fn run_audio_pump(
-    mut reader: AudioReader,
-    peer: WebRtcPeer,
-    cancel: CancellationToken,
-) {
+async fn run_audio_pump(mut reader: AudioReader, peer: WebRtcPeer, cancel: CancellationToken) {
     loop {
         let pkt = tokio::select! {
             biased;
@@ -1436,8 +1657,7 @@ async fn forward_control(
             VIEWER_BITRATE_BPS.set(*bitrate_bps);
             VIEWER_RTT_MS.set(*round_trip_time * 1000.0);
             // Monotonic browser counter — only bump Prometheus by the delta.
-            static LAST_LOST: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static LAST_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let prev = LAST_LOST.swap(*packets_lost, std::sync::atomic::Ordering::Relaxed);
             if *packets_lost >= prev {
                 VIEWER_PACKETS_LOST.inc_by(*packets_lost - prev);
@@ -1479,8 +1699,7 @@ async fn forward_control(
             // scrcpy `ResetVideo` control message. Throttled identically
             // to the browser-PLI path to avoid bursts during error
             // recovery loops.
-            static LAST_REQ_KF: std::sync::atomic::AtomicI64 =
-                std::sync::atomic::AtomicI64::new(0);
+            static LAST_REQ_KF: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
             const REQ_KF_THROTTLE_MS: i64 = 500;
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1590,7 +1809,15 @@ async fn forward_control(
         } => {
             if let Some(a) = TouchAction::parse(&action) {
                 let _ = control
-                    .inject_touch(a, x, y, screen_width.max(1), screen_height.max(1), pointer_id, pressure)
+                    .inject_touch(
+                        a,
+                        x,
+                        y,
+                        screen_width.max(1),
+                        screen_height.max(1),
+                        pointer_id,
+                        pressure,
+                    )
                     .await;
             }
         }
@@ -1610,7 +1837,11 @@ async fn forward_control(
         }
         ControlIn::Key { action, keycode } => {
             if let Some(code) = crate::scrcpy::protocol::keycode_from_name(&keycode) {
-                let a = if action == "up" { KeyAction::Up } else { KeyAction::Down };
+                let a = if action == "up" {
+                    KeyAction::Up
+                } else {
+                    KeyAction::Down
+                };
                 let _ = control.inject_keycode(a, code, 0, 0).await;
             }
         }
@@ -1682,6 +1913,101 @@ mod tests {
     use std::io::Write;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+
+    // ── Keyframe-recovery state machine ────────────────────────────────────
+
+    #[test]
+    fn recovery_pending_before_deadline() {
+        // Confirm window hasn't elapsed yet — wait regardless of IDR state.
+        assert_eq!(
+            evaluate_recovery(5, 5, 1, /*deadline_reached*/ false, true),
+            RecoveryDecision::Pending,
+        );
+    }
+
+    #[test]
+    fn recovery_confirmed_when_new_idr_arrives() {
+        // A strictly higher counter than the baseline = a fresh IDR landed.
+        assert_eq!(
+            evaluate_recovery(6, 5, 1, true, true),
+            RecoveryDecision::Confirmed,
+        );
+    }
+
+    #[test]
+    fn recovery_retries_when_no_idr_and_attempts_remain() {
+        // First attempt, deadline reached, no new IDR → ask scrcpy again.
+        assert_eq!(
+            evaluate_recovery(5, 5, 1, true, true),
+            RecoveryDecision::Retry,
+        );
+    }
+
+    #[test]
+    fn recovery_rebuilds_after_attempts_exhausted() {
+        // attempts == MAX_RESET_ATTEMPTS, still no IDR, rebuild allowed.
+        assert_eq!(
+            evaluate_recovery(5, 5, MAX_RESET_ATTEMPTS, true, true),
+            RecoveryDecision::Rebuild,
+        );
+    }
+
+    #[test]
+    fn recovery_rebuild_is_throttled() {
+        // Out of attempts but a rebuild happened too recently — back off.
+        assert_eq!(
+            evaluate_recovery(
+                5,
+                5,
+                MAX_RESET_ATTEMPTS,
+                true,
+                /*rebuild_allowed*/ false
+            ),
+            RecoveryDecision::RebuildThrottled,
+        );
+    }
+
+    #[test]
+    fn recovery_confirm_wins_even_with_attempts_exhausted() {
+        // A late IDR that lands exactly at the escalation tick still counts
+        // as recovered — never rebuild a session that just healed itself.
+        assert_eq!(
+            evaluate_recovery(7, 5, MAX_RESET_ATTEMPTS, true, true),
+            RecoveryDecision::Confirmed,
+        );
+    }
+
+    #[test]
+    fn prepends_cached_config_for_bare_keyframe() {
+        assert!(should_prepend_cached_config(
+            /*is_keyframe*/ true, /*previous_frame_was_config*/ false,
+            /*has_cached_config*/ true,
+        ));
+    }
+
+    #[test]
+    fn does_not_prepend_when_keyframe_follows_config() {
+        assert!(!should_prepend_cached_config(
+            /*is_keyframe*/ true, /*previous_frame_was_config*/ true,
+            /*has_cached_config*/ true,
+        ));
+    }
+
+    #[test]
+    fn does_not_prepend_without_cached_config() {
+        assert!(!should_prepend_cached_config(
+            /*is_keyframe*/ true, /*previous_frame_was_config*/ false,
+            /*has_cached_config*/ false,
+        ));
+    }
+
+    #[test]
+    fn does_not_prepend_for_delta_frame() {
+        assert!(!should_prepend_cached_config(
+            /*is_keyframe*/ false, /*previous_frame_was_config*/ false,
+            /*has_cached_config*/ true,
+        ));
+    }
 
     /// Build a `Cli` populated with placeholder values for every required
     /// field. Individual tests override the subset they exercise.
@@ -1874,4 +2200,3 @@ mod tests {
         assert_eq!(merged[0].urls, vec!["stun:stun.l.google.com:19302"]);
     }
 }
-

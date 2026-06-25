@@ -17,6 +17,7 @@
 //! behind a coturn instance with `TURN_URLS` pre-configured in the SDP.
 
 use std::net::SocketAddr;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -216,9 +217,7 @@ impl WebRtcPeer {
     /// on non-keyframe deltas so the scrcpy reader never stalls on a slow
     /// peer task.
     pub fn try_write_video(&self, frame: VideoFrame) -> bool {
-        self.cmd_tx
-            .try_send(PeerCommand::WriteVideo(frame))
-            .is_ok()
+        self.cmd_tx.try_send(PeerCommand::WriteVideo(frame)).is_ok()
     }
 
     /// Send a pre-framed H.264 payload on the binary `video` DataChannel.
@@ -265,9 +264,7 @@ impl WebRtcPeer {
     /// up more than a handful of 20 ms Opus frames just adds latency with
     /// no quality benefit.
     pub fn try_write_audio(&self, pkt: AudioPacket) -> bool {
-        self.cmd_tx
-            .try_send(PeerCommand::WriteAudio(pkt))
-            .is_ok()
+        self.cmd_tx.try_send(PeerCommand::WriteAudio(pkt)).is_ok()
     }
 
     pub async fn send_control_text(&self, msg: String) -> Result<()> {
@@ -319,9 +316,7 @@ async fn run_peer(
     let local_addr = socket.local_addr()?;
     info!(%local_addr, "WebRTC UDP socket bound");
 
-    let mut rtc_config = Rtc::builder()
-        .set_rtp_mode(false)
-        .enable_raw_packets(false);
+    let mut rtc_config = Rtc::builder().set_rtp_mode(false).enable_raw_packets(false);
 
     // Add support for Apple iOS WebRTC.framework's preferred H.264
     // profile-level-ids (Level 4.1 variants).
@@ -356,9 +351,9 @@ async fn run_peer(
     // capabilities, so str0m matching the `42e029` entry is enough
     // to lock H.264 in the answer; the `640c29` capability is just
     // ignored and that's fine.
-    rtc_config.codec_config().add_h264(
-        110_u8.into(), Some(111_u8.into()), true, 0x42e029,
-    );
+    rtc_config
+        .codec_config()
+        .add_h264(110_u8.into(), Some(111_u8.into()), true, 0x42e029);
 
     let mut rtc = rtc_config.build();
 
@@ -379,8 +374,8 @@ async fn run_peer(
     let mut local_candidate_ips: Vec<std::net::IpAddr> = Vec::new();
     let ip_is_wildcard = local_addr.ip().is_unspecified();
     if !ip_is_wildcard {
-        let candidate = Candidate::host(local_addr, "udp")
-            .map_err(|e| anyhow!("build host candidate: {e}"))?;
+        let candidate =
+            Candidate::host(local_addr, "udp").map_err(|e| anyhow!("build host candidate: {e}"))?;
         rtc.add_local_candidate(candidate);
         local_candidate_ips.push(local_addr.ip());
     } else {
@@ -418,7 +413,10 @@ async fn run_peer(
     loop {
         // 1. Drain str0m outputs.
         loop {
-            match rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))? {
+            let output = guard_str0m("poll_output", || {
+                rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))
+            })?;
+            match output {
                 Output::Timeout(when) => {
                     let now = Instant::now();
                     let delay = if when > now {
@@ -429,8 +427,10 @@ async fn run_peer(
                     // Wait for the earliest of (timeout, UDP packet, command).
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {
-                            rtc.handle_input(Input::Timeout(Instant::now()))
-                                .map_err(|e| anyhow!("handle_input(Timeout): {e}"))?;
+                            guard_str0m("handle_input(Timeout)", || {
+                                rtc.handle_input(Input::Timeout(Instant::now()))
+                                    .map_err(|e| anyhow!("handle_input(Timeout): {e}"))
+                            })?;
                         }
                         res = socket.recv_from(&mut buf) => {
                             match res {
@@ -456,16 +456,22 @@ async fn run_peer(
                                     let contents = (&buf[..n])
                                         .try_into()
                                         .map_err(|_| anyhow!("invalid incoming udp packet"))?;
-                                    rtc.handle_input(Input::Receive(
-                                        Instant::now(),
-                                        Receive {
-                                            proto: Protocol::Udp,
-                                            source: src,
-                                            destination: dest,
-                                            contents,
-                                        },
-                                    ))
-                                    .map_err(|e| anyhow!("handle_input(Receive): {e}"))?;
+                                    // The DTLS receive path is where str0m 0.9
+                                    // can `assert!`-panic on unconsumed data;
+                                    // guard it so that aborts the session, not
+                                    // the process.
+                                    guard_str0m("handle_input(Receive)", || {
+                                        rtc.handle_input(Input::Receive(
+                                            Instant::now(),
+                                            Receive {
+                                                proto: Protocol::Udp,
+                                                source: src,
+                                                destination: dest,
+                                                contents,
+                                            },
+                                        ))
+                                        .map_err(|e| anyhow!("handle_input(Receive): {e}"))
+                                    })?;
                                 }
                                 Err(e) => warn!(error=%e, "udp recv"),
                             }
@@ -498,6 +504,32 @@ async fn run_peer(
     }
 }
 
+/// Run a synchronous `Rtc` driver call under `catch_unwind`, turning a str0m
+/// panic into a recoverable error instead of letting it unwind out of the
+/// peer task. str0m 0.9 has `assert!`/`expect` panic sites in its OpenSSL
+/// DTLS layer (e.g. `crypto::ossl::io_buf`'s 30 KB unconsumed-data assert)
+/// that fire on adversarial or merely unlucky traffic; with `panic = "unwind"`
+/// (set in Cargo.toml) we catch them here, end the peer task, and let the
+/// bridge rebuild the session — rather than aborting the whole process.
+///
+/// `AssertUnwindSafe` is sound here because the error path discards `rtc`
+/// entirely (the caller returns and the session is torn down); nothing
+/// observes the possibly-inconsistent `Rtc` after a caught panic.
+fn guard_str0m<T>(what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            warn!(call = what, panic = %msg, "str0m panicked — tearing down peer for rebuild");
+            Err(anyhow!("str0m panicked in {what}: {msg}"))
+        }
+    }
+}
+
 async fn handle_command(
     cmd: PeerCommand,
     rtc: &mut Rtc,
@@ -506,8 +538,8 @@ async fn handle_command(
 ) -> Result<bool> {
     match cmd {
         PeerCommand::AcceptOffer(sdp) => {
-            let offer = SdpOffer::from_sdp_string(&sdp)
-                .map_err(|e| anyhow!("parse offer sdp: {e}"))?;
+            let offer =
+                SdpOffer::from_sdp_string(&sdp).map_err(|e| anyhow!("parse offer sdp: {e}"))?;
             // `accept_offer` bakes the current set of local candidates into
             // the answer SDP synchronously — so candidates must already be
             // added via `rtc.add_local_candidate` before we get here. The
@@ -856,7 +888,10 @@ fn pick_local_ip(local_ips: &[std::net::IpAddr], src: std::net::IpAddr) -> std::
     }
     let same_family = |ip: &std::net::IpAddr| ip.is_ipv4() == src.is_ipv4();
     if src.is_loopback() {
-        if let Some(ip) = local_ips.iter().find(|ip| ip.is_loopback() && same_family(ip)) {
+        if let Some(ip) = local_ips
+            .iter()
+            .find(|ip| ip.is_loopback() && same_family(ip))
+        {
             return *ip;
         }
     }
@@ -865,14 +900,20 @@ fn pick_local_ip(local_ips: &[std::net::IpAddr], src: std::net::IpAddr) -> std::
         if let Some(ip) = local_ips.iter().find(|ip| match ip {
             std::net::IpAddr::V4(v4) => {
                 let o = v4.octets();
-                !v4.is_loopback() && o[0] == src_octets[0] && o[1] == src_octets[1] && o[2] == src_octets[2]
+                !v4.is_loopback()
+                    && o[0] == src_octets[0]
+                    && o[1] == src_octets[1]
+                    && o[2] == src_octets[2]
             }
             _ => false,
         }) {
             return *ip;
         }
     }
-    if let Some(ip) = local_ips.iter().find(|ip| same_family(ip) && !ip.is_loopback()) {
+    if let Some(ip) = local_ips
+        .iter()
+        .find(|ip| same_family(ip) && !ip.is_loopback())
+    {
         return *ip;
     }
     if let Some(ip) = local_ips.iter().find(|ip| same_family(ip)) {
@@ -1024,8 +1065,12 @@ a=max-message-size:262144\r\n";
 
         // Suppress unused-import warning for RtcEvent / Mid / MediaKind —
         // they're consumed by the other test in this module.
-        let _ = (RtcEvent::IceConnectionStateChange(str0m::IceConnectionState::New),
-                  Mid::from("m"), MediaKind::Video, Codec::Opus);
+        let _ = (
+            RtcEvent::IceConnectionStateChange(str0m::IceConnectionState::New),
+            Mid::from("m"),
+            MediaKind::Video,
+            Codec::Opus,
+        );
     }
 }
 
@@ -1071,5 +1116,42 @@ mod stream_ready_tests {
         state.ice_connected = true;
         maybe_emit_stream_ready(&mut state, &tx);
         assert!(matches!(rx.try_recv(), Ok(PeerEvent::StreamReady)));
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn guard_passes_ok_through() {
+        let r = guard_str0m("ok", || Ok::<u32, anyhow::Error>(42));
+        assert_eq!(r.unwrap(), 42);
+    }
+
+    #[test]
+    fn guard_propagates_inner_err_without_panic() {
+        let r = guard_str0m("inner-err", || Err::<(), anyhow::Error>(anyhow!("boom")));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn guard_catches_str_panic() {
+        // Mimics str0m's `assert!` panic (which carries a &str payload):
+        // the process must NOT abort — we get an Err back instead.
+        let r = guard_str0m("panic", || -> Result<()> {
+            panic!("Incoming DTLS data is not being consumed")
+        });
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("str0m panicked in panic"));
+        assert!(msg.contains("Incoming DTLS data is not being consumed"));
+    }
+
+    #[test]
+    fn guard_catches_string_panic() {
+        let r = guard_str0m("panic", || -> Result<()> {
+            panic!("{}", String::from("dynamic message"))
+        });
+        assert!(r.unwrap_err().to_string().contains("dynamic message"));
     }
 }
