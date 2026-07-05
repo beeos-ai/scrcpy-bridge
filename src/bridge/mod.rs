@@ -52,15 +52,23 @@ const MQTT_USERNAME: &str = "device";
 /// appears to be gone (ICE disconnected/failed, or explicit `Close`
 /// request). Inside this window:
 ///
-///   * a subsequent `Offer` from the same `viewer_id` is handled as a
-///     cheap ICE restart on the existing `WebRtcPeer` — no scrcpy bounce,
-///     no black frame;
+///   * a subsequent `Offer` from the same `viewer_id` AND the same DTLS
+///     fingerprint (i.e. the same live `RTCPeerConnection` doing
+///     `createOffer({iceRestart: true})`) is handled as a cheap ICE
+///     restart on the existing `WebRtcPeer` — no scrcpy bounce, no
+///     black frame;
+///   * a same-viewer `Offer` with a NEW DTLS fingerprint (page reload —
+///     the browser mints a fresh certificate per `RTCPeerConnection`)
+///     rebuilds the session silently: scrcpy restarts (~1-2 s black
+///     frame) but no `viewer_kicked` is sent. An ICE restart can never
+///     work here because str0m keeps the established DTLS session and
+///     pins the fingerprint from the first offer;
 ///   * an `Offer` from a different `viewer_id` (or timeout) tears down
 ///     the stale session first, restoring the "most recent viewer wins"
 ///     semantics.
 ///
-/// 30 s is a sweet spot: long enough to survive `window.onbeforeunload`
-/// + page reload, wifi handoff, tab backgrounding on mobile Safari; short
+/// 30 s is a sweet spot: long enough to survive wifi handoff, tab
+/// backgrounding on mobile Safari, and transient network blips; short
 /// enough that a real device abandonment doesn't pin the encoder.
 const SESSION_GRACE: Duration = Duration::from_secs(30);
 
@@ -123,6 +131,40 @@ fn arm_grace(slot: &mut Option<SessionGrace>, viewer_id: String, reason: &'stati
                 reason,
             });
         }
+    }
+}
+
+/// Extract the DTLS fingerprint from an SDP blob: the value of the first
+/// `a=fingerprint:` line, whether it appears at session level or on the
+/// first m-line (a single RTCPeerConnection uses one certificate, so all
+/// occurrences are identical). The hash-algorithm prefix is kept and the
+/// whole value is lowercased so comparisons are canonical regardless of
+/// the producer's hex casing (browsers emit uppercase, str0m lowercase).
+fn extract_dtls_fingerprint(sdp: &str) -> Option<String> {
+    sdp.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("a=fingerprint:")
+            .map(|v| v.trim().to_ascii_lowercase())
+    })
+}
+
+/// Decide whether a same-viewer offer may take the ICE-restart fast path
+/// on the existing str0m peer.
+///
+/// Only a genuine `createOffer({iceRestart: true})` from the SAME
+/// `RTCPeerConnection` qualifies — and the DTLS certificate (thus the
+/// `a=fingerprint` value) is the invariant that identifies it. A page
+/// reload keeps the viewerId (sessionStorage) but mints a fresh
+/// certificate; str0m pins the fingerprint from the first offer and
+/// never rebuilds DTLS on `accept_offer`, so handing it a new-cert offer
+/// wedges the browser in an endless "Connecting" loop.
+///
+/// Missing fingerprints on either side disqualify the fast path:
+/// correctness (full rebuild always works) beats the optimization.
+fn fast_path_eligible(session_fp: Option<&str>, offer_fp: Option<&str>) -> bool {
+    match (session_fp, offer_fp) {
+        (Some(s), Some(o)) => s == o,
+        _ => false,
     }
 }
 
@@ -424,7 +466,12 @@ impl Bridge {
     ) -> Result<()> {
         info!(viewer = %viewer_id, "received WebRTC offer");
 
-        // Fast path — same viewer, live peer:
+        // Extract the offer's DTLS fingerprint up front — `offer_sdp`
+        // is consumed by the session construction below, and the fast
+        // path needs it to decide eligibility.
+        let offer_fingerprint = extract_dtls_fingerprint(&offer_sdp);
+
+        // Fast path — same viewer, same RTCPeerConnection, live peer:
         //   * The viewer side just re-ran `createOffer({iceRestart:
         //     true})` after detecting unhealthy (A2) or as part of a
         //     recovery from within our grace window.
@@ -437,41 +484,69 @@ impl Bridge {
         // Eligibility: non-empty viewer id (legacy viewers that
         // predate B3 sent empty strings and must not cross-contaminate
         // sessions) AND the viewer is still the owner of the current
-        // session. str0m 0.9 has no "unrecoverable" state we can
-        // check — if accept_offer itself fails we fall through to
-        // the replace path below (Fix B).
+        // session AND the offer carries the SAME DTLS fingerprint as
+        // the offer that created the session (`fast_path_eligible`).
+        //
+        // The fingerprint check is what tells a genuine ICE restart
+        // apart from a page reload. A reloaded page keeps its viewerId
+        // (sessionStorage) but builds a brand-new RTCPeerConnection
+        // with a fresh DTLS certificate. Feeding that offer to the
+        // existing str0m peer can NEVER work: str0m pins the remote
+        // fingerprint from the first offer (change/sdp.rs — only set
+        // when `None`) and keeps the established DTLS session, so the
+        // browser's new DTLS handshake either stalls forever (browser
+        // stuck at "Connecting", retrying under the same viewerId — an
+        // infinite loop) or completes and gets killed by the
+        // fingerprint mismatch check. Such offers must take the
+        // silent-rebuild path below instead.
+        //
+        // str0m 0.9 has no "unrecoverable" state we can check — if
+        // accept_offer itself fails we fall through to the replace
+        // path below (Fix B).
         if !viewer_id.is_empty() {
             let peer_opt = {
                 let guard = current_session.lock().await;
                 guard
                     .as_ref()
                     .filter(|s| s.viewer_id == viewer_id)
-                    .map(|s| s.peer.clone())
+                    .map(|s| (s.peer.clone(), s.remote_fingerprint.clone()))
             };
-            if let Some(peer) = peer_opt {
-                info!(
-                    viewer = %viewer_id,
-                    "same-viewer offer → ICE restart on existing peer (scrcpy preserved)"
-                );
-                // Clone the SDP so the replace path below can still
-                // consume it if str0m refuses the fast-path offer
-                // (e.g. the peer is in a state the SDP-state-machine
-                // can't reconcile). String clone is negligible vs.
-                // the alternative of losing a recovery opportunity.
-                match peer.accept_offer(offer_sdp.clone()).await {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        warn!(
-                            viewer = %viewer_id,
-                            error = %e,
-                            "fast-path accept_offer failed — falling back to full session rebuild"
-                        );
-                        // Fall through to the replace path below.
-                        // The next block takes current_session, which
-                        // will kick this (now-wedged) peer + scrcpy
-                        // and spawn a fresh session — same semantics
-                        // as a different-viewer takeover.
+            if let Some((peer, session_fingerprint)) = peer_opt {
+                if fast_path_eligible(session_fingerprint.as_deref(), offer_fingerprint.as_deref())
+                {
+                    info!(
+                        viewer = %viewer_id,
+                        "same-viewer offer → ICE restart on existing peer (scrcpy preserved)"
+                    );
+                    // Clone the SDP so the replace path below can still
+                    // consume it if str0m refuses the fast-path offer
+                    // (e.g. the peer is in a state the SDP-state-machine
+                    // can't reconcile). String clone is negligible vs.
+                    // the alternative of losing a recovery opportunity.
+                    match peer.accept_offer(offer_sdp.clone()).await {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            warn!(
+                                viewer = %viewer_id,
+                                error = %e,
+                                "fast-path accept_offer failed — falling back to full session rebuild"
+                            );
+                            // Fall through to the replace path below.
+                            // The next block takes current_session, which
+                            // will kick this (now-wedged) peer + scrcpy
+                            // and spawn a fresh session — same semantics
+                            // as a different-viewer takeover.
+                        }
                     }
+                } else {
+                    info!(
+                        viewer = %viewer_id,
+                        session_fingerprint = ?session_fingerprint,
+                        offer_fingerprint = ?offer_fingerprint,
+                        "same-viewer offer with new DTLS fingerprint (page reload) — full rebuild"
+                    );
+                    // Fall through to the replace path below: same
+                    // viewer_id means silent teardown, no viewer_kicked.
                 }
             }
         }
@@ -677,6 +752,7 @@ impl Bridge {
 
         *current_session.lock().await = Some(Session {
             viewer_id,
+            remote_fingerprint: offer_fingerprint,
             peer,
             cancel,
             tasks,
@@ -943,6 +1019,14 @@ pub(crate) struct Session {
     /// distinguish "same viewer reconnecting" (keep scrcpy) from
     /// "different viewer stealing the device" (kick + rebuild).
     viewer_id: String,
+    /// Normalized DTLS fingerprint (`a=fingerprint:` value) from the
+    /// offer that created this session. Browsers mint a fresh
+    /// certificate per `RTCPeerConnection`, so a same-viewer offer
+    /// carrying a DIFFERENT fingerprint means the page was reloaded
+    /// and the old peer can never be recovered via ICE restart —
+    /// str0m pins the fingerprint from the first offer and keeps the
+    /// established DTLS session. See `fast_path_eligible`.
+    remote_fingerprint: Option<String>,
     peer: WebRtcPeer,
     cancel: CancellationToken,
     tasks: JoinSet<()>,
@@ -1913,6 +1997,75 @@ mod tests {
     use std::io::Write;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+
+    // ── DTLS fingerprint / fast-path eligibility ────────────────────────────
+
+    const FP_A: &str =
+        "sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00";
+    const FP_B: &str =
+        "sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+
+    #[test]
+    fn extract_fingerprint_session_level() {
+        let sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\na=fingerprint:{FP_A}\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+        );
+        assert_eq!(
+            extract_dtls_fingerprint(&sdp).as_deref(),
+            Some(FP_A.to_ascii_lowercase().as_str()),
+        );
+    }
+
+    #[test]
+    fn extract_fingerprint_media_level() {
+        let sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=fingerprint:{FP_A}\r\n"
+        );
+        assert_eq!(
+            extract_dtls_fingerprint(&sdp).as_deref(),
+            Some(FP_A.to_ascii_lowercase().as_str()),
+        );
+    }
+
+    #[test]
+    fn extract_fingerprint_missing() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
+        assert_eq!(extract_dtls_fingerprint(sdp), None);
+    }
+
+    #[test]
+    fn extract_fingerprint_normalizes_case() {
+        // Browsers emit uppercase hex, str0m lowercase — both must
+        // canonicalize to the same value.
+        let upper = format!("a=fingerprint:{FP_A}\r\n");
+        let lower = format!("a=fingerprint:{}\r\n", FP_A.to_ascii_lowercase());
+        assert_eq!(
+            extract_dtls_fingerprint(&upper),
+            extract_dtls_fingerprint(&lower),
+        );
+    }
+
+    #[test]
+    fn fast_path_same_fingerprint_eligible() {
+        // Genuine ICE restart: same RTCPeerConnection, same certificate.
+        assert!(fast_path_eligible(Some(FP_A), Some(FP_A)));
+    }
+
+    #[test]
+    fn fast_path_new_fingerprint_rebuilds() {
+        // Page reload: same viewerId but a brand-new RTCPeerConnection
+        // with a fresh certificate — must NOT take the fast path.
+        assert!(!fast_path_eligible(Some(FP_A), Some(FP_B)));
+    }
+
+    #[test]
+    fn fast_path_missing_fingerprint_rebuilds() {
+        // Conservative: unknown certificate identity on either side
+        // disqualifies the ICE-restart optimization.
+        assert!(!fast_path_eligible(None, Some(FP_A)));
+        assert!(!fast_path_eligible(Some(FP_A), None));
+        assert!(!fast_path_eligible(None, None));
+    }
 
     // ── Keyframe-recovery state machine ────────────────────────────────────
 
