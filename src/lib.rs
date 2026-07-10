@@ -16,6 +16,8 @@
 //! ### Modules
 //!
 //! * [`adb`] — thin wrapper around the `adb` binary (push / forward / shell).
+//! * [`camera`] — inbound browser-webcam H.264 uplink → in-guest ReDroid
+//!   virtual-camera endpoint (loopback socket, pass-through, no decode).
 //! * [`scrcpy`] — protocol implementation: pushes server.jar, launches
 //!   `app_process`, reads video/audio/control sockets.
 //! * [`mqtt`] — MQTT signaling client. Subscribes to
@@ -32,6 +34,7 @@
 pub mod adb;
 pub mod bootstrap;
 pub mod bridge;
+pub mod camera;
 pub mod config;
 pub mod datachannel;
 pub mod mqtt;

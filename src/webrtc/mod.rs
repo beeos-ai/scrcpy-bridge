@@ -15,4 +15,6 @@
 
 pub mod peer;
 
-pub use peer::{IceServer, PeerCommand, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer};
+pub use peer::{
+    CameraFrame, IceServer, PeerCommand, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer,
+};

@@ -26,7 +26,7 @@ use anyhow::{anyhow, Context, Result};
 use str0m::change::SdpOffer;
 use str0m::channel::ChannelId;
 use str0m::format::Codec;
-use str0m::media::{KeyframeRequestKind, MediaKind, MediaTime, Mid};
+use str0m::media::{Direction, KeyframeRequestKind, MediaKind, MediaTime, Mid};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event as RtcEvent, IceConnectionState, Input, Output, Rtc};
 use tokio::net::UdpSocket;
@@ -126,8 +126,26 @@ pub enum PeerCommand {
     SendControlText(String),
     /// Ask the encoder for a fresh keyframe.
     RequestKeyframe,
+    /// Register (or clear) the sink that inbound browser-camera H.264 access
+    /// units are forwarded to. `Some` when the viewer starts sharing its
+    /// webcam, `None` when it stops. Setting a sink also arms a PLI toward
+    /// the browser so the first forwarded AU is an IDR + parameter sets.
+    SetCameraSink(Option<mpsc::Sender<CameraFrame>>),
+    /// Send a PLI to the browser on the inbound camera track, asking its
+    /// encoder for a fresh keyframe (SPS/PPS/IDR). Used when the in-guest
+    /// camera endpoint (re)connects and needs a decodable entry point.
+    RequestCameraKeyframe,
     /// Tear down the peer.
     Close,
+}
+
+/// One depayloaded Annex-B H.264 access unit received on the inbound
+/// browser-camera track, tagged with its RTP media time (converted to
+/// microseconds) so the Android decoder can pace presentation.
+#[derive(Debug, Clone)]
+pub struct CameraFrame {
+    pub data: Vec<u8>,
+    pub pts_us: i64,
 }
 
 /// Events emitted *from* the peer task.
@@ -270,6 +288,25 @@ impl WebRtcPeer {
     pub async fn send_control_text(&self, msg: String) -> Result<()> {
         self.cmd_tx
             .send(PeerCommand::SendControlText(msg))
+            .await
+            .map_err(|_| anyhow!("peer task has exited"))
+    }
+
+    /// Register the sink for inbound browser-camera H.264 access units, or
+    /// clear it with `None`. Idempotent; the peer task also fires an initial
+    /// PLI so the browser emits an IDR promptly.
+    pub async fn set_camera_sink(&self, sink: Option<mpsc::Sender<CameraFrame>>) -> Result<()> {
+        self.cmd_tx
+            .send(PeerCommand::SetCameraSink(sink))
+            .await
+            .map_err(|_| anyhow!("peer task has exited"))
+    }
+
+    /// Ask the browser's camera encoder for a fresh keyframe (PLI on the
+    /// inbound camera track).
+    pub async fn request_camera_keyframe(&self) -> Result<()> {
+        self.cmd_tx
+            .send(PeerCommand::RequestCameraKeyframe)
             .await
             .map_err(|_| anyhow!("peer task has exited"))
     }
@@ -679,6 +716,19 @@ async fn handle_command(
                 }
             }
         }
+        PeerCommand::SetCameraSink(sink) => {
+            let arming = sink.is_some();
+            state.camera_sink = sink;
+            // Prime an IDR from the browser so the first AU the endpoint
+            // sees carries SPS/PPS. Harmless no-op if the inbound track
+            // isn't negotiated yet — the MediaAdded handler re-primes.
+            if arming {
+                request_camera_keyframe(rtc, state);
+            }
+        }
+        PeerCommand::RequestCameraKeyframe => {
+            request_camera_keyframe(rtc, state);
+        }
         PeerCommand::Close => {
             rtc.disconnect();
             let _ = evt_tx.send(PeerEvent::Disconnected);
@@ -690,7 +740,7 @@ async fn handle_command(
 
 async fn handle_rtc_event(
     evt: RtcEvent,
-    _rtc: &mut Rtc,
+    rtc: &mut Rtc,
     state: &mut PeerState,
     evt_tx: &broadcast::Sender<PeerEvent>,
 ) -> Result<()> {
@@ -729,8 +779,24 @@ async fn handle_rtc_event(
         RtcEvent::MediaAdded(m) => {
             match m.kind {
                 MediaKind::Video => {
-                    state.video_mid = Some(m.mid);
-                    info!(mid = ?m.mid, "video media track ready");
+                    // The browser offers two video m-lines with opposite
+                    // directions: the scrcpy screen stream (browser
+                    // recvonly → bridge sends → we see SendOnly) and, once
+                    // the viewer shares its webcam, the camera uplink
+                    // (browser sendonly → bridge receives → we see
+                    // RecvOnly). Bind each to the right slot so outbound
+                    // writes and inbound forwarding never cross wires.
+                    if m.direction == Direction::RecvOnly {
+                        state.camera_mid = Some(m.mid);
+                        info!(mid = ?m.mid, "inbound camera video track ready");
+                        // Prime a keyframe so the first forwarded AU is an IDR.
+                        if state.camera_sink.is_some() {
+                            request_camera_keyframe(rtc, state);
+                        }
+                    } else {
+                        state.video_mid = Some(m.mid);
+                        info!(mid = ?m.mid, dir = ?m.direction, "outbound video media track ready");
+                    }
                 }
                 MediaKind::Audio => {
                     state.audio_mid = Some(m.mid);
@@ -738,6 +804,24 @@ async fn handle_rtc_event(
                 }
             }
             maybe_emit_stream_ready(state, evt_tx);
+        }
+        RtcEvent::MediaData(data) => {
+            // Inbound browser-camera H.264. str0m depayloads to a full
+            // Annex-B access unit (start codes included, see
+            // packet/h264.rs). Forward as-is to the camera sink — the
+            // Android endpoint does the hardware decode. Drop-newest on a
+            // full queue: a lost delta just costs one PLI.
+            if Some(data.mid) == state.camera_mid {
+                if let Some(sink) = state.camera_sink.as_ref() {
+                    let frame = CameraFrame {
+                        data: data.data,
+                        pts_us: data.time.as_micros() as i64,
+                    };
+                    if sink.try_send(frame).is_err() {
+                        debug!("camera sink queue full or gone; dropping inbound AU");
+                    }
+                }
+            }
         }
         RtcEvent::ChannelOpen(cid, label) => {
             info!(%label, "data channel open");
@@ -793,10 +877,28 @@ async fn handle_rtc_event(
     Ok(())
 }
 
+/// Send a PLI to the browser on the inbound camera track (if negotiated),
+/// asking its webcam encoder for a fresh SPS/PPS/IDR. No-op when the camera
+/// track hasn't been negotiated yet.
+fn request_camera_keyframe(rtc: &mut Rtc, state: &PeerState) {
+    let Some(mid) = state.camera_mid else {
+        return;
+    };
+    if let Some(stream) = rtc.direct_api().stream_rx_by_mid(mid, None) {
+        stream.request_keyframe(KeyframeRequestKind::Pli);
+    }
+}
+
 #[derive(Default)]
 struct PeerState {
     video_mid: Option<Mid>,
     audio_mid: Option<Mid>,
+    /// Inbound (browser → bridge) camera track, negotiated when the viewer
+    /// shares its webcam. Distinct from `video_mid` (outbound scrcpy screen).
+    camera_mid: Option<Mid>,
+    /// Sink for depayloaded inbound camera access units. `Some` only while
+    /// the viewer is sharing; forwarding is a no-op otherwise.
+    camera_sink: Option<mpsc::Sender<CameraFrame>>,
     control_channel: Option<ChannelId>,
     /// Bound when the viewer opens a `label="video"` DataChannel and we want
     /// to push H.264 NAL payloads as binary messages instead of (or in

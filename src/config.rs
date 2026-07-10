@@ -94,6 +94,21 @@ pub struct Cli {
     #[arg(long, env = "METRICS_PORT", default_value_t = 9091)]
     pub metrics_port: u16,
 
+    /// In-guest virtual-camera injection endpoint (`host:port`).
+    ///
+    /// When the viewer shares its browser webcam, the bridge decodes nothing
+    /// — it forwards the raw H.264 access units to this loopback TCP endpoint,
+    /// which is an external camera provider HAL (or platform-signed helper)
+    /// running *inside* the ReDroid container. Because the scrcpy-bridge
+    /// sidecar and the ReDroid container share a pod network namespace, the
+    /// endpoint is reachable on `127.0.0.1`. Mirrors the transport used by
+    /// Intel Celadon's camera vHAL / Aliyun Wuying's `libvhal_sdk`.
+    ///
+    /// Default `127.0.0.1:7910`. Rarely overridden; the port is fixed by the
+    /// in-guest camera HAL's socket server.
+    #[arg(long, env = "CAMERA_SINK_ADDR", default_value = "127.0.0.1:7910")]
+    pub camera_sink_addr: String,
+
     /// Extra local IPs to advertise as ICE host candidates (comma-separated).
     ///
     /// In Kubernetes, wire this to the downward API's `status.podIP` plus any

@@ -122,6 +122,26 @@ pub enum ControlIn {
     /// `ResetVideo` control message.
     #[serde(rename = "request_keyframe")]
     RequestKeyframe,
+    /// Viewer started sharing its browser webcam. The browser has added a
+    /// `sendonly` H.264 video track and renegotiated; this message tells the
+    /// bridge the stream dimensions/orientation so it can hand the in-guest
+    /// virtual-camera endpoint a matching capability before the first frame.
+    #[serde(rename = "camera_start")]
+    CameraStart {
+        #[serde(default = "default_camera_width")]
+        width: u32,
+        #[serde(default = "default_camera_height")]
+        height: u32,
+        #[serde(default = "default_camera_fps")]
+        fps: u32,
+        /// `"front"` (default) or `"back"` — maps to Android `LENS_FACING_*`.
+        #[serde(default = "default_camera_facing")]
+        facing: String,
+    },
+    /// Viewer stopped sharing its webcam. The bridge tears down the
+    /// virtual-camera session so Android camera apps see the device vanish.
+    #[serde(rename = "camera_stop")]
+    CameraStop,
     /// Catch-all for unknown types; we ignore these but don't error the pipe.
     #[serde(other)]
     Unknown,
@@ -135,6 +155,18 @@ fn default_pressure() -> f32 {
 }
 fn default_key_action() -> String {
     "down".to_string()
+}
+fn default_camera_width() -> u32 {
+    1280
+}
+fn default_camera_height() -> u32 {
+    720
+}
+fn default_camera_fps() -> u32 {
+    30
+}
+fn default_camera_facing() -> String {
+    "front".to_string()
 }
 
 pub fn parse(raw: &[u8]) -> Result<ControlIn> {
@@ -157,6 +189,14 @@ pub fn build_stream_restarted() -> String {
 /// *previous* viewer right before it is replaced.
 pub fn build_viewer_kicked(reason: &str) -> String {
     json!({ "type": "viewer_kicked", "reason": reason }).to_string()
+}
+
+/// Build a `{"type":"camera_status","active":<bool>,"reason":...}` payload
+/// telling the viewer whether its shared webcam is currently wired into the
+/// device's virtual camera. The frontend uses this to reflect the toggle
+/// state (and surface an error if injection could not start).
+pub fn build_camera_status(active: bool, reason: &str) -> String {
+    json!({ "type": "camera_status", "active": active, "reason": reason }).to_string()
 }
 
 /// Translate the browser's accumulated wheel delta into scrcpy's

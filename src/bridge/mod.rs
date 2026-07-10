@@ -26,6 +26,7 @@ use crate::bootstrap::{
     self, spawn_refresh_loop, BootstrapClient, BootstrapConfig, BootstrapEvent, BootstrapResponse,
     IceServerPayload,
 };
+use crate::camera::{CameraConfig, CameraSink};
 use crate::config::Cli;
 use crate::datachannel::{self, ControlIn};
 use crate::mqtt::{
@@ -42,7 +43,7 @@ use crate::scrcpy::{
     AudioReader, ControlSocket, ScrcpyServer, ScrcpyServerConfig, ScrcpyShutdown, VideoFrame,
     VideoReader,
 };
-use crate::webrtc::{IceServer, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer};
+use crate::webrtc::{CameraFrame, IceServer, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer};
 
 /// MQTT username expected by the EMQX JWT auth plugin. All device-scoped
 /// connections log in as `device`; the JWT payload carries the true identity.
@@ -178,14 +179,21 @@ pub struct Bridge {
     /// that TURN credential rotation takes effect on the very next
     /// `on_offer` without a restart.
     ice_servers: Arc<RwLock<Vec<IceServer>>>,
+    /// Uplink sink for the viewer's shared browser webcam → in-guest ReDroid
+    /// virtual camera. Bridge-global and idle until a `camera_start` control
+    /// message arrives; survives session rebuilds (the socket reconnects on
+    /// its own), so a page reload that renegotiates doesn't strand it.
+    camera_sink: CameraSink,
 }
 
 impl Bridge {
     pub fn new(cli: Cli, health: HealthFlags) -> Self {
+        let camera_sink = CameraSink::spawn(cli.camera_sink_addr.clone());
         Self {
             cli,
             health,
             ice_servers: Arc::new(RwLock::new(Vec::new())),
+            camera_sink,
         }
     }
 
@@ -694,6 +702,7 @@ impl Bridge {
             let viewer_for_evt = viewer_id.clone();
             let internal_tx_for_evt = internal_tx.clone();
             let keyframes_for_evt = keyframes_observed.clone();
+            let camera_sink_for_evt = self.camera_sink.clone();
             tasks.spawn(async move {
                 run_event_pump(
                     peer_for_evt,
@@ -707,6 +716,7 @@ impl Bridge {
                     viewer_for_evt,
                     internal_tx_for_evt,
                     keyframes_for_evt,
+                    camera_sink_for_evt,
                 )
                 .await;
             });
@@ -1137,6 +1147,7 @@ async fn run_event_pump(
     viewer_id: String,
     internal_tx: mpsc::Sender<BridgeInternalEvent>,
     keyframes_observed: Arc<AtomicU64>,
+    camera_sink: CameraSink,
 ) {
     let mut evt_rx = peer.subscribe();
     // Browsers emit PLI roughly every 200 ms after any packet loss. Scrcpy
@@ -1299,7 +1310,7 @@ async fn run_event_pump(
                     PeerEvent::ControlMessage(text) => {
                         if let Err(e) =
                             forward_control(&text, control.as_ref(), &scrcpy_cfg, &peer, &health,
-                                &current_session, scroll_sensitivity).await
+                                &current_session, scroll_sensitivity, &camera_sink).await
                         {
                             warn!(error = %e, "forward control");
                         }
@@ -1720,6 +1731,7 @@ async fn forward_control(
     _health: &HealthFlags,
     current_session: &Arc<Mutex<Option<Session>>>,
     scroll_sensitivity: f32,
+    camera_sink: &CameraSink,
 ) -> Result<()> {
     let msg = datachannel::parse(text.as_bytes())?;
     let kind = msg_kind(&msg);
@@ -1874,6 +1886,57 @@ async fn forward_control(
             SCRCPY_RUNNING.set(0);
             return Ok(());
         }
+        ControlIn::CameraStart {
+            width,
+            height,
+            fps,
+            facing,
+        } => {
+            info!(width, height, fps, %facing, "camera_start — wiring browser webcam into virtual camera");
+            // Bridge → in-guest endpoint: announce the capability so the
+            // vHAL advertises the right camera characteristics before frames.
+            let cfg = CameraConfig::new(*width, *height, *fps, facing);
+            camera_sink.start(cfg).await;
+
+            // Peer → sink pathway. The peer forwards depayloaded inbound
+            // Annex-B AUs into `frame_tx`; a tiny drain task hands them to
+            // the sink (which owns the loopback socket). The task ends on
+            // its own when the peer drops `frame_tx` (camera_stop or session
+            // teardown replaces/clears the sink), so it needs no cancel
+            // token.
+            let (frame_tx, mut frame_rx) = mpsc::channel::<CameraFrame>(16);
+            let sink_for_task = camera_sink.clone();
+            tokio::spawn(async move {
+                while let Some(frame) = frame_rx.recv().await {
+                    sink_for_task.push_frame(frame.data);
+                }
+                debug!("camera frame forwarder exiting");
+            });
+            if let Err(e) = peer.set_camera_sink(Some(frame_tx)).await {
+                warn!(error = %e, "camera_start: set_camera_sink failed");
+                let _ = peer
+                    .send_control_text(datachannel::build_camera_status(false, "peer_gone"))
+                    .await;
+                return Ok(());
+            }
+            // Prime an IDR from the browser so the endpoint gets a decodable
+            // entry point promptly (belt-and-suspenders with the peer-side
+            // priming on SetCameraSink / MediaAdded).
+            let _ = peer.request_camera_keyframe().await;
+            let _ = peer
+                .send_control_text(datachannel::build_camera_status(true, "started"))
+                .await;
+            return Ok(());
+        }
+        ControlIn::CameraStop => {
+            info!("camera_stop — tearing down virtual camera");
+            let _ = peer.set_camera_sink(None).await;
+            camera_sink.stop().await;
+            let _ = peer
+                .send_control_text(datachannel::build_camera_status(false, "stopped"))
+                .await;
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -1955,6 +2018,8 @@ async fn forward_control(
         | ControlIn::Stats { .. }
         | ControlIn::SetVideoTransport { .. }
         | ControlIn::RequestKeyframe
+        | ControlIn::CameraStart { .. }
+        | ControlIn::CameraStop
         | ControlIn::Unknown => {}
     }
     Ok(())
@@ -1973,6 +2038,8 @@ fn msg_kind(msg: &ControlIn) -> &'static str {
         ControlIn::Stats { .. } => "stats",
         ControlIn::SetVideoTransport { .. } => "set_video_transport",
         ControlIn::RequestKeyframe => "request_keyframe",
+        ControlIn::CameraStart { .. } => "camera_start",
+        ControlIn::CameraStop => "camera_stop",
         ControlIn::Unknown => "unknown",
     }
 }
@@ -2181,6 +2248,7 @@ mod tests {
             metrics_port: 0,
             public_ips: vec![],
             ice_gather_wait_ms: 0,
+            camera_sink_addr: "127.0.0.1:7910".into(),
             log_format: "text".into(),
             scrcpy_server_jar: None,
             remote_jar_path: "/data/local/tmp/scrcpy-server.jar".into(),
