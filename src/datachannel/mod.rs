@@ -199,6 +199,15 @@ pub fn build_camera_status(active: bool, reason: &str) -> String {
     json!({ "type": "camera_status", "active": active, "reason": reason }).to_string()
 }
 
+/// Build a `{"type":"camera_needed","active":<bool>}` payload telling the
+/// viewer that an in-guest app opened (`true`) or closed (`false`) the
+/// device camera. Sourced from the vHAL's reverse CMR1 `CamInUse` events;
+/// the viewer auto-starts/stops webcam capture in response (AgentBay-style
+/// behaviour — no manual "share camera" click required).
+pub fn build_camera_needed(active: bool) -> String {
+    json!({ "type": "camera_needed", "active": active }).to_string()
+}
+
 /// Translate the browser's accumulated wheel delta into scrcpy's
 /// scroll intensity (`AXIS_HSCROLL` / `AXIS_VSCROLL` of the injected
 /// `MotionEvent`).

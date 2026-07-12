@@ -43,15 +43,22 @@
 //! * `Stop` has an empty payload and tells the endpoint to drop the virtual
 //!   camera (so an Android camera app sees the device disappear).
 //!
-//! The endpoint never sends anything back on this socket; keyframe requests
-//! flow the other way (endpoint → bridge → browser PLI) out of band. If the
-//! socket drops, the sink task reconnects with backoff and re-sends the
-//! `Config` frame, so a vHAL restart doesn't strand the uplink.
+//! ### Reverse events (v1.1, resident connection)
+//!
+//! The connection is RESIDENT: the sink connects at startup and keeps the
+//! socket open across sharing sessions (sessions are delimited in-band by
+//! Config/Stop, not by connection lifecycle). The vHAL uses the same socket
+//! for reverse `CamInUse` events (kind=4, JSON `{"in_use":bool,...}`):
+//! emitted when an in-guest app opens/closes the camera, replayed on
+//! (re)connect. The bridge surfaces them to the viewer as `camera_needed`
+//! datachannel messages so the browser can auto-start/stop webcam capture.
+//! Keyframe requests still flow out of band (bridge-driven PLI).
 
 use std::time::Duration;
 
 use serde::Serialize;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -63,10 +70,15 @@ pub const FRAME_MAGIC: &[u8; 4] = b"CMR1";
 const KIND_CONFIG: u8 = 1;
 const KIND_FRAME: u8 = 2;
 const KIND_STOP: u8 = 3;
+const KIND_CAM_IN_USE: u8 = 4;
 
-/// Reconnect backoff bounds for the sink socket.
+/// Reconnect backoff bounds for the resident sink socket. The cap is
+/// deliberately lax — during normal pod startup the vHAL may lag the bridge
+/// by a while, and a resident reconnect loop at a tight cap would spam logs.
 const BACKOFF_MIN: Duration = Duration::from_millis(200);
-const BACKOFF_MAX: Duration = Duration::from_secs(5);
+const BACKOFF_MAX: Duration = Duration::from_secs(15);
+/// Log a connect failure at warn level only every N attempts (debug otherwise).
+const CONNECT_WARN_EVERY: u32 = 8;
 
 /// Camera capability handshake, serialised as the `Config` frame payload.
 #[derive(Debug, Clone, Serialize)]
@@ -113,16 +125,20 @@ pub struct CameraSink {
 }
 
 impl CameraSink {
-    /// Spawn the sink task. `sink_addr` is the in-guest camera endpoint
-    /// (`127.0.0.1:7910` by default). The task idles until [`Self::start`]
-    /// is called and only holds a socket open while a session is active.
-    pub fn spawn(sink_addr: String) -> Self {
+    /// Spawn the resident sink task. `sink_addr` is the in-guest camera
+    /// endpoint (`127.0.0.1:7910` by default). The task connects
+    /// immediately and keeps the socket open across sessions (reconnect
+    /// with backoff) — it doubles as the reverse event channel. Returns the
+    /// handle plus the receiver of `CamInUse` events (`true` = an in-guest
+    /// app opened the camera, `false` = the last one closed it).
+    pub fn spawn(sink_addr: String) -> (Self, mpsc::Receiver<bool>) {
         // Bounded so a wedged/slow endpoint applies backpressure without
         // unbounded memory growth. Frames are drop-newest on a full queue
         // (see `push_frame`) — losing a delta frame just costs one PLI.
         let (tx, rx) = mpsc::channel(256);
-        tokio::spawn(run_sink(sink_addr, rx));
-        Self { tx }
+        let (evt_tx, evt_rx) = mpsc::channel(16);
+        tokio::spawn(run_sink(sink_addr, rx, evt_tx));
+        (Self { tx }, evt_rx)
     }
 
     /// Begin (or restart) a virtual-camera session.
@@ -145,93 +161,183 @@ impl CameraSink {
     }
 }
 
-/// Sink task: owns the (lazily-established) TCP connection to the in-guest
-/// camera endpoint and serialises framed messages onto it.
-async fn run_sink(sink_addr: String, mut rx: mpsc::Receiver<SinkMsg>) {
+/// Sink task: owns the RESIDENT TCP connection to the in-guest camera
+/// endpoint. Writes framed session messages (Config/Frame/Stop) and reads
+/// reverse `CamInUse` events on the same socket. Reconnects with backoff on
+/// drop; replays the active session's `Config` after a mid-session reconnect.
+async fn run_sink(sink_addr: String, mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
     // The current session's capability, retained so a mid-session reconnect
     // can replay the `Config` handshake before resuming frames.
     let mut active: Option<CameraConfig> = None;
-    let mut stream: Option<TcpStream> = None;
 
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            SinkMsg::Start(cfg) => {
-                info!(addr = %sink_addr, ?cfg, "camera uplink: starting virtual-camera session");
-                active = Some(cfg.clone());
-                // Force a fresh connection so the endpoint always sees the
-                // Config frame first.
-                stream = connect_and_configure(&sink_addr, &cfg).await;
-            }
-            SinkMsg::Frame(au) => {
-                let Some(cfg) = active.as_ref() else {
-                    // Frame arrived before Start (or after Stop) — ignore.
-                    continue;
-                };
-                if stream.is_none() {
-                    stream = connect_and_configure(&sink_addr, cfg).await;
-                }
-                if let Some(s) = stream.as_mut() {
-                    if let Err(e) = write_frame(s, KIND_FRAME, &au).await {
-                        warn!(error = %e, "camera uplink: frame write failed; will reconnect");
-                        stream = None;
+    'reconnect: loop {
+        // ── Resident connect loop. Keep draining rx while disconnected so
+        // session state stays current (frames are dropped — they're
+        // undeliverable anyway; the post-reconnect PLI recovers video).
+        let stream = {
+            let mut backoff = BACKOFF_MIN;
+            let mut attempts: u32 = 0;
+            loop {
+                match TcpStream::connect(&sink_addr).await {
+                    Ok(s) => {
+                        let _ = s.set_nodelay(true);
+                        info!(addr = %sink_addr, "camera uplink: connected (resident)");
+                        break s;
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts % CONNECT_WARN_EVERY == 1 && attempts > 1 {
+                            warn!(addr = %sink_addr, attempts, error = %e,
+                                  "camera uplink: endpoint unreachable; retrying");
+                        } else {
+                            debug!(addr = %sink_addr, attempts, error = %e,
+                                   "camera uplink: connect failed");
+                        }
+                        // Sleep with backoff, but keep consuming session
+                        // messages so `active` tracks reality.
+                        let deadline = tokio::time::Instant::now() + backoff;
+                        loop {
+                            tokio::select! {
+                                _ = tokio::time::sleep_until(deadline) => break,
+                                msg = rx.recv() => match msg {
+                                    None => {
+                                        debug!("camera sink task exiting (all senders dropped)");
+                                        return;
+                                    }
+                                    Some(SinkMsg::Start(cfg)) => active = Some(cfg),
+                                    Some(SinkMsg::Stop) => active = None,
+                                    Some(SinkMsg::Frame(_)) => {} // undeliverable; drop
+                                },
+                            }
+                        }
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
                     }
                 }
             }
-            SinkMsg::Stop => {
-                info!("camera uplink: stopping virtual-camera session");
-                if let Some(s) = stream.as_mut() {
-                    let _ = write_frame(s, KIND_STOP, &[]).await;
-                    let _ = s.shutdown().await;
+        };
+
+        let (rd, mut wr) = stream.into_split();
+
+        // Replay the in-flight session's Config so the endpoint sees it
+        // before any post-reconnect frames.
+        if let Some(cfg) = active.as_ref() {
+            let Ok(payload) = serde_json::to_vec(cfg) else { continue 'reconnect };
+            if let Err(e) = write_frame(&mut wr, KIND_CONFIG, &payload).await {
+                warn!(error = %e, "camera uplink: config replay failed; reconnecting");
+                continue 'reconnect;
+            }
+            info!(?cfg, "camera uplink: replayed session config after (re)connect");
+        }
+
+        // Reader task: parse reverse frames until EOF/error. Runs separately
+        // from the writer so a partial read is never cancelled mid-frame.
+        let evt_for_reader = evt_tx.clone();
+        let mut reader = tokio::spawn(read_events(rd, evt_for_reader));
+
+        // Writer loop: serialise session messages onto the socket. Exits to
+        // 'reconnect when either half of the connection dies.
+        loop {
+            tokio::select! {
+                _ = &mut reader => {
+                    debug!("camera uplink: reader ended; reconnecting");
+                    continue 'reconnect;
                 }
-                active = None;
-                stream = None;
+                msg = rx.recv() => match msg {
+                    None => {
+                        reader.abort();
+                        debug!("camera sink task exiting (all senders dropped)");
+                        return;
+                    }
+                    Some(SinkMsg::Start(cfg)) => {
+                        info!(addr = %sink_addr, ?cfg, "camera uplink: starting virtual-camera session");
+                        active = Some(cfg.clone());
+                        let Ok(payload) = serde_json::to_vec(&cfg) else { continue };
+                        if let Err(e) = write_frame(&mut wr, KIND_CONFIG, &payload).await {
+                            warn!(error = %e, "camera uplink: config write failed; reconnecting");
+                            reader.abort();
+                            continue 'reconnect;
+                        }
+                    }
+                    Some(SinkMsg::Frame(au)) => {
+                        if active.is_none() {
+                            continue; // Frame before Start (or after Stop) — ignore.
+                        }
+                        if let Err(e) = write_frame(&mut wr, KIND_FRAME, &au).await {
+                            warn!(error = %e, "camera uplink: frame write failed; reconnecting");
+                            reader.abort();
+                            continue 'reconnect;
+                        }
+                    }
+                    Some(SinkMsg::Stop) => {
+                        // v1.1: Stop ends the session in-band; the resident
+                        // connection stays up (it carries reverse events).
+                        info!("camera uplink: stopping virtual-camera session");
+                        active = None;
+                        if let Err(e) = write_frame(&mut wr, KIND_STOP, &[]).await {
+                            warn!(error = %e, "camera uplink: stop write failed; reconnecting");
+                            reader.abort();
+                            continue 'reconnect;
+                        }
+                    }
+                },
             }
         }
     }
-    debug!("camera sink task exiting (all senders dropped)");
 }
 
-/// Connect to the endpoint with bounded backoff and send the `Config`
-/// handshake. Returns `None` if the endpoint is unreachable after the
-/// backoff cap — the caller retries on the next frame, so a not-yet-ready
-/// vHAL just delays the first frame rather than dropping the session.
-async fn connect_and_configure(addr: &str, cfg: &CameraConfig) -> Option<TcpStream> {
-    let mut backoff = BACKOFF_MIN;
-    // A small bounded number of attempts per call; frames keep arriving so
-    // we get repeated chances without blocking the whole task on a dead
-    // endpoint.
-    for attempt in 0..3u32 {
-        match TcpStream::connect(addr).await {
-            Ok(mut s) => {
-                let _ = s.set_nodelay(true);
-                let payload = match serde_json::to_vec(cfg) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!(error = %e, "camera uplink: serialise config failed");
-                        return None;
-                    }
-                };
-                if let Err(e) = write_frame(&mut s, KIND_CONFIG, &payload).await {
-                    warn!(error = %e, "camera uplink: config write failed");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(BACKOFF_MAX);
+/// Read reverse frames (server → client) until EOF/error. Forwards decoded
+/// `CamInUse` transitions to `evt_tx`; unknown kinds are skipped (forward
+/// compatibility). Pre-v1.1 endpoints never write, so this simply blocks
+/// until the connection drops.
+async fn read_events(mut rd: OwnedReadHalf, evt_tx: mpsc::Sender<bool>) {
+    let mut header = [0u8; 9];
+    loop {
+        if rd.read_exact(&mut header).await.is_err() {
+            return; // EOF / connection error → caller reconnects
+        }
+        if &header[..4] != FRAME_MAGIC {
+            warn!("camera uplink: bad reverse-frame magic; dropping connection");
+            return;
+        }
+        let kind = header[4];
+        let len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
+        // Reverse events are tiny JSON payloads; anything huge means desync.
+        if len > 64 * 1024 {
+            warn!(len, "camera uplink: absurd reverse-frame length; dropping connection");
+            return;
+        }
+        let mut payload = vec![0u8; len];
+        if len > 0 && rd.read_exact(&mut payload).await.is_err() {
+            return;
+        }
+        if kind != KIND_CAM_IN_USE {
+            debug!(kind, "camera uplink: ignoring unknown reverse frame kind");
+            continue;
+        }
+        match serde_json::from_slice::<serde_json::Value>(&payload) {
+            Ok(v) => {
+                let Some(in_use) = v.get("in_use").and_then(|b| b.as_bool()) else {
+                    debug!("camera uplink: CamInUse without in_use field; ignoring");
                     continue;
+                };
+                info!(in_use, "camera uplink: device camera usage changed");
+                if evt_tx.send(in_use).await.is_err() {
+                    return; // consumer gone — nothing left to do
                 }
-                info!(%addr, "camera uplink: connected + configured");
-                return Some(s);
             }
             Err(e) => {
-                debug!(%addr, attempt, error = %e, "camera uplink: connect failed");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(BACKOFF_MAX);
+                debug!(error = %e, "camera uplink: unparseable CamInUse payload; ignoring");
             }
         }
     }
-    None
 }
 
 /// Write one framed message: magic, kind, u32-le length, payload.
-async fn write_frame(stream: &mut TcpStream, kind: u8, payload: &[u8]) -> std::io::Result<()> {
+async fn write_frame<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    kind: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
     let mut header = [0u8; 9];
     header[..4].copy_from_slice(FRAME_MAGIC);
     header[4] = kind;
@@ -282,9 +388,9 @@ mod tests {
             frames
         });
 
-        let sink = CameraSink::spawn(addr);
+        let (sink, _evt_rx) = CameraSink::spawn(addr);
         sink.start(CameraConfig::new(640, 480, 30, "back")).await;
-        // Retry a couple times: the sink connects lazily/asynchronously.
+        // Retry a couple times: the sink connects asynchronously.
         for _ in 0..50 {
             if sink.push_frame(vec![0, 0, 0, 1, 0x65, 0xAA]) {
                 break;
@@ -305,5 +411,57 @@ mod tests {
 
         assert_eq!(frames[1].0, KIND_FRAME);
         assert_eq!(frames[1].1, vec![0, 0, 0, 1, 0x65, 0xAA]);
+    }
+
+    /// v1.1 resident-connection semantics: the sink connects without a
+    /// session, reverse CamInUse frames surface on the event receiver, and
+    /// Stop does NOT close the socket (a follow-up Config flows on the same
+    /// connection).
+    #[tokio::test]
+    async fn resident_connection_reverse_events_and_stop_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (sink, mut evt_rx) = CameraSink::spawn(addr);
+
+        // Sink connects at spawn — no session needed.
+        let (mut sock, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("sink did not connect at spawn")
+            .unwrap();
+
+        // Reverse CamInUse event surfaces on the receiver.
+        let payload = br#"{"in_use":true,"width":1280,"height":720}"#;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(FRAME_MAGIC);
+        frame.push(KIND_CAM_IN_USE);
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(payload);
+        sock.write_all(&frame).await.unwrap();
+        let evt = tokio::time::timeout(Duration::from_secs(5), evt_rx.recv())
+            .await
+            .expect("no CamInUse event")
+            .unwrap();
+        assert!(evt, "expected in_use=true");
+
+        // Session start/stop flow on the SAME connection; Stop keeps it open.
+        sink.start(CameraConfig::new(640, 480, 30, "front")).await;
+        sink.stop().await;
+        sink.start(CameraConfig::new(1280, 720, 30, "front")).await;
+
+        let mut kinds = Vec::new();
+        for _ in 0..3 {
+            let mut header = [0u8; 9];
+            tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut header))
+                .await
+                .expect("connection closed early — Stop must not drop the resident socket")
+                .unwrap();
+            assert_eq!(&header[..4], FRAME_MAGIC);
+            let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; len];
+            sock.read_exact(&mut payload).await.unwrap();
+            kinds.push(header[4]);
+        }
+        assert_eq!(kinds, vec![KIND_CONFIG, KIND_STOP, KIND_CONFIG]);
     }
 }

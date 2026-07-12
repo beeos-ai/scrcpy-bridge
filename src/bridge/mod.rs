@@ -180,24 +180,34 @@ pub struct Bridge {
     /// `on_offer` without a restart.
     ice_servers: Arc<RwLock<Vec<IceServer>>>,
     /// Uplink sink for the viewer's shared browser webcam → in-guest ReDroid
-    /// virtual camera. Bridge-global and idle until a `camera_start` control
-    /// message arrives; survives session rebuilds (the socket reconnects on
-    /// its own), so a page reload that renegotiates doesn't strand it.
+    /// virtual camera. Bridge-global with a RESIDENT socket (connects at
+    /// startup, reconnects on drop); survives session rebuilds, so a page
+    /// reload that renegotiates doesn't strand it.
     camera_sink: CameraSink,
+    /// Receiver of reverse `CamInUse` events from the vHAL (an in-guest app
+    /// opened/closed the camera). Consumed once by `run()`, which forwards
+    /// the edges to the current viewer as `camera_needed` datachannel
+    /// messages. Option so `run(self)` can take it out of the shared struct.
+    cam_events: Option<tokio::sync::mpsc::Receiver<bool>>,
+    /// Last known in-guest camera usage. Replayed to a viewer whose control
+    /// datachannel (re)opens, so late-joining viewers auto-start capture.
+    cam_in_use: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Bridge {
     pub fn new(cli: Cli, health: HealthFlags) -> Self {
-        let camera_sink = CameraSink::spawn(cli.camera_sink_addr.clone());
+        let (camera_sink, cam_events) = CameraSink::spawn(cli.camera_sink_addr.clone());
         Self {
             cli,
             health,
             ice_servers: Arc::new(RwLock::new(Vec::new())),
             camera_sink,
+            cam_events: Some(cam_events),
+            cam_in_use: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         // 1. Resolve initial broker credentials via Agent Gateway bootstrap.
         //    Runtime issues a short-lived (~10 min) RS256 JWT authenticated
         //    by Ed25519 identity keys. This is the only supported credential
@@ -279,6 +289,30 @@ impl Bridge {
         // into each new `run_event_pump` via `on_offer`.
         let (internal_tx, mut internal_rx) = mpsc::channel::<BridgeInternalEvent>(16);
         let mut grace: Option<SessionGrace> = None;
+
+        // Reverse camera-usage events (vHAL CMR1 kind=4): forward each edge
+        // to the current viewer as a `camera_needed` datachannel message and
+        // remember the latest state for datachannel-open replay (see the
+        // ControlChannelOpen branch in run_event_pump).
+        if let Some(mut cam_events) = self.cam_events.take() {
+            let session_for_cam = current_session.clone();
+            let cam_state = self.cam_in_use.clone();
+            tokio::spawn(async move {
+                while let Some(in_use) = cam_events.recv().await {
+                    cam_state.store(in_use, Ordering::Relaxed);
+                    let guard = session_for_cam.lock().await;
+                    if let Some(session) = guard.as_ref() {
+                        info!(in_use, "camera usage edge -> notifying viewer (camera_needed)");
+                        let _ = session
+                            .peer
+                            .send_control_text(datachannel::build_camera_needed(in_use))
+                            .await;
+                    } else {
+                        debug!(in_use, "camera usage edge with no viewer; will replay on connect");
+                    }
+                }
+            });
+        }
 
         loop {
             // `sleep_until` on a missing grace blocks forever; we want
@@ -703,6 +737,7 @@ impl Bridge {
             let internal_tx_for_evt = internal_tx.clone();
             let keyframes_for_evt = keyframes_observed.clone();
             let camera_sink_for_evt = self.camera_sink.clone();
+            let cam_in_use_for_evt = self.cam_in_use.clone();
             tasks.spawn(async move {
                 run_event_pump(
                     peer_for_evt,
@@ -717,6 +752,7 @@ impl Bridge {
                     internal_tx_for_evt,
                     keyframes_for_evt,
                     camera_sink_for_evt,
+                    cam_in_use_for_evt,
                 )
                 .await;
             });
@@ -1148,6 +1184,7 @@ async fn run_event_pump(
     internal_tx: mpsc::Sender<BridgeInternalEvent>,
     keyframes_observed: Arc<AtomicU64>,
     camera_sink: CameraSink,
+    cam_in_use: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut evt_rx = peer.subscribe();
     // Browsers emit PLI roughly every 200 ms after any packet loss. Scrcpy
@@ -1313,6 +1350,19 @@ async fn run_event_pump(
                                 &current_session, scroll_sensitivity, &camera_sink).await
                         {
                             warn!(error = %e, "forward control");
+                        }
+                    }
+                    PeerEvent::ControlChannelOpen => {
+                        // Replay the device-camera usage flag so a viewer
+                        // that (re)connects while an in-guest app already
+                        // holds the camera open still auto-starts capture.
+                        // Idle (false) is the viewer's default assumption —
+                        // only the in-use state needs replay.
+                        if cam_in_use.load(Ordering::Relaxed) {
+                            info!("control channel open — replaying camera_needed(true)");
+                            let _ = peer
+                                .send_control_text(datachannel::build_camera_needed(true))
+                                .await;
                         }
                     }
                     PeerEvent::KeyframeRequested => {

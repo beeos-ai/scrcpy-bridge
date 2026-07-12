@@ -170,6 +170,11 @@ pub enum PeerEvent {
     Disconnected,
     /// JSON data channel message from the browser.
     ControlMessage(String),
+    /// The control DataChannel just opened — outbound `send_control_text`
+    /// now actually reaches the viewer (before this edge it is dropped).
+    /// Used to replay state that must survive viewer reconnects, e.g. the
+    /// `camera_needed` device-camera-usage flag.
+    ControlChannelOpen,
     /// Browser asked for a keyframe (PLI/FIR). Caller should ask the scrcpy
     /// encoder for a fresh IDR via `ResetVideo`.
     KeyframeRequested,
@@ -836,6 +841,7 @@ async fn handle_rtc_event(
                 state.video_dc_channel = Some(cid);
             } else if label == "control" || state.control_channel.is_none() {
                 state.control_channel = Some(cid);
+                let _ = evt_tx.send(PeerEvent::ControlChannelOpen);
             }
         }
         RtcEvent::ChannelData(d) => {
