@@ -58,10 +58,41 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::TcpStream;
+use tokio::net::unix::OwnedReadHalf;
+use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// Abstract-namespace AF_UNIX socket name of the in-guest CMR1 endpoint
+/// (without the leading NUL; that's added by `SocketAddr::from_abstract_name`).
+/// Must match the vHAL server (`MakeAbstractAddr` in cmr1.cpp). A UNIX socket
+/// is used instead of TCP because ReDroid's kernel blocks AF_INET for the
+/// cameraserver uid the vHAL runs as (ANDROID_PARANOID_NETWORK), while
+/// AF_UNIX is unrestricted.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const CMR1_ABSTRACT_NAME: &[u8] = b"beeos_camera_cmr1";
+
+/// Connect the resident sink to the vHAL's abstract-namespace CMR1 socket.
+/// Abstract sockets are Linux-only; on other hosts (dev builds / non-Linux
+/// CI) this returns an error every attempt, which the caller treats as an
+/// unreachable endpoint (the camera plane is a ReDroid/Linux-only feature).
+async fn connect_cmr1() -> std::io::Result<UnixStream> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(CMR1_ABSTRACT_NAME)?;
+        let std_stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
+        std_stream.set_nonblocking(true)?;
+        UnixStream::from_std(std_stream)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "abstract AF_UNIX sockets are Linux-only",
+        ))
+    }
+}
 
 /// Framing magic. Little-endian on the wire is irrelevant for the 4 ASCII
 /// bytes; we compare them verbatim.
@@ -125,19 +156,23 @@ pub struct CameraSink {
 }
 
 impl CameraSink {
-    /// Spawn the resident sink task. `sink_addr` is the in-guest camera
-    /// endpoint (`127.0.0.1:7910` by default). The task connects
-    /// immediately and keeps the socket open across sessions (reconnect
-    /// with backoff) — it doubles as the reverse event channel. Returns the
-    /// handle plus the receiver of `CamInUse` events (`true` = an in-guest
-    /// app opened the camera, `false` = the last one closed it).
-    pub fn spawn(sink_addr: String) -> (Self, mpsc::Receiver<bool>) {
+    /// Spawn the resident sink task. The task connects immediately to the
+    /// vHAL's abstract AF_UNIX CMR1 endpoint and keeps the socket open
+    /// across sessions (reconnect with backoff) — it doubles as the reverse
+    /// event channel. Returns the handle plus the receiver of `CamInUse`
+    /// events (`true` = an in-guest app opened the camera, `false` = closed).
+    ///
+    /// `_sink_addr` (the legacy `CAMERA_SINK_ADDR` TCP endpoint) is retained
+    /// for CLI/executor compatibility but no longer used for connection —
+    /// the transport moved to a fixed abstract AF_UNIX name to bypass
+    /// ReDroid's ANDROID_PARANOID_NETWORK AF_INET restriction.
+    pub fn spawn(_sink_addr: String) -> (Self, mpsc::Receiver<bool>) {
         // Bounded so a wedged/slow endpoint applies backpressure without
         // unbounded memory growth. Frames are drop-newest on a full queue
         // (see `push_frame`) — losing a delta frame just costs one PLI.
         let (tx, rx) = mpsc::channel(256);
         let (evt_tx, evt_rx) = mpsc::channel(16);
-        tokio::spawn(run_sink(sink_addr, rx, evt_tx));
+        tokio::spawn(run_sink(rx, evt_tx));
         (Self { tx }, evt_rx)
     }
 
@@ -165,7 +200,7 @@ impl CameraSink {
 /// endpoint. Writes framed session messages (Config/Frame/Stop) and reads
 /// reverse `CamInUse` events on the same socket. Reconnects with backoff on
 /// drop; replays the active session's `Config` after a mid-session reconnect.
-async fn run_sink(sink_addr: String, mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
+async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
     // The current session's capability, retained so a mid-session reconnect
     // can replay the `Config` handshake before resuming frames.
     let mut active: Option<CameraConfig> = None;
@@ -178,20 +213,18 @@ async fn run_sink(sink_addr: String, mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mp
             let mut backoff = BACKOFF_MIN;
             let mut attempts: u32 = 0;
             loop {
-                match TcpStream::connect(&sink_addr).await {
+                match connect_cmr1().await {
                     Ok(s) => {
-                        let _ = s.set_nodelay(true);
-                        info!(addr = %sink_addr, "camera uplink: connected (resident)");
+                        info!("camera uplink: connected (resident, AF_UNIX @beeos_camera_cmr1)");
                         break s;
                     }
                     Err(e) => {
                         attempts += 1;
                         if attempts % CONNECT_WARN_EVERY == 1 && attempts > 1 {
-                            warn!(addr = %sink_addr, attempts, error = %e,
+                            warn!(attempts, error = %e,
                                   "camera uplink: endpoint unreachable; retrying");
                         } else {
-                            debug!(addr = %sink_addr, attempts, error = %e,
-                                   "camera uplink: connect failed");
+                            debug!(attempts, error = %e, "camera uplink: connect failed");
                         }
                         // Sleep with backoff, but keep consuming session
                         // messages so `active` tracks reality.
@@ -249,7 +282,7 @@ async fn run_sink(sink_addr: String, mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mp
                         return;
                     }
                     Some(SinkMsg::Start(cfg)) => {
-                        info!(addr = %sink_addr, ?cfg, "camera uplink: starting virtual-camera session");
+                        info!(?cfg, "camera uplink: starting virtual-camera session");
                         active = Some(cfg.clone());
                         let Ok(payload) = serde_json::to_vec(&cfg) else { continue };
                         if let Err(e) = write_frame(&mut wr, KIND_CONFIG, &payload).await {
@@ -352,8 +385,6 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
 
     #[test]
     fn config_defaults_to_h264() {
@@ -363,68 +394,30 @@ mod tests {
         assert_eq!(c.width, 1280);
     }
 
-    /// End-to-end framing round-trip against a real loopback listener:
-    /// Start → Config frame, push_frame → Frame frame, with correct magic,
-    /// kind bytes and little-endian lengths.
+    /// Full resident-connection round-trip against a real abstract AF_UNIX
+    /// listener bound to the SAME fixed name the sink connects to. Covers:
+    /// framing (Config/Frame with correct magic/kind/LE-length), reverse
+    /// CamInUse surfacing on the event channel, and Stop-keepalive (a
+    /// follow-up Config flows on the same still-open connection).
+    ///
+    /// Linux-only: the sink hard-codes the abstract-namespace name (a Linux
+    /// extension), and the single fixed name means this test must run alone
+    /// (there is one endpoint per process). macOS dev builds skip it.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn writes_config_then_frame_with_correct_framing() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
+    async fn resident_connection_framing_reverse_and_stop_keepalive() {
+        use std::os::linux::net::SocketAddrExt;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixListener;
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut frames = Vec::new();
-            // Read two frames (config + one au).
-            for _ in 0..2 {
-                let mut header = [0u8; 9];
-                sock.read_exact(&mut header).await.unwrap();
-                assert_eq!(&header[..4], FRAME_MAGIC);
-                let kind = header[4];
-                let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
-                let mut payload = vec![0u8; len];
-                sock.read_exact(&mut payload).await.unwrap();
-                frames.push((kind, payload));
-            }
-            frames
-        });
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(CMR1_ABSTRACT_NAME).unwrap();
+        let std_listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let listener = UnixListener::from_std(std_listener).unwrap();
 
-        let (sink, _evt_rx) = CameraSink::spawn(addr);
-        sink.start(CameraConfig::new(640, 480, 30, "back")).await;
-        // Retry a couple times: the sink connects asynchronously.
-        for _ in 0..50 {
-            if sink.push_frame(vec![0, 0, 0, 1, 0x65, 0xAA]) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let (sink, mut evt_rx) = CameraSink::spawn(String::new());
 
-        let frames = tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("server did not receive frames in time")
-            .unwrap();
-
-        assert_eq!(frames[0].0, KIND_CONFIG);
-        let cfg: serde_json::Value = serde_json::from_slice(&frames[0].1).unwrap();
-        assert_eq!(cfg["codec"], "h264");
-        assert_eq!(cfg["facing"], "back");
-        assert_eq!(cfg["width"], 640);
-
-        assert_eq!(frames[1].0, KIND_FRAME);
-        assert_eq!(frames[1].1, vec![0, 0, 0, 1, 0x65, 0xAA]);
-    }
-
-    /// v1.1 resident-connection semantics: the sink connects without a
-    /// session, reverse CamInUse frames surface on the event receiver, and
-    /// Stop does NOT close the socket (a follow-up Config flows on the same
-    /// connection).
-    #[tokio::test]
-    async fn resident_connection_reverse_events_and_stop_keepalive() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-
-        let (sink, mut evt_rx) = CameraSink::spawn(addr);
-
-        // Sink connects at spawn — no session needed.
+        // Sink connects at spawn — no session needed (resident).
         let (mut sock, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
             .await
             .expect("sink did not connect at spawn")
@@ -444,13 +437,21 @@ mod tests {
             .unwrap();
         assert!(evt, "expected in_use=true");
 
-        // Session start/stop flow on the SAME connection; Stop keeps it open.
-        sink.start(CameraConfig::new(640, 480, 30, "front")).await;
+        // Session start (Config) + a Frame with correct framing, then Stop
+        // (keeps the socket), then a second Config on the SAME connection.
+        sink.start(CameraConfig::new(640, 480, 30, "back")).await;
+        for _ in 0..50 {
+            if sink.push_frame(vec![0, 0, 0, 1, 0x65, 0xAA]) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         sink.stop().await;
         sink.start(CameraConfig::new(1280, 720, 30, "front")).await;
 
-        let mut kinds = Vec::new();
-        for _ in 0..3 {
+        // Expect: Config, Frame, Stop, Config — all on one connection.
+        let mut got: Vec<(u8, Vec<u8>)> = Vec::new();
+        for _ in 0..4 {
             let mut header = [0u8; 9];
             tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut header))
                 .await
@@ -460,8 +461,16 @@ mod tests {
             let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
             let mut payload = vec![0u8; len];
             sock.read_exact(&mut payload).await.unwrap();
-            kinds.push(header[4]);
+            got.push((header[4], payload));
         }
-        assert_eq!(kinds, vec![KIND_CONFIG, KIND_STOP, KIND_CONFIG]);
+
+        assert_eq!(got[0].0, KIND_CONFIG);
+        let cfg: serde_json::Value = serde_json::from_slice(&got[0].1).unwrap();
+        assert_eq!(cfg["codec"], "h264");
+        assert_eq!(cfg["facing"], "back");
+        assert_eq!(cfg["width"], 640);
+        assert_eq!(got[1], (KIND_FRAME, vec![0, 0, 0, 1, 0x65, 0xAA]));
+        assert_eq!(got[2].0, KIND_STOP);
+        assert_eq!(got[3].0, KIND_CONFIG);
     }
 }
