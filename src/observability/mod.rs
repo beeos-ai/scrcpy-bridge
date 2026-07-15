@@ -150,6 +150,36 @@ pub static MQTT_RECONNECTS_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
     c
 });
 
+/// Times the MQTT watchdog decided the signaling session was unhealthy
+/// (event loop silent past the staleness threshold, or the session slot
+/// left empty by a failed credential rotation) and forced a rebuild.
+/// A non-zero rate here means the bridge is actively self-healing —
+/// worth alerting on if sustained.
+pub static MQTT_WATCHDOG_REBUILDS_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let c = prometheus::IntCounter::new(
+        "scrcpy_bridge_mqtt_watchdog_rebuilds_total",
+        "MQTT session rebuilds forced by the staleness watchdog",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+/// Inbound signaling messages dropped because the bridge main loop was not
+/// draining the signal channel (backpressure). Dropping is deliberate —
+/// blocking the MQTT event loop would starve the keepalive and get the
+/// client kicked off the broker silently. Browsers retry offers, so drops
+/// are recoverable; a sustained rate points at a wedged offer handler.
+pub static MQTT_SIGNALS_DROPPED_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let c = prometheus::IntCounter::new(
+        "scrcpy_bridge_mqtt_signals_dropped_total",
+        "Inbound MQTT signaling messages dropped due to backpressure",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 pub static JWT_REFRESH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         prometheus::Opts::new(
@@ -207,6 +237,8 @@ pub fn init_metrics() {
     Lazy::force(&VIEWER_FPS);
     Lazy::force(&VIEWER_PACKETS_LOST);
     Lazy::force(&MQTT_RECONNECTS_TOTAL);
+    Lazy::force(&MQTT_WATCHDOG_REBUILDS_TOTAL);
+    Lazy::force(&MQTT_SIGNALS_DROPPED_TOTAL);
     Lazy::force(&JWT_REFRESH_TOTAL);
     Lazy::force(&SCRCPY_RECONNECTS_TOTAL);
     Lazy::force(&PLI_COUNT_TOTAL);

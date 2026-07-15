@@ -243,16 +243,20 @@ impl Bridge {
             ));
         }
         let topic_prefix = topic_prefix.to_string();
+        // `MqttSignaling` owns the `mqtt_connected` health flag from here
+        // on: it is raised only after the broker acknowledged the
+        // subscription and dropped by the internal watchdog / failed
+        // rebuilds. No manual store here — single source of truth.
         let (mqtt, mut sig_rx) = MqttSignaling::connect(MqttSignalingConfig {
             broker_url: initial_creds.broker_url.clone(),
             username: initial_creds.username.clone(),
             token: initial_creds.token.clone(),
             topic_prefix: topic_prefix.clone(),
             client_id: format!("scrcpy-bridge-{}", self.cli.device_id),
+            connected_flag: self.health.mqtt_connected.clone(),
         })
         .await
         .context("connect mqtt")?;
-        self.health.mqtt_connected.store(true, Ordering::Relaxed);
         let mqtt = Arc::new(mqtt);
         info!(
             device_id = %self.cli.device_id,
@@ -957,9 +961,14 @@ impl Bridge {
                             username: MQTT_USERNAME.to_string(),
                             token: resp.mqtt_token,
                         };
+                        // `reconnect` updates the mqtt_connected health
+                        // flag itself (truthful: Ok means the broker
+                        // acknowledged the new session's subscription). On
+                        // failure the signaling watchdog keeps retrying
+                        // with these credentials every tick — no session
+                        // is stranded until the next refresh event.
                         match mqtt.reconnect(creds).await {
                             Ok(_) => {
-                                health.mqtt_connected.store(true, Ordering::Relaxed);
                                 info!(
                                     expires_at = resp.expires_at,
                                     ice_servers = resp.ice_servers.len(),
@@ -967,8 +976,10 @@ impl Bridge {
                                 );
                             }
                             Err(e) => {
-                                warn!(error = %e, "MQTT reconnect failed after credential refresh");
-                                health.mqtt_connected.store(false, Ordering::Relaxed);
+                                warn!(
+                                    error = format!("{e:#}"),
+                                    "MQTT reconnect failed after credential refresh — watchdog will retry"
+                                );
                             }
                         }
                     }
@@ -2395,6 +2406,7 @@ mod tests {
             token: "whatever".into(),
             topic_prefix: "   ".into(), // whitespace must count as empty
             client_id: "scrcpy-bridge-test".into(),
+            connected_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
         .await;
         match result {
