@@ -84,21 +84,20 @@ rumqttc = { version = "0.25", features = ["use-rustls", "websocket"] }
 # transitive deps).
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
-# str0m (via its default features) enables the `asm` feature of the `sha1`
-# crate, which on aarch64 pulls in `sha1-asm` 0.5.3 → buggy on Apple Silicon
-# and miscomputes the digest used by tungstenite's `Sec-WebSocket-Accept`
-# validation (leading to `Key mismatch` on every MQTT handshake). Cargo
-# feature unification means we can't flip the flag on str0m alone; we instead
-# opt this whole crate (and, transitively, tungstenite) into sha1's
-# `force-soft` backend which short-circuits the asm branch. No measurable
-# perf impact for the WebSocket + DTLS paths we exercise.
+# Keep SHA-1 on its portable implementation. This avoids architecture-specific
+# WebSocket handshake regressions in multi-arch release builds.
 sha1 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
 # URL parsing (for mqtt:// / ws:// / wss://)
 url = "2.5"
 
-# WebRTC (sans-IO)
-str0m = { version = "0.9" }
+# WebRTC. Unlike the previous sans-I/O transport, webrtc-rs gathers and uses
+# TURN relay candidates on the service side, which is required when the
+# browser and an OKE pod cannot reach each other's private host candidates.
+webrtc = "0.17"
+media = { package = "webrtc-media", version = "0.17" }
+rtp = "0.17"
+rtcp = "0.17"
 
 # Random (nonces, SSRC allocation, etc.)
 rand = "0.8"

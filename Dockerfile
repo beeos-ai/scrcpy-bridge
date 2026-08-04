@@ -1,7 +1,7 @@
 ############################
 # Stage 1 — cargo builder
 ############################
-FROM rust:1.82-slim AS builder
+FROM rust:1.88-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev ca-certificates curl \

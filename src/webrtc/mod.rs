@@ -1,10 +1,10 @@
-//! WebRTC peer using `str0m` (Sans-IO).
+//! WebRTC peer with service-side TURN relay support.
 //!
 //! ## H.264 pass-through
 //!
 //! The whole reason this crate exists is to avoid the decode/re-encode cycle
 //! that the Python prototype does. Scrcpy hands us H.264 AUs directly; we
-//! simply hand each AU to str0m's sample API (`Writer::write`) and str0m's
+//! simply hand each AU to the WebRTC sample API and its
 //! built-in H.264 packetizer chops it into RTP packets.
 //!
 //! ## Run-loop ownership
@@ -13,8 +13,8 @@
 //! machine. The public API is message-passing (offer / ice / close via
 //! an mpsc channel, events via a broadcast channel).
 
-pub mod peer;
+pub mod peer_webrtc;
 
-pub use peer::{
+pub use peer_webrtc::{
     CameraFrame, IceServer, PeerCommand, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer,
 };
