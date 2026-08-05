@@ -388,7 +388,18 @@ impl WebRtcPeer {
 
 type DataChannelSlot = Arc<RwLock<Option<Arc<RTCDataChannel>>>>;
 type CameraSinkSlot = Arc<RwLock<Option<mpsc::Sender<CameraFrame>>>>;
-type CameraPayloadTypes = Arc<RwLock<HashSet<u8>>>;
+type CameraCodecContract = Arc<RwLock<H264CameraContract>>;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct H264CameraContract {
+    advertised_payload_types: HashSet<u8>,
+}
+
+impl H264CameraContract {
+    fn authorizes_inbound_video(&self) -> bool {
+        !self.advertised_payload_types.is_empty()
+    }
+}
 
 async fn run_peer(
     opts: PeerOptions,
@@ -447,12 +458,13 @@ async fn run_peer(
 
     let camera_sink: CameraSinkSlot = Arc::new(RwLock::new(None));
     let camera_ssrc = Arc::new(AtomicU32::new(0));
-    let camera_payload_types: CameraPayloadTypes = Arc::new(RwLock::new(HashSet::new()));
+    let camera_codec_contract: CameraCodecContract =
+        Arc::new(RwLock::new(H264CameraContract::default()));
     install_camera_callback(
         &pc,
         camera_sink.clone(),
         camera_ssrc.clone(),
-        camera_payload_types.clone(),
+        camera_codec_contract.clone(),
     );
 
     let video_track = Arc::new(TrackLocalStaticSample::new(
@@ -493,7 +505,7 @@ async fn run_peer(
         match command {
             PeerCommand::AcceptOffer { sdp, kind, done } => {
                 let result =
-                    accept_offer(&pc, &candidate_gate, &camera_payload_types, sdp, kind).await;
+                    accept_offer(&pc, &candidate_gate, &camera_codec_contract, sdp, kind).await;
                 let acknowledgement = result
                     .as_ref()
                     .map(|_| ())
@@ -722,13 +734,13 @@ fn install_camera_callback(
     pc: &Arc<RTCPeerConnection>,
     camera_sink: CameraSinkSlot,
     camera_ssrc: Arc<AtomicU32>,
-    camera_payload_types: CameraPayloadTypes,
+    camera_codec_contract: CameraCodecContract,
 ) {
     let pc_weak = Arc::downgrade(pc);
     pc.on_track(Box::new(move |track, _receiver, _transceiver| {
         let sink = camera_sink.clone();
         let ssrc_slot = camera_ssrc.clone();
-        let allowed_payload_types = camera_payload_types.clone();
+        let codec_contract = camera_codec_contract.clone();
         let pc_weak = pc_weak.clone();
         Box::pin(async move {
             if track.kind() != RTPCodecType::Video {
@@ -741,14 +753,17 @@ fn install_camera_callback(
             // though the new sendonly camera m-line maps that PT to H.264.
             // TrackRemote::codec() then reports the stale global mapping. The
             // remote SDP media section is the authoritative per-m-line
-            // contract, so validate the actual packet PT against that set.
+            // contract. The packet PT cannot be compared with that section's
+            // PT set: webrtc-rs exposes the bundled/global PT on TrackRemote,
+            // which may legitimately differ from the camera m-line's PT.
             let payload_type = track.payload_type();
             let reported_codec = track.codec().capability.mime_type;
-            if !allowed_payload_types.read().await.contains(&payload_type) {
+            let contract = codec_contract.read().await.clone();
+            if !contract.authorizes_inbound_video() {
                 warn!(
                     payload_type,
                     %reported_codec,
-                    "ignoring inbound camera track outside H264 SDP contract"
+                    "ignoring inbound camera track without H264 SDP contract"
                 );
                 return;
             }
@@ -759,6 +774,7 @@ fn install_camera_callback(
                 ssrc,
                 payload_type,
                 %reported_codec,
+                advertised_payload_types = ?contract.advertised_payload_types,
                 "inbound H264 camera track ready"
             );
             if sink.read().await.is_some() {
@@ -835,13 +851,13 @@ fn spawn_outbound_rtcp_reader(
 async fn accept_offer(
     pc: &Arc<RTCPeerConnection>,
     candidate_gate: &LocalCandidateGate,
-    camera_payload_types: &CameraPayloadTypes,
+    camera_codec_contract: &CameraCodecContract,
     sdp: String,
     kind: NegotiationKind,
 ) -> Result<()> {
-    let negotiated_camera_payload_types =
-        h264_camera_payload_types(&sdp).context("validate inbound camera codec contract")?;
-    *camera_payload_types.write().await = negotiated_camera_payload_types;
+    let negotiated_camera_contract =
+        h264_camera_contract(&sdp).context("validate inbound camera codec contract")?;
+    *camera_codec_contract.write().await = negotiated_camera_contract;
 
     let offer = RTCSessionDescription::offer(sdp).context("parse offer SDP")?;
     pc.set_remote_description(offer)
@@ -864,11 +880,10 @@ async fn accept_offer(
     Ok(())
 }
 
-/// Return the H.264 payload types authorized by every remote sendonly video
-/// m-line. A camera uplink has no degraded fallback: the virtual-camera sink
-/// consumes H.264 access units directly, so any other primary codec makes the
-/// whole offer invalid.
-fn h264_camera_payload_types(sdp: &str) -> Result<HashSet<u8>> {
+/// Validate every remote sendonly video m-line. A camera uplink has no
+/// degraded fallback: the virtual-camera sink consumes H.264 access units
+/// directly, so any other primary codec makes the whole offer invalid.
+fn h264_camera_contract(sdp: &str) -> Result<H264CameraContract> {
     const AUXILIARY_CODECS: &[&str] = &["rtx", "red", "ulpfec", "flexfec-03"];
 
     let normalized = sdp.replace("\r\n", "\n");
@@ -890,9 +905,7 @@ fn h264_camera_payload_types(sdp: &str) -> Result<HashSet<u8>> {
             let rtpmap = lines
                 .iter()
                 .find_map(|line| line.strip_prefix(&prefix))
-                .ok_or_else(|| {
-                    anyhow!("sendonly camera payload type {payload_type_text} has no rtpmap")
-                })?;
+                .ok_or_else(|| anyhow!("camera payload type {payload_type_text} has no rtpmap"))?;
             let codec = rtpmap
                 .split(['/', ' '])
                 .next()
@@ -905,7 +918,7 @@ fn h264_camera_payload_types(sdp: &str) -> Result<HashSet<u8>> {
             primary_codec_count += 1;
             if codec != "h264" {
                 return Err(anyhow!(
-                    "sendonly camera m-line offered unsupported primary codec {codec}"
+                    "camera m-line offered unsupported primary codec {codec}"
                 ));
             }
             h264_payload_types.insert(
@@ -916,13 +929,13 @@ fn h264_camera_payload_types(sdp: &str) -> Result<HashSet<u8>> {
         }
 
         if primary_codec_count == 0 {
-            return Err(anyhow!(
-                "sendonly camera m-line has no primary H264 payload type"
-            ));
+            return Err(anyhow!("camera m-line has no primary H264 payload type"));
         }
     }
 
-    Ok(h264_payload_types)
+    Ok(H264CameraContract {
+        advertised_payload_types: h264_payload_types,
+    })
 }
 
 async fn send_camera_pli(pc: &Arc<RTCPeerConnection>, media_ssrc: u32) {
@@ -997,7 +1010,29 @@ a=rtpmap:96 H264/90000\r\n\
 a=rtpmap:121 rtx/90000\r\n\
 a=fmtp:121 apt=96\r\n";
 
-        assert_eq!(h264_camera_payload_types(sdp)?, HashSet::from([96]));
+        assert_eq!(
+            h264_camera_contract(sdp)?,
+            H264CameraContract {
+                advertised_payload_types: HashSet::from([96]),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn camera_contract_authorizes_track_across_bundle_payload_collision() -> Result<()> {
+        let sdp = "v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=recvonly\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 107\r\n\
+a=sendonly\r\n\
+a=rtpmap:107 H264/90000\r\n";
+
+        let contract = h264_camera_contract(sdp)?;
+        assert_eq!(contract.advertised_payload_types, HashSet::from([107]));
+        assert!(!contract.advertised_payload_types.contains(&96));
+        assert!(contract.authorizes_inbound_video());
         Ok(())
     }
 
@@ -1008,7 +1043,7 @@ m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
 a=sendonly\r\n\
 a=rtpmap:96 VP8/90000\r\n";
 
-        let error = h264_camera_payload_types(sdp).expect_err("VP8 camera must fail closed");
+        let error = h264_camera_contract(sdp).expect_err("VP8 camera must fail closed");
         assert!(error.to_string().contains("unsupported primary codec vp8"));
     }
 
@@ -1019,7 +1054,7 @@ m=video 9 UDP/TLS/RTP/SAVPF 102 127\r\n\
 a=sendonly\r\n\
 a=rtpmap:102 H264/90000\r\n";
 
-        let error = h264_camera_payload_types(sdp).expect_err("unmapped PT must fail closed");
+        let error = h264_camera_contract(sdp).expect_err("unmapped PT must fail closed");
         assert!(error.to_string().contains("payload type 127 has no rtpmap"));
     }
 
@@ -1030,7 +1065,7 @@ m=video 9 UDP/TLS/RTP/SAVPF 102\r\n\
 a=recvonly\r\n\
 a=rtpmap:102 H264/90000\r\n";
 
-        assert!(h264_camera_payload_types(sdp)?.is_empty());
+        assert!(!h264_camera_contract(sdp)?.authorizes_inbound_video());
         Ok(())
     }
 
