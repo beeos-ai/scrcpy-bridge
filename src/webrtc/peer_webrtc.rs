@@ -396,8 +396,9 @@ struct H264CameraContract {
 }
 
 impl H264CameraContract {
-    fn authorizes_inbound_video(&self) -> bool {
+    fn authorizes_inbound_video(&self, reported_codec: &str) -> bool {
         !self.advertised_payload_types.is_empty()
+            && reported_codec.eq_ignore_ascii_case(MIME_TYPE_H264)
     }
 }
 
@@ -759,11 +760,12 @@ fn install_camera_callback(
             let payload_type = track.payload_type();
             let reported_codec = track.codec().capability.mime_type;
             let contract = codec_contract.read().await.clone();
-            if !contract.authorizes_inbound_video() {
+            if !contract.authorizes_inbound_video(&reported_codec) {
                 warn!(
                     payload_type,
                     %reported_codec,
-                    "ignoring inbound camera track without H264 SDP contract"
+                    advertised_payload_types = ?contract.advertised_payload_types,
+                    "ignoring inbound camera track without matching H264 codec contract"
                 );
                 return;
             }
@@ -1032,7 +1034,8 @@ a=rtpmap:107 H264/90000\r\n";
         let contract = h264_camera_contract(sdp)?;
         assert_eq!(contract.advertised_payload_types, HashSet::from([107]));
         assert!(!contract.advertised_payload_types.contains(&96));
-        assert!(contract.authorizes_inbound_video());
+        assert!(contract.authorizes_inbound_video(MIME_TYPE_H264));
+        assert!(!contract.authorizes_inbound_video("video/VP8"));
         Ok(())
     }
 
@@ -1065,7 +1068,7 @@ m=video 9 UDP/TLS/RTP/SAVPF 102\r\n\
 a=recvonly\r\n\
 a=rtpmap:102 H264/90000\r\n";
 
-        assert!(!h264_camera_contract(sdp)?.authorizes_inbound_video());
+        assert!(!h264_camera_contract(sdp)?.authorizes_inbound_video(MIME_TYPE_H264));
         Ok(())
     }
 
