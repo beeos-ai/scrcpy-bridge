@@ -871,6 +871,100 @@ fn sample_duration(previous_pts: &mut Option<u64>, pts_us: u64, fallback: Durati
 mod tests {
     use super::*;
 
+    async fn next_answer(peer: &WebRtcPeer) -> Result<String> {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), peer.next_event())
+                .await
+                .context("timed out waiting for peer answer")?
+                .context("peer event stream closed")?;
+            match event {
+                PeerEvent::Answer(sdp) => return Ok(sdp),
+                PeerEvent::Error(error) => return Err(anyhow!(error)),
+                _ => {}
+            }
+        }
+    }
+
+    fn ice_ufrag(sdp: &str) -> Option<&str> {
+        sdp.lines()
+            .find_map(|line| line.trim().strip_prefix("a=ice-ufrag:"))
+    }
+
+    #[tokio::test]
+    async fn adding_camera_media_renegotiates_without_waiting_for_new_ice() -> Result<()> {
+        use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+        use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
+
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs()?;
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let client = api.new_peer_connection(RTCConfiguration::default()).await?;
+        let recvonly = || RTCRtpTransceiverInit {
+            direction: RTCRtpTransceiverDirection::Recvonly,
+            send_encodings: vec![],
+        };
+        client
+            .add_transceiver_from_kind(RTPCodecType::Video, Some(recvonly()))
+            .await?;
+        client
+            .add_transceiver_from_kind(RTPCodecType::Audio, Some(recvonly()))
+            .await?;
+        let _control = client.create_data_channel("control", None).await?;
+
+        let peer = WebRtcPeer::spawn(PeerOptions::default())?;
+        let initial_offer = client.create_offer(None).await?;
+        client.set_local_description(initial_offer).await?;
+        let initial_sdp = client
+            .local_description()
+            .await
+            .context("client initial local description")?
+            .sdp;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            peer.accept_offer(initial_sdp.clone(), NegotiationKind::Initial),
+        )
+        .await
+        .context("initial negotiation blocked")??;
+        client
+            .set_remote_description(RTCSessionDescription::answer(next_answer(&peer).await?)?)
+            .await?;
+
+        let camera_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                clock_rate: 90_000,
+                ..Default::default()
+            },
+            "camera".to_owned(),
+            "browser-camera".to_owned(),
+        ));
+        let _camera_sender = client
+            .add_track(camera_track as Arc<dyn TrackLocal + Send + Sync>)
+            .await?;
+        let camera_offer = client.create_offer(None).await?;
+        client.set_local_description(camera_offer).await?;
+        let camera_sdp = client
+            .local_description()
+            .await
+            .context("client camera local description")?
+            .sdp;
+        assert_eq!(ice_ufrag(&initial_sdp), ice_ufrag(&camera_sdp));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            peer.accept_offer(camera_sdp, NegotiationKind::MediaRenegotiation),
+        )
+        .await
+        .context("camera media renegotiation blocked on ICE gathering")??;
+        client
+            .set_remote_description(RTCSessionDescription::answer(next_answer(&peer).await?)?)
+            .await?;
+
+        peer.close().await;
+        client.close().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn trickle_candidates_are_published_after_the_answer() {
         let (evt_tx, mut evt_rx) = broadcast::channel(8);
