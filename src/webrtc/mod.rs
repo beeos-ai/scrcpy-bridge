@@ -16,5 +16,6 @@
 pub mod peer_webrtc;
 
 pub use peer_webrtc::{
-    CameraFrame, IceServer, PeerCommand, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer,
+    CameraFrame, IceServer, NegotiationKind, PeerCommand, PeerEvent, PeerOptions, VideoTransport,
+    WebRtcPeer,
 };

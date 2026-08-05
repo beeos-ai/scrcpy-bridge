@@ -18,7 +18,7 @@ use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtp::codecs::h264::H264Packet;
 use rtp::packetizer::Depacketizer;
-use tokio::sync::{broadcast, mpsc, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
@@ -81,8 +81,9 @@ pub struct PeerOptions {
     /// Retained for local/self-host callers; TURN-backed cloud sessions do not
     /// advertise hand-built host candidates.
     pub extra_local_ips: Vec<std::net::IpAddr>,
-    /// Minimum legacy wait hint. Gathering is always allowed up to 10 seconds
-    /// so a TURN allocation can complete before the answer is published.
+    /// Maximum time allowed for a TURN-backed ICE generation to produce a
+    /// relay candidate. SDP answers are published immediately and candidates
+    /// trickle independently; this deadline only enforces the relay policy.
     pub ice_gather_wait: Duration,
 }
 
@@ -97,8 +98,25 @@ impl Default for PeerOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NegotiationKind {
+    Initial,
+    MediaRenegotiation,
+    IceRestart,
+}
+
+impl NegotiationKind {
+    fn starts_ice_generation(self) -> bool {
+        matches!(self, Self::Initial | Self::IceRestart)
+    }
+}
+
 pub enum PeerCommand {
-    AcceptOffer(String),
+    AcceptOffer {
+        sdp: String,
+        kind: NegotiationKind,
+        done: oneshot::Sender<std::result::Result<(), String>>,
+    },
     RemoteIce(String),
     WriteVideo(VideoFrame),
     WriteVideoBinary(Vec<u8>),
@@ -129,11 +147,137 @@ pub enum PeerEvent {
     Error(String),
 }
 
+#[derive(Default)]
+struct CandidateGateState {
+    generation: u64,
+    answer_published: bool,
+    pending_candidates: Vec<String>,
+    relay_seen: bool,
+    gathering_complete: bool,
+    failure_reported: bool,
+}
+
+/// Orders trickled candidates behind their SDP answer and enforces the
+/// service-side TURN policy without blocking the peer command loop.
+///
+/// WebRTC candidate gathering is a state machine, not a one-shot event. A
+/// media-only renegotiation reuses the current ICE generation and may never
+/// emit another `Complete` transition. Keeping the generation state here
+/// prevents that renegotiation from waiting on an event that cannot occur.
+#[derive(Clone)]
+struct LocalCandidateGate {
+    state: Arc<Mutex<CandidateGateState>>,
+    evt_tx: broadcast::Sender<PeerEvent>,
+    require_relay: bool,
+    relay_deadline: Duration,
+}
+
+impl LocalCandidateGate {
+    fn new(
+        evt_tx: broadcast::Sender<PeerEvent>,
+        require_relay: bool,
+        relay_deadline: Duration,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(CandidateGateState::default())),
+            evt_tx,
+            require_relay,
+            relay_deadline,
+        }
+    }
+
+    async fn begin_answer(&self, starts_ice_generation: bool) {
+        let generation = {
+            let mut state = self.state.lock().await;
+            if starts_ice_generation {
+                state.generation = state.generation.wrapping_add(1);
+                state.pending_candidates.clear();
+                state.relay_seen = false;
+                state.gathering_complete = false;
+                state.failure_reported = false;
+            }
+            state.answer_published = false;
+            state.generation
+        };
+
+        if starts_ice_generation && self.require_relay {
+            let gate = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(gate.relay_deadline).await;
+                gate.fail_if_relay_missing(generation, "deadline elapsed")
+                    .await;
+            });
+        }
+    }
+
+    async fn publish_answer(&self, sdp: String) {
+        // The broadcast receiver owned by WebRtcPeer is created before the
+        // peer task, so this answer remains durable even when initial session
+        // plumbing has not started its event pump yet.
+        let _ = self.evt_tx.send(PeerEvent::Answer(sdp));
+        let pending = {
+            let mut state = self.state.lock().await;
+            state.answer_published = true;
+            std::mem::take(&mut state.pending_candidates)
+        };
+        for candidate in pending {
+            let _ = self.evt_tx.send(PeerEvent::LocalIce(candidate));
+        }
+    }
+
+    async fn add_candidate(&self, candidate: String, is_relay: bool) {
+        let publish_now = {
+            let mut state = self.state.lock().await;
+            state.relay_seen |= is_relay;
+            if state.answer_published {
+                true
+            } else {
+                state.pending_candidates.push(candidate.clone());
+                false
+            }
+        };
+        if publish_now {
+            let _ = self.evt_tx.send(PeerEvent::LocalIce(candidate));
+        }
+    }
+
+    async fn gathering_complete(&self) {
+        let generation = {
+            let mut state = self.state.lock().await;
+            state.gathering_complete = true;
+            state.generation
+        };
+        self.fail_if_relay_missing(generation, "gathering completed")
+            .await;
+    }
+
+    async fn fail_if_relay_missing(&self, generation: u64, reason: &'static str) {
+        if !self.require_relay {
+            return;
+        }
+        let should_report = {
+            let mut state = self.state.lock().await;
+            if state.generation != generation || state.relay_seen || state.failure_reported {
+                false
+            } else if reason == "gathering completed" || !state.gathering_complete {
+                state.failure_reported = true;
+                true
+            } else {
+                false
+            }
+        };
+        if should_report {
+            let _ = self.evt_tx.send(PeerEvent::Error(format!(
+                "TURN was configured but ICE relay validation failed: {reason}"
+            )));
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WebRtcPeer {
     cmd_tx: mpsc::Sender<PeerCommand>,
     evt_rx: Arc<tokio::sync::Mutex<broadcast::Receiver<PeerEvent>>>,
-    evt_tx: broadcast::Sender<PeerEvent>,
     video_transport: Arc<AtomicU8>,
 }
 
@@ -151,13 +295,18 @@ impl WebRtcPeer {
         Ok(Self {
             cmd_tx,
             evt_rx: Arc::new(tokio::sync::Mutex::new(evt_rx)),
-            evt_tx,
             video_transport: Arc::new(AtomicU8::new(VideoTransport::Rtp.as_u8())),
         })
     }
 
-    pub async fn accept_offer(&self, sdp: String) -> Result<()> {
-        self.send(PeerCommand::AcceptOffer(sdp)).await
+    pub async fn accept_offer(&self, sdp: String, kind: NegotiationKind) -> Result<()> {
+        let (done, completed) = oneshot::channel();
+        self.send(PeerCommand::AcceptOffer { sdp, kind, done })
+            .await?;
+        completed
+            .await
+            .map_err(|_| anyhow!("peer exited before completing offer"))?
+            .map_err(|error| anyhow!(error))
     }
 
     pub async fn add_remote_ice(&self, candidate: String) -> Result<()> {
@@ -216,12 +365,16 @@ impl WebRtcPeer {
         let _ = self.send(PeerCommand::Close).await;
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<PeerEvent> {
-        self.evt_tx.subscribe()
-    }
-
     pub async fn next_event(&self) -> Option<PeerEvent> {
-        self.evt_rx.lock().await.recv().await.ok()
+        loop {
+            match self.evt_rx.lock().await.recv().await {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "webrtc peer event receiver lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
     }
 
     async fn send(&self, command: PeerCommand) -> Result<()> {
@@ -264,7 +417,6 @@ async fn run_peer(
                 urls: server.urls.clone(),
                 username: server.username.clone().unwrap_or_default(),
                 credential: server.credential.clone().unwrap_or_default(),
-                ..Default::default()
             })
             .collect(),
         ice_transport_policy: if force_relay {
@@ -283,8 +435,13 @@ async fn run_peer(
     );
 
     let pc = Arc::new(api.new_peer_connection(config).await?);
-    let gathering_done = Arc::new(Notify::new());
-    install_state_callbacks(&pc, gathering_done.clone(), evt_tx.clone());
+    let relay_deadline = if opts.ice_gather_wait.is_zero() {
+        Duration::from_secs(10)
+    } else {
+        opts.ice_gather_wait
+    };
+    let candidate_gate = LocalCandidateGate::new(evt_tx.clone(), force_relay, relay_deadline);
+    install_state_callbacks(&pc, candidate_gate.clone(), evt_tx.clone());
 
     let control_dc: DataChannelSlot = Arc::new(RwLock::new(None));
     let video_dc: DataChannelSlot = Arc::new(RwLock::new(None));
@@ -330,8 +487,14 @@ async fn run_peer(
 
     while let Some(command) = cmd_rx.recv().await {
         match command {
-            PeerCommand::AcceptOffer(sdp) => {
-                accept_offer(&pc, &gathering_done, &opts, sdp, &evt_tx).await?;
+            PeerCommand::AcceptOffer { sdp, kind, done } => {
+                let result = accept_offer(&pc, &candidate_gate, sdp, kind).await;
+                let acknowledgement = result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"));
+                let _ = done.send(acknowledgement);
+                result?;
             }
             PeerCommand::RemoteIce(candidate) => {
                 if candidate.trim().is_empty() {
@@ -433,23 +596,33 @@ async fn run_peer(
 
 fn install_state_callbacks(
     pc: &Arc<RTCPeerConnection>,
-    gathering_done: Arc<Notify>,
+    candidate_gate: LocalCandidateGate,
     evt_tx: broadcast::Sender<PeerEvent>,
 ) {
+    let gathering_gate = candidate_gate.clone();
     pc.on_ice_gathering_state_change(Box::new(move |state| {
-        let done = gathering_done.clone();
+        let gate = gathering_gate.clone();
         Box::pin(async move {
             info!(state = %state, "ICE gathering state");
             if state == RTCIceGathererState::Complete {
-                done.notify_one();
+                gate.gathering_complete().await;
             }
         })
     }));
 
     pc.on_ice_candidate(Box::new(move |candidate| {
+        let gate = candidate_gate.clone();
         Box::pin(async move {
             match candidate {
-                Some(candidate) => info!(candidate = %candidate, "local ICE candidate gathered"),
+                Some(candidate) => {
+                    info!(candidate = %candidate, "local ICE candidate gathered");
+                    let is_relay = candidate.typ
+                        == webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType::Relay;
+                    match candidate.to_json() {
+                        Ok(init) => gate.add_candidate(init.candidate, is_relay).await,
+                        Err(error) => warn!(%error, "serialize local ICE candidate"),
+                    }
+                }
                 None => info!("local ICE gathering complete"),
             }
         })
@@ -636,52 +809,28 @@ fn spawn_outbound_rtcp_reader(
 
 async fn accept_offer(
     pc: &Arc<RTCPeerConnection>,
-    gathering_done: &Arc<Notify>,
-    opts: &PeerOptions,
+    candidate_gate: &LocalCandidateGate,
     sdp: String,
-    evt_tx: &broadcast::Sender<PeerEvent>,
+    kind: NegotiationKind,
 ) -> Result<()> {
     let offer = RTCSessionDescription::offer(sdp).context("parse offer SDP")?;
     pc.set_remote_description(offer)
         .await
         .context("set remote description")?;
     let answer = pc.create_answer(None).await.context("create answer")?;
+    candidate_gate
+        .begin_answer(kind.starts_ice_generation())
+        .await;
     pc.set_local_description(answer)
         .await
         .context("set local description")?;
-
-    let timeout = Duration::from_secs(10).max(opts.ice_gather_wait);
-    tokio::select! {
-        _ = gathering_done.notified() => {}
-        _ = tokio::time::sleep(timeout) => {
-            warn!(?timeout, "ICE gathering timed out; returning available candidates");
-        }
-    }
 
     let local = pc
         .local_description()
         .await
         .context("missing local description after answer")?;
-    let candidates: Vec<&str> = local
-        .sdp
-        .lines()
-        .filter(|line| line.starts_with("a=candidate:"))
-        .collect();
-    let relay_candidates = candidates
-        .iter()
-        .filter(|line| line.contains(" typ relay"))
-        .count();
-    info!(
-        candidates = candidates.len(),
-        relay_candidates, "answer SDP ready"
-    );
-
-    if has_turn_server(&opts.ice_servers) && relay_candidates == 0 {
-        return Err(anyhow!(
-            "TURN was configured but the service gathered no relay candidate"
-        ));
-    }
-    let _ = evt_tx.send(PeerEvent::Answer(local.sdp));
+    info!(?kind, "answer SDP ready; ICE candidates will trickle");
+    candidate_gate.publish_answer(local.sdp).await;
     Ok(())
 }
 
@@ -722,6 +871,48 @@ fn sample_duration(previous_pts: &mut Option<u64>, pts_us: u64, fallback: Durati
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn trickle_candidates_are_published_after_the_answer() {
+        let (evt_tx, mut evt_rx) = broadcast::channel(8);
+        let gate = LocalCandidateGate::new(evt_tx, true, Duration::from_secs(60));
+
+        gate.begin_answer(true).await;
+        gate.add_candidate("candidate:relay".to_owned(), true).await;
+        assert!(matches!(
+            evt_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        gate.publish_answer("answer".to_owned()).await;
+        assert!(matches!(evt_rx.recv().await, Ok(PeerEvent::Answer(sdp)) if sdp == "answer"));
+        assert!(
+            matches!(evt_rx.recv().await, Ok(PeerEvent::LocalIce(candidate)) if candidate == "candidate:relay")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_turn_relay_is_reported_without_blocking_the_answer() {
+        let (evt_tx, mut evt_rx) = broadcast::channel(8);
+        let gate = LocalCandidateGate::new(evt_tx, true, Duration::from_secs(60));
+
+        gate.begin_answer(true).await;
+        gate.publish_answer("answer".to_owned()).await;
+        gate.gathering_complete().await;
+
+        assert!(matches!(evt_rx.recv().await, Ok(PeerEvent::Answer(_))));
+        assert!(matches!(
+            evt_rx.recv().await,
+            Ok(PeerEvent::Error(message)) if message.contains("gathering completed")
+        ));
+    }
+
+    #[test]
+    fn only_initial_offers_and_ice_restarts_start_a_generation() {
+        assert!(NegotiationKind::Initial.starts_ice_generation());
+        assert!(NegotiationKind::IceRestart.starts_ice_generation());
+        assert!(!NegotiationKind::MediaRenegotiation.starts_ice_generation());
+    }
+
     #[test]
     fn detects_turn_urls_and_ignores_stun_only_configs() {
         let stun = IceServer {
@@ -734,7 +925,7 @@ mod tests {
             username: Some("u".to_owned()),
             credential: Some("p".to_owned()),
         };
-        assert!(!has_turn_server(&[stun.clone()]));
+        assert!(!has_turn_server(std::slice::from_ref(&stun)));
         assert!(has_turn_server(&[stun, turn]));
     }
 
