@@ -6,6 +6,7 @@
 //! the Runtime-provided ICE servers and, whenever TURN is present, requires a
 //! relay candidate for the service side as well.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -387,6 +388,7 @@ impl WebRtcPeer {
 
 type DataChannelSlot = Arc<RwLock<Option<Arc<RTCDataChannel>>>>;
 type CameraSinkSlot = Arc<RwLock<Option<mpsc::Sender<CameraFrame>>>>;
+type CameraPayloadTypes = Arc<RwLock<HashSet<u8>>>;
 
 async fn run_peer(
     opts: PeerOptions,
@@ -445,7 +447,13 @@ async fn run_peer(
 
     let camera_sink: CameraSinkSlot = Arc::new(RwLock::new(None));
     let camera_ssrc = Arc::new(AtomicU32::new(0));
-    install_camera_callback(&pc, camera_sink.clone(), camera_ssrc.clone());
+    let camera_payload_types: CameraPayloadTypes = Arc::new(RwLock::new(HashSet::new()));
+    install_camera_callback(
+        &pc,
+        camera_sink.clone(),
+        camera_ssrc.clone(),
+        camera_payload_types.clone(),
+    );
 
     let video_track = Arc::new(TrackLocalStaticSample::new(
         RTCRtpCodecCapability {
@@ -484,7 +492,8 @@ async fn run_peer(
     while let Some(command) = cmd_rx.recv().await {
         match command {
             PeerCommand::AcceptOffer { sdp, kind, done } => {
-                let result = accept_offer(&pc, &candidate_gate, sdp, kind).await;
+                let result =
+                    accept_offer(&pc, &candidate_gate, &camera_payload_types, sdp, kind).await;
                 let acknowledgement = result
                     .as_ref()
                     .map(|_| ())
@@ -713,25 +722,45 @@ fn install_camera_callback(
     pc: &Arc<RTCPeerConnection>,
     camera_sink: CameraSinkSlot,
     camera_ssrc: Arc<AtomicU32>,
+    camera_payload_types: CameraPayloadTypes,
 ) {
     let pc_weak = Arc::downgrade(pc);
     pc.on_track(Box::new(move |track, _receiver, _transceiver| {
         let sink = camera_sink.clone();
         let ssrc_slot = camera_ssrc.clone();
+        let allowed_payload_types = camera_payload_types.clone();
         let pc_weak = pc_weak.clone();
         Box::pin(async move {
             if track.kind() != RTPCodecType::Video {
                 return;
             }
-            let codec = track.codec().capability.mime_type;
-            if !codec.eq_ignore_ascii_case(MIME_TYPE_H264) {
-                warn!(%codec, "ignoring non-H264 inbound camera track");
+
+            // webrtc-rs keeps one negotiated payload-type table for every
+            // bundled video m-line. During media renegotiation a browser may
+            // reuse a PT that the initial screen m-line mapped to VP8, even
+            // though the new sendonly camera m-line maps that PT to H.264.
+            // TrackRemote::codec() then reports the stale global mapping. The
+            // remote SDP media section is the authoritative per-m-line
+            // contract, so validate the actual packet PT against that set.
+            let payload_type = track.payload_type();
+            let reported_codec = track.codec().capability.mime_type;
+            if !allowed_payload_types.read().await.contains(&payload_type) {
+                warn!(
+                    payload_type,
+                    %reported_codec,
+                    "ignoring inbound camera track outside H264 SDP contract"
+                );
                 return;
             }
 
             let ssrc = track.ssrc();
             ssrc_slot.store(ssrc, Ordering::Release);
-            info!(ssrc, "inbound H264 camera track ready");
+            info!(
+                ssrc,
+                payload_type,
+                %reported_codec,
+                "inbound H264 camera track ready"
+            );
             if sink.read().await.is_some() {
                 if let Some(pc) = pc_weak.upgrade() {
                     send_camera_pli(&pc, ssrc).await;
@@ -806,9 +835,14 @@ fn spawn_outbound_rtcp_reader(
 async fn accept_offer(
     pc: &Arc<RTCPeerConnection>,
     candidate_gate: &LocalCandidateGate,
+    camera_payload_types: &CameraPayloadTypes,
     sdp: String,
     kind: NegotiationKind,
 ) -> Result<()> {
+    let negotiated_camera_payload_types =
+        h264_camera_payload_types(&sdp).context("validate inbound camera codec contract")?;
+    *camera_payload_types.write().await = negotiated_camera_payload_types;
+
     let offer = RTCSessionDescription::offer(sdp).context("parse offer SDP")?;
     pc.set_remote_description(offer)
         .await
@@ -828,6 +862,67 @@ async fn accept_offer(
     info!(?kind, "answer SDP ready; ICE candidates will trickle");
     candidate_gate.publish_answer(local.sdp).await;
     Ok(())
+}
+
+/// Return the H.264 payload types authorized by every remote sendonly video
+/// m-line. A camera uplink has no degraded fallback: the virtual-camera sink
+/// consumes H.264 access units directly, so any other primary codec makes the
+/// whole offer invalid.
+fn h264_camera_payload_types(sdp: &str) -> Result<HashSet<u8>> {
+    const AUXILIARY_CODECS: &[&str] = &["rtx", "red", "ulpfec", "flexfec-03"];
+
+    let normalized = sdp.replace("\r\n", "\n");
+    let mut h264_payload_types = HashSet::new();
+
+    for raw_section in normalized.split("\nm=").skip(1) {
+        let section = format!("m={raw_section}");
+        let lines: Vec<&str> = section.lines().map(str::trim).collect();
+        let Some(media_line) = lines.first() else {
+            continue;
+        };
+        if !media_line.starts_with("m=video ") || !lines.contains(&"a=sendonly") {
+            continue;
+        }
+
+        let mut primary_codec_count = 0;
+        for payload_type_text in media_line.split_whitespace().skip(3) {
+            let prefix = format!("a=rtpmap:{payload_type_text} ");
+            let rtpmap = lines
+                .iter()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .ok_or_else(|| {
+                    anyhow!("sendonly camera payload type {payload_type_text} has no rtpmap")
+                })?;
+            let codec = rtpmap
+                .split(['/', ' '])
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if AUXILIARY_CODECS.contains(&codec.as_str()) {
+                continue;
+            }
+
+            primary_codec_count += 1;
+            if codec != "h264" {
+                return Err(anyhow!(
+                    "sendonly camera m-line offered unsupported primary codec {codec}"
+                ));
+            }
+            h264_payload_types.insert(
+                payload_type_text
+                    .parse::<u8>()
+                    .with_context(|| format!("invalid camera payload type {payload_type_text}"))?,
+            );
+        }
+
+        if primary_codec_count == 0 {
+            return Err(anyhow!(
+                "sendonly camera m-line has no primary H264 payload type"
+            ));
+        }
+    }
+
+    Ok(h264_payload_types)
 }
 
 async fn send_camera_pli(pc: &Arc<RTCPeerConnection>, media_ssrc: u32) {
@@ -888,6 +983,55 @@ mod tests {
     fn ice_ufrag(sdp: &str) -> Option<&str> {
         sdp.lines()
             .find_map(|line| line.trim().strip_prefix("a=ice-ufrag:"))
+    }
+
+    #[test]
+    fn camera_payload_contract_uses_the_sendonly_media_mapping() -> Result<()> {
+        let sdp = "v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=recvonly\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 121\r\n\
+a=sendonly\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=rtpmap:121 rtx/90000\r\n\
+a=fmtp:121 apt=96\r\n";
+
+        assert_eq!(h264_camera_payload_types(sdp)?, HashSet::from([96]));
+        Ok(())
+    }
+
+    #[test]
+    fn camera_payload_contract_rejects_non_h264_primary_codecs() {
+        let sdp = "v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=sendonly\r\n\
+a=rtpmap:96 VP8/90000\r\n";
+
+        let error = h264_camera_payload_types(sdp).expect_err("VP8 camera must fail closed");
+        assert!(error.to_string().contains("unsupported primary codec vp8"));
+    }
+
+    #[test]
+    fn camera_payload_contract_rejects_unmapped_payloads() {
+        let sdp = "v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 102 127\r\n\
+a=sendonly\r\n\
+a=rtpmap:102 H264/90000\r\n";
+
+        let error = h264_camera_payload_types(sdp).expect_err("unmapped PT must fail closed");
+        assert!(error.to_string().contains("payload type 127 has no rtpmap"));
+    }
+
+    #[test]
+    fn camera_payload_contract_is_empty_without_an_uplink() -> Result<()> {
+        let sdp = "v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 102\r\n\
+a=recvonly\r\n\
+a=rtpmap:102 H264/90000\r\n";
+
+        assert!(h264_camera_payload_types(sdp)?.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
