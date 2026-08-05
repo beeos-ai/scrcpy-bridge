@@ -81,9 +81,9 @@ pub struct PeerOptions {
     /// Retained for local/self-host callers; TURN-backed cloud sessions do not
     /// advertise hand-built host candidates.
     pub extra_local_ips: Vec<std::net::IpAddr>,
-    /// Maximum time allowed for a TURN-backed ICE generation to produce a
-    /// relay candidate. SDP answers are published immediately and candidates
-    /// trickle independently; this deadline only enforces the relay policy.
+    /// Legacy gathering wait hint. TURN-backed sessions use at least ten
+    /// seconds for background relay validation. SDP answers are still
+    /// published immediately and candidates trickle independently.
     pub ice_gather_wait: Duration,
 }
 
@@ -435,11 +435,7 @@ async fn run_peer(
     );
 
     let pc = Arc::new(api.new_peer_connection(config).await?);
-    let relay_deadline = if opts.ice_gather_wait.is_zero() {
-        Duration::from_secs(10)
-    } else {
-        opts.ice_gather_wait
-    };
+    let relay_deadline = relay_validation_deadline(opts.ice_gather_wait);
     let candidate_gate = LocalCandidateGate::new(evt_tx.clone(), force_relay, relay_deadline);
     install_state_callbacks(&pc, candidate_gate.clone(), evt_tx.clone());
 
@@ -857,6 +853,10 @@ fn has_turn_server(servers: &[IceServer]) -> bool {
     })
 }
 
+fn relay_validation_deadline(legacy_hint: Duration) -> Duration {
+    Duration::from_secs(10).max(legacy_hint)
+}
+
 fn sample_duration(previous_pts: &mut Option<u64>, pts_us: u64, fallback: Duration) -> Duration {
     let duration = previous_pts
         .and_then(|previous| pts_us.checked_sub(previous))
@@ -911,6 +911,18 @@ mod tests {
         assert!(NegotiationKind::Initial.starts_ice_generation());
         assert!(NegotiationKind::IceRestart.starts_ice_generation());
         assert!(!NegotiationKind::MediaRenegotiation.starts_ice_generation());
+    }
+
+    #[test]
+    fn relay_validation_never_uses_the_legacy_short_wait() {
+        assert_eq!(
+            relay_validation_deadline(Duration::from_millis(250)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            relay_validation_deadline(Duration::from_secs(15)),
+            Duration::from_secs(15)
+        );
     }
 
     #[test]
