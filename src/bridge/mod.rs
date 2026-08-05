@@ -43,7 +43,9 @@ use crate::scrcpy::{
     AudioReader, ControlSocket, ScrcpyServer, ScrcpyServerConfig, ScrcpyShutdown, VideoFrame,
     VideoReader,
 };
-use crate::webrtc::{CameraFrame, IceServer, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer};
+use crate::webrtc::{
+    CameraFrame, IceServer, NegotiationKind, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer,
+};
 
 /// MQTT username expected by the EMQX JWT auth plugin. All device-scoped
 /// connections log in as `device`; the JWT payload carries the true identity.
@@ -149,16 +151,38 @@ fn extract_dtls_fingerprint(sdp: &str) -> Option<String> {
     })
 }
 
-/// Decide whether a same-viewer offer may take the ICE-restart fast path
-/// on the existing str0m peer.
+/// Extract the remote ICE username fragment that identifies an ICE
+/// generation. Media-only renegotiation keeps it stable; `restartIce()`
+/// changes it. Reading this independently from the DTLS fingerprint lets the
+/// bridge distinguish the two operations without coupling to webrtc-rs
+/// internals.
+fn extract_ice_ufrag(sdp: &str) -> Option<String> {
+    sdp.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("a=ice-ufrag:")
+            .map(|value| value.trim().to_owned())
+    })
+}
+
+fn classify_in_place_negotiation(
+    session_ice_ufrag: Option<&str>,
+    offer_ice_ufrag: Option<&str>,
+) -> NegotiationKind {
+    match (session_ice_ufrag, offer_ice_ufrag) {
+        (Some(session), Some(offer)) if session == offer => NegotiationKind::MediaRenegotiation,
+        _ => NegotiationKind::IceRestart,
+    }
+}
+
+/// Decide whether a same-viewer offer may be applied to the existing peer.
 ///
 /// Only a genuine `createOffer({iceRestart: true})` from the SAME
 /// `RTCPeerConnection` qualifies — and the DTLS certificate (thus the
 /// `a=fingerprint` value) is the invariant that identifies it. A page
 /// reload keeps the viewerId (sessionStorage) but mints a fresh
-/// certificate; str0m pins the fingerprint from the first offer and
-/// never rebuilds DTLS on `accept_offer`, so handing it a new-cert offer
-/// wedges the browser in an endless "Connecting" loop.
+/// certificate. Handing a new-certificate offer to the old peer mixes two
+/// connection identities and can wedge the browser in an endless
+/// "Connecting" loop.
 ///
 /// Missing fingerprints on either side disqualify the fast path:
 /// correctness (full rebuild always works) beats the optimization.
@@ -516,6 +540,7 @@ impl Bridge {
         // is consumed by the session construction below, and the fast
         // path needs it to decide eligibility.
         let offer_fingerprint = extract_dtls_fingerprint(&offer_sdp);
+        let offer_ice_ufrag = extract_ice_ufrag(&offer_sdp);
 
         // Fast path — same viewer, same RTCPeerConnection, live peer:
         //   * The viewer side just re-ran `createOffer({iceRestart:
@@ -555,22 +580,40 @@ impl Bridge {
                 guard
                     .as_ref()
                     .filter(|s| s.viewer_id == viewer_id)
-                    .map(|s| (s.peer.clone(), s.remote_fingerprint.clone()))
+                    .map(|s| {
+                        (
+                            s.peer.clone(),
+                            s.remote_fingerprint.clone(),
+                            s.remote_ice_ufrag.clone(),
+                        )
+                    })
             };
-            if let Some((peer, session_fingerprint)) = peer_opt {
+            if let Some((peer, session_fingerprint, session_ice_ufrag)) = peer_opt {
                 if fast_path_eligible(session_fingerprint.as_deref(), offer_fingerprint.as_deref())
                 {
+                    let kind = classify_in_place_negotiation(
+                        session_ice_ufrag.as_deref(),
+                        offer_ice_ufrag.as_deref(),
+                    );
                     info!(
                         viewer = %viewer_id,
-                        "same-viewer offer → ICE restart on existing peer (scrcpy preserved)"
+                        ?kind,
+                        "same-viewer offer → in-place negotiation (scrcpy preserved)"
                     );
                     // Clone the SDP so the replace path below can still
                     // consume it if str0m refuses the fast-path offer
                     // (e.g. the peer is in a state the SDP-state-machine
                     // can't reconcile). String clone is negligible vs.
                     // the alternative of losing a recovery opportunity.
-                    match peer.accept_offer(offer_sdp.clone()).await {
-                        Ok(()) => return Ok(()),
+                    match peer.accept_offer(offer_sdp.clone(), kind).await {
+                        Ok(()) => {
+                            if let Some(session) = current_session.lock().await.as_mut() {
+                                if session.viewer_id == viewer_id {
+                                    session.remote_ice_ufrag = offer_ice_ufrag;
+                                }
+                            }
+                            return Ok(());
+                        }
                         Err(e) => {
                             warn!(
                                 viewer = %viewer_id,
@@ -698,7 +741,8 @@ impl Bridge {
                 ice_gather_wait: Duration::from_millis(self.cli.ice_gather_wait_ms),
             };
             let peer = WebRtcPeer::spawn(peer_opts)?;
-            peer.accept_offer(offer_sdp).await?;
+            peer.accept_offer(offer_sdp, NegotiationKind::Initial)
+                .await?;
             anyhow::Ok(peer)
         };
         let peer = match construct.await {
@@ -803,6 +847,7 @@ impl Bridge {
         *current_session.lock().await = Some(Session {
             viewer_id,
             remote_fingerprint: offer_fingerprint,
+            remote_ice_ufrag: offer_ice_ufrag,
             peer,
             cancel,
             tasks,
@@ -1084,6 +1129,10 @@ pub(crate) struct Session {
     /// str0m pins the fingerprint from the first offer and keeps the
     /// established DTLS session. See `fast_path_eligible`.
     remote_fingerprint: Option<String>,
+    /// Remote ICE username fragment from the most recently accepted offer.
+    /// A stable value means a media-only renegotiation; a changed value means
+    /// a real ICE restart and begins a new relay-validation generation.
+    remote_ice_ufrag: Option<String>,
     peer: WebRtcPeer,
     cancel: CancellationToken,
     tasks: JoinSet<()>,
@@ -1197,7 +1246,6 @@ async fn run_event_pump(
     camera_sink: CameraSink,
     cam_in_use: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let mut evt_rx = peer.subscribe();
     // Browsers emit PLI roughly every 200 ms after any packet loss. Scrcpy
     // needs ~1 encode cycle to emit a new IDR, so we rate-limit how often
     // we actually poke the device. The `StreamReady` edge is NOT subject
@@ -1278,15 +1326,8 @@ async fn run_event_pump(
                     }
                 }
             }
-            recv = evt_rx.recv() => {
-                let evt = match recv {
-                    Ok(e) => e,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(lagged = n, "event pump lagged");
-                        continue;
-                    }
-                };
+            evt = peer.next_event() => {
+                let Some(evt) = evt else { return };
                 match evt {
                     PeerEvent::Answer(sdp) => {
                         if let Err(e) = mqtt.publish_response(&SignalResponse::Answer { sdp }).await {
@@ -2193,6 +2234,36 @@ mod tests {
         assert!(!fast_path_eligible(None, Some(FP_A)));
         assert!(!fast_path_eligible(Some(FP_A), None));
         assert!(!fast_path_eligible(None, None));
+    }
+
+    #[test]
+    fn extracts_ice_generation_from_session_or_media_sdp() {
+        let session_level = "v=0\r\na=ice-ufrag:generation-a\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
+        let media_level = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=ice-ufrag:generation-b\r\n";
+        assert_eq!(
+            extract_ice_ufrag(session_level).as_deref(),
+            Some("generation-a")
+        );
+        assert_eq!(
+            extract_ice_ufrag(media_level).as_deref(),
+            Some("generation-b")
+        );
+    }
+
+    #[test]
+    fn classifies_media_renegotiation_without_starting_new_ice() {
+        assert_eq!(
+            classify_in_place_negotiation(Some("stable"), Some("stable")),
+            NegotiationKind::MediaRenegotiation,
+        );
+        assert_eq!(
+            classify_in_place_negotiation(Some("old"), Some("new")),
+            NegotiationKind::IceRestart,
+        );
+        assert_eq!(
+            classify_in_place_negotiation(None, Some("new")),
+            NegotiationKind::IceRestart,
+        );
     }
 
     // ── Keyframe-recovery state machine ────────────────────────────────────
