@@ -75,6 +75,12 @@ const MQTT_USERNAME: &str = "device";
 /// enough that a real device abandonment doesn't pin the encoder.
 const SESSION_GRACE: Duration = Duration::from_secs(30);
 
+/// Initial bootstrap runs while the pod's networking sidecars are still
+/// converging. Retry only transport-level failures; authentication and payload
+/// errors are deterministic and must fail immediately.
+const INITIAL_BOOTSTRAP_MAX_ATTEMPTS: usize = 8;
+const INITIAL_BOOTSTRAP_MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
+
 /// Control messages the event pump fires into `Bridge::run`'s main loop
 /// so the grace-timer state machine lives in exactly one place. The
 /// event pump is per-session and must not own grace state directly — it
@@ -907,11 +913,11 @@ impl Bridge {
     /// Pull credentials from Agent Gateway's `/api/v1/device/bootstrap`.
     ///
     /// This is the only supported credential path. Missing/empty key files,
-    /// unreachable Agent Gateway, expired/rejected Ed25519 signatures — all
-    /// surface as an `Err` here and the bridge refuses to start. There is
-    /// **no** static `--mqtt-token` fallback: Runtime-issued JWTs expire in
-    /// ~10 minutes and `rumqttc` reuses its initial password on reconnect,
-    /// so a static token would guarantee a broken session at expiry.
+    /// Transport failures are retried with a bounded exponential backoff so
+    /// startup does not race the pod's DNS/network setup. Missing key files,
+    /// rejected Ed25519 signatures, invalid responses, and a transport outage
+    /// that outlives the retry budget surface as an `Err`; the bridge never
+    /// falls back to a static MQTT token.
     async fn resolve_initial_credentials(&self) -> Result<(MqttCredentials, BootstrapResponse)> {
         if self.cli.bridge_private_key_file.is_empty() || self.cli.bridge_public_key_file.is_empty()
         {
@@ -919,10 +925,30 @@ impl Bridge {
                 "BRIDGE_PRIVATE_KEY_FILE and BRIDGE_PUBLIC_KEY_FILE are required"
             ));
         }
-        let (creds, resp) = self
-            .bootstrap_fetch()
-            .await
-            .context("bootstrap fetch from Agent Gateway")?;
+        let mut attempt = 1;
+        let (creds, resp) = loop {
+            match self.bootstrap_fetch().await {
+                Ok(result) => break result,
+                Err(error)
+                    if attempt < INITIAL_BOOTSTRAP_MAX_ATTEMPTS
+                        && is_transient_initial_bootstrap_error(&error) =>
+                {
+                    let delay = initial_bootstrap_retry_delay(attempt);
+                    warn!(
+                        attempt,
+                        max_attempts = INITIAL_BOOTSTRAP_MAX_ATTEMPTS,
+                        delay_ms = delay.as_millis(),
+                        error = %error,
+                        "initial bootstrap transport failure; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(error).context("bootstrap fetch from Agent Gateway");
+                }
+            }
+        };
         info!(
             broker = %mask_broker(&creds.broker_url),
             expires_at = resp.expires_at,
@@ -1087,6 +1113,19 @@ fn merge_ice_servers(bootstrap: &[IceServerPayload], cli: &Cli) -> Vec<IceServer
         });
     }
     out
+}
+
+fn initial_bootstrap_retry_delay(failed_attempt: usize) -> Duration {
+    let exponent = failed_attempt.saturating_sub(1).min(3) as u32;
+    Duration::from_secs(1_u64 << exponent).min(INITIAL_BOOTSTRAP_MAX_RETRY_DELAY)
+}
+
+fn is_transient_initial_bootstrap_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_connect() || error.is_timeout())
+    })
 }
 
 /// Redact the token/query portion from an MQTT URL for logging.
@@ -2435,6 +2474,57 @@ mod tests {
             msg.contains("BRIDGE_PRIVATE_KEY_FILE") && msg.contains("BRIDGE_PUBLIC_KEY_FILE"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn initial_bootstrap_backoff_is_bounded() {
+        assert_eq!(initial_bootstrap_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(initial_bootstrap_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(initial_bootstrap_retry_delay(3), Duration::from_secs(4));
+        assert_eq!(initial_bootstrap_retry_delay(4), Duration::from_secs(8));
+        assert_eq!(initial_bootstrap_retry_delay(20), Duration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn initial_bootstrap_retries_transient_connect_failure() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        tokio::spawn(async move {
+            // Leave the port closed long enough for the first request to get a
+            // connection error, then serve the retry from the same address.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let listener = TcpListener::bind(addr).await.unwrap();
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut request).await;
+            let body = r#"{"mqttUrl":"mqtt://broker.test:1883","mqttToken":"jwt","deviceTopic":"devices/device-dev-test","iceServers":[],"expiresAt":4102444800}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        let (priv_f, pub_f) = write_identity();
+        let mut cli = make_cli();
+        cli.agent_gateway_url = format!("http://{addr}");
+        cli.bridge_private_key_file = priv_f.path().to_string_lossy().into_owned();
+        cli.bridge_public_key_file = pub_f.path().to_string_lossy().into_owned();
+        let bridge = Bridge::new(cli, HealthFlags::default());
+        let started = Instant::now();
+
+        let (creds, response) = bridge
+            .resolve_initial_credentials()
+            .await
+            .expect("transient connection failure should recover");
+
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(creds.broker_url, "mqtt://broker.test:1883");
+        assert_eq!(response.device_topic, "devices/device-dev-test");
     }
 
     /// Spin up a one-shot TCP listener that always answers with HTTP 401
