@@ -2001,16 +2001,30 @@ async fn forward_control(
             camera_sink.start(cfg).await;
 
             // Peer → sink pathway. The peer forwards depayloaded inbound
-            // Annex-B AUs into `frame_tx`; a tiny drain task hands them to
-            // the sink (which owns the loopback socket). The task ends on
-            // its own when the peer drops `frame_tx` (camera_stop or session
-            // teardown replaces/clears the sink), so it needs no cancel
-            // token.
+            // Annex-B AUs into `frame_tx`; the drain task hands them to the
+            // sink and owns recovery for that final queue boundary. After a
+            // local drop it rejects dependent frames until an IDR arrives.
+            // The task ends when the peer drops `frame_tx`, so it needs no
+            // cancel token.
             let (frame_tx, mut frame_rx) = mpsc::channel::<CameraFrame>(16);
             let sink_for_task = camera_sink.clone();
+            let peer_for_recovery = peer.clone();
             tokio::spawn(async move {
+                let mut waiting_for_idr = true;
                 while let Some(frame) = frame_rx.recv().await {
-                    sink_for_task.push_frame(frame.data);
+                    let is_keyframe = frame.is_keyframe();
+                    if waiting_for_idr && !is_keyframe {
+                        continue;
+                    }
+                    if sink_for_task.push_frame(frame.data) {
+                        if is_keyframe {
+                            waiting_for_idr = false;
+                        }
+                    } else {
+                        waiting_for_idr = true;
+                        debug!("camera endpoint queue full or closed; requesting recovery IDR");
+                        let _ = peer_for_recovery.request_camera_keyframe().await;
+                    }
                 }
                 debug!("camera frame forwarder exiting");
             });

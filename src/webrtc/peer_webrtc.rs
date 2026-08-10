@@ -8,16 +8,18 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use media::Sample;
 use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
-use rtp::codecs::h264::H264Packet;
+use rtp::codecs::h264::{
+    H264Packet, FUA_NALU_TYPE, FU_END_BITMASK, FU_START_BITMASK, NALU_TYPE_BITMASK,
+};
 use rtp::packetizer::Depacketizer;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -133,6 +135,12 @@ pub enum PeerCommand {
 pub struct CameraFrame {
     pub data: Vec<u8>,
     pub pts_us: i64,
+}
+
+impl CameraFrame {
+    pub fn is_keyframe(&self) -> bool {
+        annex_b_contains_idr(&self.data)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +288,7 @@ pub struct WebRtcPeer {
     cmd_tx: mpsc::Sender<PeerCommand>,
     evt_rx: Arc<tokio::sync::Mutex<broadcast::Receiver<PeerEvent>>>,
     video_transport: Arc<AtomicU8>,
+    camera_waiting_for_keyframe: Arc<AtomicBool>,
 }
 
 impl WebRtcPeer {
@@ -287,8 +296,12 @@ impl WebRtcPeer {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (evt_tx, evt_rx) = broadcast::channel(64);
         let evt_for_task = evt_tx.clone();
+        let camera_waiting_for_keyframe = Arc::new(AtomicBool::new(true));
+        let recovery_for_task = camera_waiting_for_keyframe.clone();
         tokio::spawn(async move {
-            if let Err(error) = run_peer(opts, cmd_rx, evt_for_task.clone()).await {
+            if let Err(error) =
+                run_peer(opts, cmd_rx, evt_for_task.clone(), recovery_for_task).await
+            {
                 warn!(error = %error, "webrtc peer run loop exited with error");
                 let _ = evt_for_task.send(PeerEvent::Error(error.to_string()));
             }
@@ -297,6 +310,7 @@ impl WebRtcPeer {
             cmd_tx,
             evt_rx: Arc::new(tokio::sync::Mutex::new(evt_rx)),
             video_transport: Arc::new(AtomicU8::new(VideoTransport::Rtp.as_u8())),
+            camera_waiting_for_keyframe,
         })
     }
 
@@ -355,10 +369,16 @@ impl WebRtcPeer {
     }
 
     pub async fn set_camera_sink(&self, sink: Option<mpsc::Sender<CameraFrame>>) -> Result<()> {
+        if sink.is_some() {
+            self.camera_waiting_for_keyframe
+                .store(true, Ordering::Release);
+        }
         self.send(PeerCommand::SetCameraSink(sink)).await
     }
 
     pub async fn request_camera_keyframe(&self) -> Result<()> {
+        self.camera_waiting_for_keyframe
+            .store(true, Ordering::Release);
         self.send(PeerCommand::RequestCameraKeyframe).await
     }
 
@@ -402,10 +422,234 @@ impl H264CameraContract {
     }
 }
 
+const CAMERA_PLI_MIN_INTERVAL: Duration = Duration::from_millis(300);
+
+#[derive(Clone)]
+struct CameraPliRequester {
+    last_sent: Arc<Mutex<Option<Instant>>>,
+}
+
+impl CameraPliRequester {
+    fn new() -> Self {
+        Self {
+            last_sent: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn request(&self, pc: &Arc<RTCPeerConnection>, media_ssrc: u32, reason: &'static str) {
+        if media_ssrc == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        {
+            let mut last_sent = self.last_sent.lock().await;
+            if last_sent.is_some_and(|last| now.duration_since(last) < CAMERA_PLI_MIN_INTERVAL) {
+                return;
+            }
+            *last_sent = Some(now);
+        }
+
+        let packets: Vec<Box<dyn rtcp::packet::Packet + Send + Sync>> =
+            vec![Box::new(PictureLossIndication {
+                sender_ssrc: 0,
+                media_ssrc,
+            })];
+        if let Err(error) = pc.write_rtcp(&packets).await {
+            let mut last_sent = self.last_sent.lock().await;
+            if *last_sent == Some(now) {
+                *last_sent = None;
+            }
+            warn!(error = %error, media_ssrc, reason, "send camera PLI");
+        } else {
+            debug!(media_ssrc, reason, "camera PLI sent");
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CameraPacketOutput {
+    access_unit: Option<Vec<u8>>,
+    discontinuity: Option<&'static str>,
+}
+
+/// Reassembles exactly one H.264 access unit at a time.
+///
+/// `H264Packet` depacketizes FU-A payloads but does not validate RTP sequence
+/// continuity or FU start/end ordering. Feeding its partial output downstream
+/// permanently poisons an inter-frame decoder until the next IDR. This wrapper
+/// makes a complete, continuous access unit the only possible output.
+#[derive(Default)]
+struct CameraH264Assembler {
+    depacketizer: H264Packet,
+    access_unit: Vec<u8>,
+    last_sequence: Option<u16>,
+    last_timestamp: Option<u32>,
+    fragment_open: bool,
+    discard_current_access_unit: bool,
+}
+
+impl CameraH264Assembler {
+    fn push(
+        &mut self,
+        sequence_number: u16,
+        timestamp: u32,
+        marker: bool,
+        payload: &Bytes,
+    ) -> CameraPacketOutput {
+        let mut output = CameraPacketOutput::default();
+
+        let forward_gap = if let Some(previous) = self.last_sequence {
+            match sequence_number.wrapping_sub(previous) {
+                1 => false,
+                0 | 0x8000..=u16::MAX => return output,
+                _ => true,
+            }
+        } else {
+            false
+        };
+        self.last_sequence = Some(sequence_number);
+
+        let timestamp_changed = self
+            .last_timestamp
+            .is_some_and(|previous| previous != timestamp);
+        if timestamp_changed {
+            if self.access_unit_in_progress() {
+                output.discontinuity = Some("timestamp_changed_before_marker");
+            }
+            self.reset_access_unit();
+        }
+        self.last_timestamp = Some(timestamp);
+
+        if forward_gap {
+            output.discontinuity.get_or_insert("rtp_sequence_gap");
+            if timestamp_changed {
+                self.reset_access_unit();
+            } else {
+                self.discard_access_unit();
+            }
+        }
+
+        if self.discard_current_access_unit {
+            if marker {
+                self.reset_access_unit();
+            }
+            return output;
+        }
+
+        if payload.len() < 2 {
+            output.discontinuity.get_or_insert("short_h264_payload");
+            self.discard_access_unit();
+            if marker {
+                self.reset_access_unit();
+            }
+            return output;
+        }
+
+        let nalu_type = payload[0] & NALU_TYPE_BITMASK;
+        if nalu_type == FUA_NALU_TYPE {
+            let start = payload[1] & FU_START_BITMASK != 0;
+            let end = payload[1] & FU_END_BITMASK != 0;
+            let invalid_fragment = if start {
+                end || self.fragment_open
+            } else {
+                !self.fragment_open
+            };
+            if invalid_fragment {
+                output.discontinuity.get_or_insert("invalid_fu_a_order");
+                self.discard_access_unit();
+                if marker {
+                    self.reset_access_unit();
+                }
+                return output;
+            }
+            if start {
+                self.fragment_open = true;
+            } else if end {
+                self.fragment_open = false;
+            }
+        } else if self.fragment_open {
+            output
+                .discontinuity
+                .get_or_insert("unfinished_fu_a_fragment");
+            self.discard_access_unit();
+            if marker {
+                self.reset_access_unit();
+            }
+            return output;
+        }
+
+        match self.depacketizer.depacketize(payload) {
+            Ok(nal) if !nal.is_empty() => self.access_unit.extend_from_slice(&nal),
+            Ok(_) => {}
+            Err(_) => {
+                output.discontinuity.get_or_insert("h264_depacketize_error");
+                self.discard_access_unit();
+                if marker {
+                    self.reset_access_unit();
+                }
+                return output;
+            }
+        }
+
+        if marker {
+            if self.fragment_open {
+                output.discontinuity.get_or_insert("marker_before_fu_a_end");
+            } else if !self.access_unit.is_empty() {
+                output.access_unit = Some(std::mem::take(&mut self.access_unit));
+            }
+            self.reset_access_unit();
+        }
+
+        output
+    }
+
+    fn access_unit_in_progress(&self) -> bool {
+        !self.access_unit.is_empty() || self.fragment_open || self.discard_current_access_unit
+    }
+
+    fn discard_access_unit(&mut self) {
+        self.depacketizer = H264Packet::default();
+        self.access_unit.clear();
+        self.fragment_open = false;
+        self.discard_current_access_unit = true;
+    }
+
+    fn reset_access_unit(&mut self) {
+        self.depacketizer = H264Packet::default();
+        self.access_unit.clear();
+        self.fragment_open = false;
+        self.discard_current_access_unit = false;
+    }
+}
+
+fn annex_b_contains_idr(access_unit: &[u8]) -> bool {
+    let mut offset = 0;
+    while offset + 3 < access_unit.len() {
+        let header = if access_unit[offset..].starts_with(&[0, 0, 0, 1]) {
+            Some(offset + 4)
+        } else if access_unit[offset..].starts_with(&[0, 0, 1]) {
+            Some(offset + 3)
+        } else {
+            None
+        };
+        if let Some(header) = header {
+            if header < access_unit.len() && access_unit[header] & NALU_TYPE_BITMASK == 5 {
+                return true;
+            }
+            offset = header.saturating_add(1);
+        } else {
+            offset += 1;
+        }
+    }
+    false
+}
+
 async fn run_peer(
     opts: PeerOptions,
     mut cmd_rx: mpsc::Receiver<PeerCommand>,
     evt_tx: broadcast::Sender<PeerEvent>,
+    camera_waiting_for_keyframe: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
@@ -459,6 +703,7 @@ async fn run_peer(
 
     let camera_sink: CameraSinkSlot = Arc::new(RwLock::new(None));
     let camera_ssrc = Arc::new(AtomicU32::new(0));
+    let camera_pli = CameraPliRequester::new();
     let camera_codec_contract: CameraCodecContract =
         Arc::new(RwLock::new(H264CameraContract::default()));
     install_camera_callback(
@@ -466,6 +711,8 @@ async fn run_peer(
         camera_sink.clone(),
         camera_ssrc.clone(),
         camera_codec_contract.clone(),
+        camera_waiting_for_keyframe.clone(),
+        camera_pli.clone(),
     );
 
     let video_track = Arc::new(TrackLocalStaticSample::new(
@@ -590,11 +837,21 @@ async fn run_peer(
                 let should_request = sink.is_some();
                 *camera_sink.write().await = sink;
                 if should_request {
-                    send_camera_pli(&pc, camera_ssrc.load(Ordering::Acquire)).await;
+                    camera_waiting_for_keyframe.store(true, Ordering::Release);
+                    camera_pli
+                        .request(
+                            &pc,
+                            camera_ssrc.load(Ordering::Acquire),
+                            "camera_sink_attached",
+                        )
+                        .await;
                 }
             }
             PeerCommand::RequestCameraKeyframe => {
-                send_camera_pli(&pc, camera_ssrc.load(Ordering::Acquire)).await;
+                camera_waiting_for_keyframe.store(true, Ordering::Release);
+                camera_pli
+                    .request(&pc, camera_ssrc.load(Ordering::Acquire), "explicit_request")
+                    .await;
             }
             // Outbound keyframe recovery is driven by RTCP PLI/FIR and the
             // bridge's scrcpy ResetVideo command. No local WebRTC action is
@@ -736,12 +993,16 @@ fn install_camera_callback(
     camera_sink: CameraSinkSlot,
     camera_ssrc: Arc<AtomicU32>,
     camera_codec_contract: CameraCodecContract,
+    camera_waiting_for_keyframe: Arc<AtomicBool>,
+    camera_pli: CameraPliRequester,
 ) {
     let pc_weak = Arc::downgrade(pc);
     pc.on_track(Box::new(move |track, _receiver, _transceiver| {
         let sink = camera_sink.clone();
         let ssrc_slot = camera_ssrc.clone();
         let codec_contract = camera_codec_contract.clone();
+        let waiting_for_keyframe = camera_waiting_for_keyframe.clone();
+        let pli = camera_pli.clone();
         let pc_weak = pc_weak.clone();
         Box::pin(async move {
             if track.kind() != RTPCodecType::Video {
@@ -780,14 +1041,14 @@ fn install_camera_callback(
                 "inbound H264 camera track ready"
             );
             if sink.read().await.is_some() {
+                waiting_for_keyframe.store(true, Ordering::Release);
                 if let Some(pc) = pc_weak.upgrade() {
-                    send_camera_pli(&pc, ssrc).await;
+                    pli.request(&pc, ssrc, "camera_track_ready").await;
                 }
             }
 
             tokio::spawn(async move {
-                let mut depacketizer = H264Packet::default();
-                let mut access_unit = Vec::new();
+                let mut assembler = CameraH264Assembler::default();
                 loop {
                     let (packet, _) = match track.read_rtp().await {
                         Ok(packet) => packet,
@@ -796,28 +1057,54 @@ fn install_camera_callback(
                             break;
                         }
                     };
-                    match depacketizer.depacketize(&packet.payload) {
-                        Ok(nal) if !nal.is_empty() => access_unit.extend_from_slice(&nal),
-                        Ok(_) => {}
-                        Err(error) => {
-                            warn!(error = %error, "camera H264 depacketize");
-                            access_unit.clear();
-                            continue;
-                        }
+                    let output = assembler.push(
+                        packet.header.sequence_number,
+                        packet.header.timestamp,
+                        packet.header.marker,
+                        &packet.payload,
+                    );
+                    if let Some(reason) = output.discontinuity {
+                        waiting_for_keyframe.store(true, Ordering::Release);
+                        debug!(reason, "discarding damaged camera access unit");
                     }
-                    if packet.header.marker && !access_unit.is_empty() {
-                        let frame = CameraFrame {
-                            data: std::mem::take(&mut access_unit),
-                            pts_us: (u64::from(packet.header.timestamp) * 1_000_000 / 90_000)
-                                as i64,
-                        };
-                        if let Some(tx) = sink.read().await.clone() {
-                            if tx.try_send(frame).is_err() {
-                                debug!("camera sink full or closed; dropping access unit");
+
+                    let Some(access_unit) = output.access_unit else {
+                        if let Some(reason) = output.discontinuity {
+                            if let Some(pc) = pc_weak.upgrade() {
+                                pli.request(&pc, ssrc, reason).await;
                             }
+                        }
+                        continue;
+                    };
+
+                    let is_idr = annex_b_contains_idr(&access_unit);
+                    if waiting_for_keyframe.load(Ordering::Acquire) && !is_idr {
+                        if let Some(pc) = pc_weak.upgrade() {
+                            pli.request(&pc, ssrc, "waiting_for_idr").await;
+                        }
+                        continue;
+                    }
+
+                    let Some(tx) = sink.read().await.clone() else {
+                        continue;
+                    };
+                    let frame = CameraFrame {
+                        data: access_unit,
+                        pts_us: (u64::from(packet.header.timestamp) * 1_000_000 / 90_000) as i64,
+                    };
+                    if tx.try_send(frame).is_ok() {
+                        if is_idr {
+                            waiting_for_keyframe.store(false, Ordering::Release);
+                        }
+                    } else {
+                        waiting_for_keyframe.store(true, Ordering::Release);
+                        debug!("camera peer queue full or closed; dropping access unit");
+                        if let Some(pc) = pc_weak.upgrade() {
+                            pli.request(&pc, ssrc, "peer_queue_full").await;
                         }
                     }
                 }
+                waiting_for_keyframe.store(true, Ordering::Release);
                 ssrc_slot.store(0, Ordering::Release);
             });
         })
@@ -940,20 +1227,6 @@ fn h264_camera_contract(sdp: &str) -> Result<H264CameraContract> {
     })
 }
 
-async fn send_camera_pli(pc: &Arc<RTCPeerConnection>, media_ssrc: u32) {
-    if media_ssrc == 0 {
-        return;
-    }
-    let packets: Vec<Box<dyn rtcp::packet::Packet + Send + Sync>> =
-        vec![Box::new(PictureLossIndication {
-            sender_ssrc: 0,
-            media_ssrc,
-        })];
-    if let Err(error) = pc.write_rtcp(&packets).await {
-        warn!(error = %error, media_ssrc, "send camera PLI");
-    }
-}
-
 fn has_turn_server(servers: &[IceServer]) -> bool {
     servers.iter().any(|server| {
         server.urls.iter().any(|url| {
@@ -998,6 +1271,113 @@ mod tests {
     fn ice_ufrag(sdp: &str) -> Option<&str> {
         sdp.lines()
             .find_map(|line| line.trim().strip_prefix("a=ice-ufrag:"))
+    }
+
+    #[test]
+    fn camera_assembler_emits_complete_single_nalu_access_unit() {
+        let mut assembler = CameraH264Assembler::default();
+        let output = assembler.push(10, 90_000, true, &Bytes::from_static(&[0x65, 0xaa, 0xbb]));
+
+        assert_eq!(output.discontinuity, None);
+        assert_eq!(
+            output.access_unit,
+            Some(vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa, 0xbb])
+        );
+        assert!(annex_b_contains_idr(output.access_unit.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn camera_assembler_reassembles_contiguous_fu_a() {
+        let mut assembler = CameraH264Assembler::default();
+
+        assert_eq!(
+            assembler.push(20, 90_000, false, &Bytes::from_static(&[0x7c, 0x85, 0xaa])),
+            CameraPacketOutput::default()
+        );
+        assert_eq!(
+            assembler.push(21, 90_000, false, &Bytes::from_static(&[0x7c, 0x05, 0xbb])),
+            CameraPacketOutput::default()
+        );
+        let output = assembler.push(22, 90_000, true, &Bytes::from_static(&[0x7c, 0x45, 0xcc]));
+
+        assert_eq!(output.discontinuity, None);
+        assert_eq!(
+            output.access_unit,
+            Some(vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa, 0xbb, 0xcc])
+        );
+    }
+
+    #[test]
+    fn camera_assembler_drops_fu_a_after_sequence_gap() {
+        let mut assembler = CameraH264Assembler::default();
+        assembler.push(30, 90_000, false, &Bytes::from_static(&[0x7c, 0x85, 0xaa]));
+
+        let damaged = assembler.push(32, 90_000, true, &Bytes::from_static(&[0x7c, 0x45, 0xcc]));
+        assert_eq!(damaged.discontinuity, Some("rtp_sequence_gap"));
+        assert_eq!(damaged.access_unit, None);
+
+        let recovered = assembler.push(33, 180_000, true, &Bytes::from_static(&[0x65, 0x11, 0x22]));
+        assert_eq!(recovered.discontinuity, None);
+        assert!(annex_b_contains_idr(
+            recovered.access_unit.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn camera_assembler_discards_unmarked_timestamp_and_accepts_new_idr() {
+        let mut assembler = CameraH264Assembler::default();
+        assembler.push(40, 90_000, false, &Bytes::from_static(&[0x67, 0x11, 0x22]));
+
+        let output = assembler.push(41, 180_000, true, &Bytes::from_static(&[0x65, 0x33, 0x44]));
+        assert_eq!(
+            output.discontinuity,
+            Some("timestamp_changed_before_marker")
+        );
+        assert!(annex_b_contains_idr(output.access_unit.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn camera_assembler_accepts_sequence_number_wraparound() {
+        let mut assembler = CameraH264Assembler::default();
+        assembler.push(
+            u16::MAX,
+            90_000,
+            false,
+            &Bytes::from_static(&[0x7c, 0x85, 0xaa]),
+        );
+        let output = assembler.push(0, 90_000, true, &Bytes::from_static(&[0x7c, 0x45, 0xbb]));
+
+        assert_eq!(output.discontinuity, None);
+        assert!(annex_b_contains_idr(output.access_unit.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn camera_assembler_ignores_duplicate_and_late_packets() {
+        let mut assembler = CameraH264Assembler::default();
+        let first = assembler.push(50, 90_000, true, &Bytes::from_static(&[0x65, 0xaa, 0xbb]));
+        assert!(first.access_unit.is_some());
+
+        assert_eq!(
+            assembler.push(50, 90_000, true, &Bytes::from_static(&[0x61, 0x11, 0x22]),),
+            CameraPacketOutput::default()
+        );
+        assert_eq!(
+            assembler.push(49, 45_000, true, &Bytes::from_static(&[0x61, 0x33, 0x44]),),
+            CameraPacketOutput::default()
+        );
+
+        let next = assembler.push(51, 180_000, true, &Bytes::from_static(&[0x65, 0xcc, 0xdd]));
+        assert_eq!(next.discontinuity, None);
+        assert!(next.access_unit.is_some());
+    }
+
+    #[test]
+    fn annex_b_idr_detection_supports_three_and_four_byte_start_codes() {
+        assert!(annex_b_contains_idr(&[0, 0, 1, 0x65, 0xaa]));
+        assert!(annex_b_contains_idr(&[
+            0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x65, 2
+        ]));
+        assert!(!annex_b_contains_idr(&[0, 0, 0, 1, 0x61, 0xaa]));
     }
 
     #[test]
