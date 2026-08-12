@@ -34,9 +34,10 @@ use crate::mqtt::{
 };
 use crate::observability::{
     HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, CONTROL_MESSAGES_TOTAL,
-    PLI_COUNT_TOTAL, SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED,
-    VIDEO_FRAMES_TOTAL, VIEWER_BITRATE_BPS, VIEWER_CONNECTED, VIEWER_FPS, VIEWER_PACKETS_LOST,
-    VIEWER_RTT_MS,
+    ICE_DISCONNECTS_TOTAL, ICE_RECOVERIES_TOTAL, ICE_RECOVERY_SECONDS, PLI_COUNT_TOTAL,
+    POST_CONNECT_KEYFRAMES_TOTAL, SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED,
+    VIDEO_FRAMES_TOTAL, VIEWER_BITRATE_BPS, VIEWER_CONNECTED, VIEWER_FIRST_FRAME_SECONDS,
+    VIEWER_FPS, VIEWER_PACKETS_LOST, VIEWER_RTT_MS,
 };
 use crate::scrcpy::protocol::{KeyAction, TouchAction};
 use crate::scrcpy::{
@@ -1311,6 +1312,7 @@ async fn run_event_pump(
     let mut last_rebuild = Instant::now() - REBUILD_THROTTLE;
     let mut recovery_tick = tokio::time::interval(RECOVERY_TICK);
     recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut ice_disconnected_at: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -1400,6 +1402,10 @@ async fn run_event_pump(
                     }
                     PeerEvent::Connected => {
                         VIEWER_CONNECTED.set(1);
+                        if let Some(disconnected_at) = ice_disconnected_at.take() {
+                            ICE_RECOVERIES_TOTAL.inc();
+                            ICE_RECOVERY_SECONDS.observe(disconnected_at.elapsed().as_secs_f64());
+                        }
                         // Clear any stale grace decision for this
                         // viewer — we're healthy again.
                         info!(viewer = %viewer_id, "viewer connected");
@@ -1431,6 +1437,7 @@ async fn run_event_pump(
                                 if let Err(e) = ctrl.reset_video().await {
                                     warn!(error = %e, "scrcpy reset_video on stream ready");
                                 } else {
+                                    POST_CONNECT_KEYFRAMES_TOTAL.inc();
                                     recovery = Some(VideoRecovery {
                                         baseline,
                                         deadline: Instant::now() + RECOVERY_CONFIRM,
@@ -1444,6 +1451,10 @@ async fn run_event_pump(
                     }
                     PeerEvent::Disconnected => {
                         VIEWER_CONNECTED.set(0);
+                        if ice_disconnected_at.is_none() {
+                            ICE_DISCONNECTS_TOTAL.inc();
+                            ice_disconnected_at = Some(Instant::now());
+                        }
                         info!(viewer = %viewer_id, "viewer ICE disconnected");
                         // str0m 0.9 does not distinguish transient vs
                         // fatal ICE failure — both collapse to the
@@ -1929,6 +1940,15 @@ async fn forward_control(
             }
             return Ok(());
         }
+        ControlIn::ViewerReady {
+            startup_ms,
+            width,
+            height,
+        } => {
+            VIEWER_FIRST_FRAME_SECONDS.observe(*startup_ms as f64 / 1000.0);
+            info!(startup_ms, width, height, "viewer rendered first frame");
+            return Ok(());
+        }
         ControlIn::Unknown => {
             debug!("ignoring unknown datachannel message type");
             return Ok(());
@@ -2197,6 +2217,7 @@ async fn forward_control(
         // handled above
         ControlIn::Ping { .. }
         | ControlIn::Stats { .. }
+        | ControlIn::ViewerReady { .. }
         | ControlIn::SetVideoTransport { .. }
         | ControlIn::RequestKeyframe
         | ControlIn::CameraStart { .. }
@@ -2217,6 +2238,7 @@ fn msg_kind(msg: &ControlIn) -> &'static str {
         ControlIn::Configure { .. } => "configure",
         ControlIn::Ping { .. } => "ping",
         ControlIn::Stats { .. } => "stats",
+        ControlIn::ViewerReady { .. } => "viewer_ready",
         ControlIn::SetVideoTransport { .. } => "set_video_transport",
         ControlIn::RequestKeyframe => "request_keyframe",
         ControlIn::CameraStart { .. } => "camera_start",

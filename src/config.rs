@@ -53,7 +53,7 @@ pub struct Cli {
     pub max_width: u32,
 
     /// Encode bitrate in bits/second.
-    #[arg(long, env = "VIDEO_BITRATE", default_value_t = 16_000_000)]
+    #[arg(long, env = "VIDEO_BITRATE", default_value_t = 8_000_000)]
     pub bitrate: u32,
 
     /// H.264 i-frame interval in seconds.
