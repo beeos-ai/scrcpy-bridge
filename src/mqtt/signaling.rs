@@ -142,6 +142,11 @@ pub enum SignalRequest {
         /// matches the legacy "always kick" behaviour.
         #[serde(default, rename = "viewerId")]
         viewer_id: String,
+        /// Optional per-connect correlation id from the viewer (Stage 1
+        /// timeline). Empty when the client does not send it — never
+        /// required for signaling correctness.
+        #[serde(default, rename = "traceId")]
+        trace_id: String,
     },
     /// Trickle ICE candidate from the browser.
     Ice {
@@ -553,7 +558,18 @@ fn handle_publish(
             // offers/candidates, whereas blocking here would starve the
             // MQTT keepalive and get us kicked off the broker silently.
             MQTT_SIGNALS_DROPPED_TOTAL.inc();
-            warn!(topic = %topic, "signal channel full — dropping inbound message");
+            // Keep type for Stage-1 timeline correlation (offer vs ice).
+            let signal_type = serde_json::from_slice::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+                .unwrap_or_else(|| "unknown".into());
+            warn!(
+                event = "bridge.signal_drop",
+                topic = %topic,
+                signal_type = %signal_type,
+                reason = "channel_full",
+                "signal channel full — dropping inbound message"
+            );
             true
         }
         Forward::ReceiverClosed => false,
