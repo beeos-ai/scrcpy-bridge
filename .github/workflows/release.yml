@@ -142,7 +142,10 @@ jobs:
 
   docker:
     name: distroless docker image
+    # Publish GHCR even if a non-musl matrix cell fails (e.g. Windows).
+    # Docker only consumes linux-musl archives from the GitHub Release.
     needs: [plan, binaries]
+    if: ${{ always() && needs.plan.result == 'success' && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
