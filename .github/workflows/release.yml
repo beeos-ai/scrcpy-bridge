@@ -1,11 +1,14 @@
 name: release-scrcpy-bridge
 
 # Triggered when a tag like `scrcpy-bridge-v0.1.0` is pushed. Produces:
-#   1. Static per-target archives (via cargo-dist) uploaded to the GitHub
-#      release as download assets. Consumed by `@beeos-ai/cli` when users
-#      run `beeos device attach`.
-#   2. A distroless multi-arch Docker image, pushed to GHCR. Consumed by
-#      the ReDroid Pod sidecar in `deploy/redroid/pod.yaml`.
+#   1. Static per-target archives uploaded to the GitHub release as
+#      download assets. Consumed by `@beeos-ai/cli` when users run
+#      `beeos device attach`.
+#   2. A multi-arch Docker image, pushed to GHCR. Consumed by the ReDroid
+#      Pod sidecar. The image is built from GHA *artifacts* (musl binaries
+#      from the matrix job), NOT by re-downloading release assets from the
+#      public GitHub CDN inside `docker build` (that path is flaky under
+#      multi-arch buildx / qemu).
 #
 # Tag format conventions:
 #   - `scrcpy-bridge-v0.1.0`        -> stable release (updates `:latest`)
@@ -140,15 +143,58 @@ jobs:
           fail_on_unmatched_files: true
           prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
 
+      # Musl binaries are also uploaded as GHA artifacts so the docker job
+      # can COPY them into the image without re-downloading from the public
+      # GitHub Release CDN (that path is flaky under multi-arch buildx).
+      - name: Upload musl binary for docker
+        if: contains(matrix.target, 'linux-musl')
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: scrcpy-bridge-${{ matrix.target }}/scrcpy-bridge
+          if-no-files-found: error
+          retention-days: 2
+
   docker:
     name: distroless docker image
     # Publish GHCR even if a non-musl matrix cell fails (e.g. Windows).
-    # Docker only consumes linux-musl archives from the GitHub Release.
+    # Docker only consumes the two linux-musl artifacts from `binaries`.
     needs: [plan, binaries]
     if: ${{ always() && needs.plan.result == 'success' && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Pull the musl binaries produced by the matrix job over GHA's
+      # internal artifact store (authenticated, same-org, no CDN hop).
+      - name: Download musl binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*-unknown-linux-musl
+          path: _musl_artifacts
+          merge-multiple: false
+
+      - name: Stage musl binaries for docker context
+        shell: bash
+        run: |
+          set -euo pipefail
+          # download-artifact layout:
+          #   _musl_artifacts/binary-x86_64-unknown-linux-musl/scrcpy-bridge
+          #   _musl_artifacts/binary-aarch64-unknown-linux-musl/scrcpy-bridge
+          # Dockerfile expects:
+          #   dist/<triple>/scrcpy-bridge
+          for triple in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            src="_musl_artifacts/binary-${triple}/scrcpy-bridge"
+            if [[ ! -f "$src" ]]; then
+              echo "missing $src — musl matrix cell failed or artifact name drifted" >&2
+              find _musl_artifacts -type f 2>/dev/null || true
+              exit 1
+            fi
+            mkdir -p "dist/${triple}"
+            install -m 0755 "$src" "dist/${triple}/scrcpy-bridge"
+            ls -la "dist/${triple}/scrcpy-bridge"
+            file "dist/${triple}/scrcpy-bridge" || true
+          done
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3

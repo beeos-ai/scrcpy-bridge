@@ -1,36 +1,25 @@
 ############################
-# Stage 1 — fetch the prebuilt musl binary from this tag's GitHub Release
+# Stage 1 — take the prebuilt musl binary from the build context
 ############################
 #
-# We deliberately don't compile Rust inside the container. The previous
-# `cargo build --target ${TARGETARCH}-unknown-linux-musl` in `rust:alpine`
-# tripped over two cross-compile gaps:
+# The release workflow builds static musl binaries in the `binaries`
+# matrix job and stages them into the Docker context as:
 #
-#   1. openssl-sys's vendored OpenSSL build refused to configure on the
-#      arm64 path even with `apk add openssl-dev openssl-libs-static`,
-#      because some transitive dep enabled the `vendored` feature.
-#   2. `rustup target add aarch64-unknown-linux-musl` plants the std
-#      libs but alpine's musl-dev only ships the *host* gcc; the cross
-#      compile then fails with `can't find crate for 'core'` for any
-#      proc-macro the foreign target has to materialize.
+#   dist/x86_64-unknown-linux-musl/scrcpy-bridge
+#   dist/aarch64-unknown-linux-musl/scrcpy-bridge
 #
-# Instead, the binaries matrix in `.github/workflows/release.yml`
-# already produces a fully-static musl binary per arch and uploads it to
-# the GitHub Release. The docker job depends on that matrix completing,
-# so by the time we run, the tarballs exist at predictable URLs:
-#
-#   https://github.com/beeos-ai/scrcpy-bridge/releases/download/
-#     scrcpy-bridge-v${VERSION}/scrcpy-bridge-${ARCH}-unknown-linux-musl.tar.gz
+# We deliberately do NOT curl GitHub Releases from inside the image
+# build: multi-arch buildx (esp. the qemu arm64 path) hits flaky
+# release-assets.githubusercontent.com downloads (curl exit 56) and
+# races the softprops upload. Artifact → COPY is same-runner local
+# IO and is what every reliable multi-arch release pipeline does.
 #
 # Buildx fans this stage out across `linux/amd64,linux/arm64`, so each
-# platform pulls its own tarball without any cross-compilation tooling.
+# platform copies its own binary without any cross-compilation tooling.
 #
 FROM --platform=$BUILDPLATFORM alpine:3.20 AS fetcher
 
-ARG VERSION=dev
 ARG TARGETARCH
-
-RUN apk add --no-cache curl tar coreutils
 
 RUN set -eux; \
     case "${TARGETARCH}" in \
@@ -38,18 +27,21 @@ RUN set -eux; \
       arm64)  ARCH="aarch64-unknown-linux-musl" ;; \
       *)      echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    ARCHIVE="scrcpy-bridge-${ARCH}.tar.gz"; \
-    URL="https://github.com/beeos-ai/scrcpy-bridge/releases/download/scrcpy-bridge-v${VERSION}/${ARCHIVE}"; \
-    cd /tmp; \
-    echo "fetching ${URL}"; \
-    # Download to the *original* filename so sha256sum -c can match the
-    # entry in the sidecar (sha256sum verifies "<digest>  <filename>" pairs).
-    curl -fSL --retry 5 --retry-delay 3 -o "${ARCHIVE}"        "${URL}"; \
-    curl -fSL --retry 5 --retry-delay 3 -o "${ARCHIVE}.sha256" "${URL}.sha256"; \
-    sha256sum -c "${ARCHIVE}.sha256" \
-      || (echo "sha256 mismatch — release artifact tampered or truncated" >&2; exit 1); \
-    tar -xzf "${ARCHIVE}"; \
-    install -m 0755 "/tmp/scrcpy-bridge-${ARCH}/scrcpy-bridge" /scrcpy-bridge; \
+    echo "TARGETARCH=${TARGETARCH} ARCH=${ARCH}"
+
+# Build-context paths produced by the release workflow's "Stage musl
+# binaries for docker context" step.
+COPY dist/ /dist/
+
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64)  ARCH="x86_64-unknown-linux-musl" ;; \
+      arm64)  ARCH="aarch64-unknown-linux-musl" ;; \
+      *)      echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    test -x "/dist/${ARCH}/scrcpy-bridge" \
+      || (echo "missing /dist/${ARCH}/scrcpy-bridge — release workflow must stage musl artifacts" >&2; ls -laR /dist; exit 1); \
+    install -m 0755 "/dist/${ARCH}/scrcpy-bridge" /scrcpy-bridge; \
     /scrcpy-bridge --version 2>/dev/null || true
 
 ############################
