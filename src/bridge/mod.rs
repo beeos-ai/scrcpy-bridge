@@ -158,6 +158,29 @@ fn extract_dtls_fingerprint(sdp: &str) -> Option<String> {
     })
 }
 
+/// Short DTLS fingerprint for timeline logs (not for security decisions).
+fn fingerprint_short(fp: Option<&str>) -> String {
+    match fp {
+        Some(s) if !s.is_empty() => {
+            // Prefer the trailing hex bytes; full line is "sha-256 AA:BB:..."
+            let hex: String = s
+                .rsplit_once(' ')
+                .map(|(_, h)| h)
+                .unwrap_or(s)
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .take(8)
+                .collect();
+            if hex.is_empty() {
+                s.chars().take(12).collect()
+            } else {
+                hex
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 /// Extract the remote ICE username fragment that identifies an ICE
 /// generation. Media-only renegotiation keeps it stable; `restartIce()`
 /// changes it. Reading this independently from the DTLS fingerprint lets the
@@ -441,7 +464,11 @@ impl Bridge {
                 maybe_req = sig_rx.recv() => {
                     let Some(req) = maybe_req else { break; };
                     match req {
-                        SignalRequest::Offer { sdp, viewer_id } => {
+                        SignalRequest::Offer {
+                            sdp,
+                            viewer_id,
+                            trace_id,
+                        } => {
                             // Offer arriving inside our grace window
                             // for the same viewer cancels it — the
                             // viewer is driving a successful recovery.
@@ -453,6 +480,7 @@ impl Bridge {
                                 .on_offer(
                                     viewer_id,
                                     sdp,
+                                    trace_id,
                                     &mqtt,
                                     &current_session,
                                     &scrcpy_cfg,
@@ -536,18 +564,28 @@ impl Bridge {
         &self,
         viewer_id: String,
         offer_sdp: String,
+        trace_id: String,
         mqtt: &Arc<MqttSignaling>,
         current_session: &Arc<Mutex<Option<Session>>>,
         scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
         internal_tx: mpsc::Sender<BridgeInternalEvent>,
     ) -> Result<()> {
-        info!(viewer = %viewer_id, "received WebRTC offer");
-
+        let offer_t0 = Instant::now();
         // Extract the offer's DTLS fingerprint up front — `offer_sdp`
         // is consumed by the session construction below, and the fast
         // path needs it to decide eligibility.
         let offer_fingerprint = extract_dtls_fingerprint(&offer_sdp);
         let offer_ice_ufrag = extract_ice_ufrag(&offer_sdp);
+        let dtls_fp_short = fingerprint_short(offer_fingerprint.as_deref());
+        info!(
+            event = "bridge.offer_received",
+            viewer = %viewer_id,
+            trace_id = %trace_id,
+            dtls_fp_short = %dtls_fp_short,
+            sdp_bytes = offer_sdp.len(),
+            ice_ufrag = %offer_ice_ufrag.as_deref().unwrap_or(""),
+            "received WebRTC offer"
+        );
 
         // Fast path — same viewer, same RTCPeerConnection, live peer:
         //   * The viewer side just re-ran `createOffer({iceRestart:
@@ -603,7 +641,10 @@ impl Bridge {
                         offer_ice_ufrag.as_deref(),
                     );
                     info!(
+                        event = "bridge.fast_path_ice_restart",
                         viewer = %viewer_id,
+                        trace_id = %trace_id,
+                        dtls_fp_short = %dtls_fp_short,
                         ?kind,
                         "same-viewer offer → in-place negotiation (scrcpy preserved)"
                     );
@@ -619,11 +660,20 @@ impl Bridge {
                                     session.remote_ice_ufrag = offer_ice_ufrag;
                                 }
                             }
+                            info!(
+                                event = "bridge.fast_path_accept_ok",
+                                viewer = %viewer_id,
+                                trace_id = %trace_id,
+                                elapsed_ms = offer_t0.elapsed().as_millis() as u64,
+                                "in-place negotiation accepted"
+                            );
                             return Ok(());
                         }
                         Err(e) => {
                             warn!(
+                                event = "bridge.fast_path_accept_fail",
                                 viewer = %viewer_id,
+                                trace_id = %trace_id,
                                 error = %e,
                                 "fast-path accept_offer failed — falling back to full session rebuild"
                             );
@@ -636,9 +686,12 @@ impl Bridge {
                     }
                 } else {
                     info!(
+                        event = "bridge.session_full_rebuild",
                         viewer = %viewer_id,
-                        session_fingerprint = ?session_fingerprint,
-                        offer_fingerprint = ?offer_fingerprint,
+                        trace_id = %trace_id,
+                        reason = "dtls_fingerprint_changed",
+                        session_fp_short = %fingerprint_short(session_fingerprint.as_deref()),
+                        offer_fp_short = %dtls_fp_short,
                         "same-viewer offer with new DTLS fingerprint (page reload) — full rebuild"
                     );
                     // Fall through to the replace path below: same
@@ -683,6 +736,19 @@ impl Bridge {
                     viewer_id: old.viewer_id.clone(),
                 })
                 .await;
+            let replace_kind = if old.viewer_id != viewer_id {
+                "different_viewer"
+            } else {
+                "same_viewer_rebuild"
+            };
+            info!(
+                event = "bridge.session_replace_begin",
+                viewer = %viewer_id,
+                trace_id = %trace_id,
+                old_viewer = %old.viewer_id,
+                replace_kind = %replace_kind,
+                "replacing existing session"
+            );
             if old.viewer_id != viewer_id {
                 info!(
                     old_viewer = %old.viewer_id,
@@ -704,7 +770,30 @@ impl Bridge {
                     "same-viewer rebuild (fast-path unavailable) — silent teardown, no kick"
                 );
             }
+            let recycle_t0 = Instant::now();
+            info!(
+                event = "bridge.old_recycle_begin",
+                viewer = %viewer_id,
+                trace_id = %trace_id,
+                old_viewer = %old.viewer_id,
+                "beginning old session shutdown"
+            );
             old.shutdown().await;
+            info!(
+                event = "bridge.old_recycle_end",
+                viewer = %viewer_id,
+                trace_id = %trace_id,
+                elapsed_ms = recycle_t0.elapsed().as_millis() as u64,
+                "old session shutdown complete"
+            );
+        } else {
+            info!(
+                event = "bridge.session_replace_begin",
+                viewer = %viewer_id,
+                trace_id = %trace_id,
+                replace_kind = "cold",
+                "no existing session — cold start"
+            );
         }
 
         // 1. Start a fresh scrcpy session. Every offer gets a clean
@@ -716,8 +805,25 @@ impl Bridge {
             port: self.cli.adb_port,
         };
         let cfg_snapshot = scrcpy_cfg.read().await.clone();
+        let scrcpy_t0 = Instant::now();
+        info!(
+            event = "bridge.scrcpy_start_begin",
+            viewer = %viewer_id,
+            trace_id = %trace_id,
+            bitrate = cfg_snapshot.bitrate,
+            max_width = cfg_snapshot.max_width,
+            max_fps = cfg_snapshot.max_fps,
+            "starting scrcpy server"
+        );
         let mut server = ScrcpyServer::new(adb, cfg_snapshot);
         server.start().await.context("start scrcpy server")?;
+        info!(
+            event = "bridge.scrcpy_start_end",
+            viewer = %viewer_id,
+            trace_id = %trace_id,
+            elapsed_ms = scrcpy_t0.elapsed().as_millis() as u64,
+            "scrcpy server started"
+        );
         self.health.scrcpy_running.store(true, Ordering::Relaxed);
         SCRCPY_RUNNING.set(1);
         SCRCPY_RECONNECTS_TOTAL.inc();
@@ -789,6 +895,9 @@ impl Bridge {
             let cancel_for_evt = cancel.clone();
             let scroll_sensitivity = self.cli.scroll_sensitivity;
             let viewer_for_evt = viewer_id.clone();
+            let trace_for_evt = trace_id.clone();
+            let offer_t0_for_evt = offer_t0;
+            let dtls_fp_for_evt = dtls_fp_short.clone();
             let internal_tx_for_evt = internal_tx.clone();
             let keyframes_for_evt = keyframes_observed.clone();
             let camera_sink_for_evt = self.camera_sink.clone();
@@ -804,6 +913,9 @@ impl Bridge {
                     cancel_for_evt,
                     scroll_sensitivity,
                     viewer_for_evt,
+                    trace_for_evt,
+                    offer_t0_for_evt,
+                    dtls_fp_for_evt,
                     internal_tx_for_evt,
                     keyframes_for_evt,
                     camera_sink_for_evt,
@@ -1293,6 +1405,9 @@ async fn run_event_pump(
     cancel: CancellationToken,
     scroll_sensitivity: f32,
     viewer_id: String,
+    trace_id: String,
+    offer_t0: Instant,
+    dtls_fp_short: String,
     internal_tx: mpsc::Sender<BridgeInternalEvent>,
     keyframes_observed: Arc<AtomicU64>,
     camera_sink: CameraSink,
@@ -1383,8 +1498,25 @@ async fn run_event_pump(
                 let Some(evt) = evt else { return };
                 match evt {
                     PeerEvent::Answer(sdp) => {
+                        let sdp_bytes = sdp.len();
                         if let Err(e) = mqtt.publish_response(&SignalResponse::Answer { sdp }).await {
-                            warn!(error = %e, "publish answer");
+                            warn!(
+                                event = "bridge.answer_sent",
+                                viewer = %viewer_id,
+                                trace_id = %trace_id,
+                                error = %e,
+                                "publish answer failed"
+                            );
+                        } else {
+                            info!(
+                                event = "bridge.answer_sent",
+                                viewer = %viewer_id,
+                                trace_id = %trace_id,
+                                dtls_fp_short = %dtls_fp_short,
+                                sdp_bytes,
+                                elapsed_ms = offer_t0.elapsed().as_millis() as u64,
+                                "answer published"
+                            );
                         }
                     }
                     PeerEvent::LocalIce(cand) => {
@@ -1408,7 +1540,14 @@ async fn run_event_pump(
                         }
                         // Clear any stale grace decision for this
                         // viewer — we're healthy again.
-                        info!(viewer = %viewer_id, "viewer connected");
+                        info!(
+                            event = "bridge.ice_connected",
+                            viewer = %viewer_id,
+                            trace_id = %trace_id,
+                            dtls_fp_short = %dtls_fp_short,
+                            elapsed_ms = offer_t0.elapsed().as_millis() as u64,
+                            "viewer ICE connected"
+                        );
                         let _ = internal_tx
                             .send(BridgeInternalEvent::ViewerConnected {
                                 viewer_id: viewer_id.clone(),
@@ -1455,7 +1594,12 @@ async fn run_event_pump(
                             ICE_DISCONNECTS_TOTAL.inc();
                             ice_disconnected_at = Some(Instant::now());
                         }
-                        info!(viewer = %viewer_id, "viewer ICE disconnected");
+                        info!(
+                            event = "bridge.ice_disconnected",
+                            viewer = %viewer_id,
+                            trace_id = %trace_id,
+                            "viewer ICE disconnected"
+                        );
                         // str0m 0.9 does not distinguish transient vs
                         // fatal ICE failure — both collapse to the
                         // single `Disconnected` event here. We don't
