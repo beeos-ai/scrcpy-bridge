@@ -2286,6 +2286,9 @@ async fn forward_control(
     }
 
     let Some(control) = control else {
+        // Ping/stats already returned above. Touch/key/etc. need the
+        // scrcpy control socket — log so "DC works but no inject" is visible.
+        warn!(kind, "control message dropped: scrcpy control socket not connected");
         return Ok(());
     };
 
@@ -2300,7 +2303,7 @@ async fn forward_control(
             screen_height,
         } => {
             if let Some(a) = TouchAction::parse(&action) {
-                let _ = control
+                if let Err(e) = control
                     .inject_touch(
                         a,
                         x,
@@ -2310,7 +2313,21 @@ async fn forward_control(
                         pointer_id,
                         pressure,
                     )
-                    .await;
+                    .await
+                {
+                    warn!(
+                        error = %e,
+                        action = %action,
+                        x,
+                        y,
+                        pointer_id,
+                        screen_width,
+                        screen_height,
+                        "inject_touch failed"
+                    );
+                }
+            } else {
+                warn!(action = %action, "touch action parse failed");
             }
         }
         ControlIn::Scroll {
