@@ -57,8 +57,11 @@
 use std::time::Duration;
 
 use serde::Serialize;
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::unix::OwnedReadHalf;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -69,13 +72,19 @@ use tracing::{debug, info, warn};
 /// is used instead of TCP because ReDroid's kernel blocks AF_INET for the
 /// cameraserver uid the vHAL runs as (ANDROID_PARANOID_NETWORK), while
 /// AF_UNIX is unrestricted.
+#[cfg(unix)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const CMR1_ABSTRACT_NAME: &[u8] = b"beeos_camera_cmr1";
 
 /// Connect the resident sink to the vHAL's abstract-namespace CMR1 socket.
-/// Abstract sockets are Linux-only; on other hosts (dev builds / non-Linux
+/// Abstract sockets are Linux-only; on other Unix hosts (dev builds / macOS
 /// CI) this returns an error every attempt, which the caller treats as an
 /// unreachable endpoint (the camera plane is a ReDroid/Linux-only feature).
+///
+/// Not compiled on Windows: `tokio::net::UnixStream` is unavailable there,
+/// and the release matrix's Windows job was skipping the GHCR docker push
+/// (docker `needs: binaries` fails closed when any matrix cell fails).
+#[cfg(unix)]
 async fn connect_cmr1() -> std::io::Result<UnixStream> {
     #[cfg(target_os = "linux")]
     {
@@ -196,10 +205,26 @@ impl CameraSink {
     }
 }
 
-/// Sink task: owns the RESIDENT TCP connection to the in-guest camera
+/// Non-Unix (Windows) stub: camera injection is ReDroid/Linux-only. Drain
+/// the control channel so the rest of the bridge still links, but never
+/// attempt AF_UNIX.
+#[cfg(not(unix))]
+async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, _evt_tx: mpsc::Sender<bool>) {
+    while let Some(msg) = rx.recv().await {
+        if let SinkMsg::Start(cfg) = msg {
+            warn!(
+                ?cfg,
+                "camera uplink unavailable on non-Unix host (ReDroid/Linux only)"
+            );
+        }
+    }
+}
+
+/// Sink task: owns the RESIDENT connection to the in-guest camera
 /// endpoint. Writes framed session messages (Config/Frame/Stop) and reads
 /// reverse `CamInUse` events on the same socket. Reconnects with backoff on
 /// drop; replays the active session's `Config` after a mid-session reconnect.
+#[cfg(unix)]
 async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
     // The current session's capability, retained so a mid-session reconnect
     // can replay the `Config` handshake before resuming frames.
@@ -322,6 +347,7 @@ async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
 /// `CamInUse` transitions to `evt_tx`; unknown kinds are skipped (forward
 /// compatibility). Pre-v1.1 endpoints never write, so this simply blocks
 /// until the connection drops.
+#[cfg(unix)]
 async fn read_events(mut rd: OwnedReadHalf, evt_tx: mpsc::Sender<bool>) {
     let mut header = [0u8; 9];
     loop {
@@ -366,6 +392,7 @@ async fn read_events(mut rd: OwnedReadHalf, evt_tx: mpsc::Sender<bool>) {
 }
 
 /// Write one framed message: magic, kind, u32-le length, payload.
+#[cfg(unix)]
 async fn write_frame<W: AsyncWriteExt + Unpin>(
     stream: &mut W,
     kind: u8,
