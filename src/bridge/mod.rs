@@ -34,9 +34,10 @@ use crate::mqtt::{
 };
 use crate::observability::{
     HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, CONTROL_MESSAGES_TOTAL,
-    PLI_COUNT_TOTAL, SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED,
-    VIDEO_FRAMES_TOTAL, VIEWER_BITRATE_BPS, VIEWER_CONNECTED, VIEWER_FPS, VIEWER_PACKETS_LOST,
-    VIEWER_RTT_MS,
+    ICE_DISCONNECTS_TOTAL, ICE_RECOVERIES_TOTAL, ICE_RECOVERY_SECONDS, PLI_COUNT_TOTAL,
+    POST_CONNECT_KEYFRAMES_TOTAL, SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED,
+    VIDEO_FRAMES_TOTAL, VIEWER_BITRATE_BPS, VIEWER_CONNECTED, VIEWER_FIRST_FRAME_SECONDS,
+    VIEWER_FPS, VIEWER_PACKETS_LOST, VIEWER_RTT_MS,
 };
 use crate::scrcpy::protocol::{KeyAction, TouchAction};
 use crate::scrcpy::{
@@ -1267,6 +1268,18 @@ fn evaluate_recovery(
     }
 }
 
+/// A natural scrcpy IDR is sufficient only when it is emitted after the
+/// WebRTC transport becomes writable. If the video pump already observed an
+/// IDR before `StreamReady`, request one more frame now that ICE/DTLS is up so
+/// the decoder is not stranded until its first (often much later) RTCP PLI.
+///
+/// Waiting for at least one observed IDR also proves scrcpy's capture pipeline
+/// is initialized, avoiding the `reset_video` startup race in which
+/// `SurfaceCapture.invalidate()` can run before its listener is attached.
+fn should_request_post_connect_keyframe(keyframes_observed: u64) -> bool {
+    keyframes_observed > 0
+}
+
 /// Pump peer events out to MQTT, back into scrcpy control (PLI → reset_video,
 /// DataChannel control messages → touches/keys/etc), and surface connection
 /// state changes to the observability layer.
@@ -1299,6 +1312,7 @@ async fn run_event_pump(
     let mut last_rebuild = Instant::now() - REBUILD_THROTTLE;
     let mut recovery_tick = tokio::time::interval(RECOVERY_TICK);
     recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut ice_disconnected_at: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -1388,6 +1402,10 @@ async fn run_event_pump(
                     }
                     PeerEvent::Connected => {
                         VIEWER_CONNECTED.set(1);
+                        if let Some(disconnected_at) = ice_disconnected_at.take() {
+                            ICE_RECOVERIES_TOTAL.inc();
+                            ICE_RECOVERY_SECONDS.observe(disconnected_at.elapsed().as_secs_f64());
+                        }
                         // Clear any stale grace decision for this
                         // viewer — we're healthy again.
                         info!(viewer = %viewer_id, "viewer connected");
@@ -1398,26 +1416,45 @@ async fn run_event_pump(
                             .await;
                     }
                     PeerEvent::StreamReady => {
-                        // ICE is up AND the video mid is negotiated. We used
-                        // to proactively call `reset_video` here to prime an
-                        // IDR, but scrcpy's Controller.resetVideo() triggers
-                        // SurfaceCapture.invalidate(), which NPEs if the
-                        // capture's CaptureListener has not attached yet — a
-                        // startup race we lose ~100% of the time because
-                        // `server.start()` returns as soon as the sockets
-                        // accept, well before the capture pipeline is wired.
+                        // `StreamReady` means ICE/DTLS is writable. scrcpy
+                        // commonly emits its natural SPS/PPS + first IDR while
+                        // signaling is still in progress; that frame is then
+                        // accepted by the peer pump but cannot reach the
+                        // viewer. In production this left Android black for
+                        // ~57 s until libwebrtc finally emitted a PLI.
                         //
-                        // This is also just unnecessary: every `on_offer`
-                        // boots a fresh scrcpy process whose very first
-                        // emitted NAL unit is an IDR keyframe. So the first
-                        // frame is already a keyframe without any prompting.
-                        // Mid-stream keyframe recovery is handled by the
-                        // `KeyframeRequested` (PLI) branch below, which
-                        // fires only after capture is fully initialized.
-                        debug!("stream ready — relying on natural initial IDR");
+                        // Only reset once an IDR has already passed through
+                        // the video pump. Besides proving that the natural IDR
+                        // was too early, this proves the capture listener is
+                        // initialized and avoids resetVideo's startup NPE.
+                        let baseline = keyframes_observed.load(Ordering::Relaxed);
+                        if should_request_post_connect_keyframe(baseline) {
+                            if let Some(ctrl) = control.as_ref() {
+                                info!(
+                                    baseline,
+                                    "stream ready after pre-connect IDR — requesting fresh keyframe"
+                                );
+                                if let Err(e) = ctrl.reset_video().await {
+                                    warn!(error = %e, "scrcpy reset_video on stream ready");
+                                } else {
+                                    POST_CONNECT_KEYFRAMES_TOTAL.inc();
+                                    recovery = Some(VideoRecovery {
+                                        baseline,
+                                        deadline: Instant::now() + RECOVERY_CONFIRM,
+                                        attempts: 1,
+                                    });
+                                }
+                            }
+                        } else {
+                            debug!("stream ready before first IDR — natural keyframe will be post-connect");
+                        }
                     }
                     PeerEvent::Disconnected => {
                         VIEWER_CONNECTED.set(0);
+                        if ice_disconnected_at.is_none() {
+                            ICE_DISCONNECTS_TOTAL.inc();
+                            ice_disconnected_at = Some(Instant::now());
+                        }
                         info!(viewer = %viewer_id, "viewer ICE disconnected");
                         // str0m 0.9 does not distinguish transient vs
                         // fatal ICE failure — both collapse to the
@@ -1903,6 +1940,15 @@ async fn forward_control(
             }
             return Ok(());
         }
+        ControlIn::ViewerReady {
+            startup_ms,
+            width,
+            height,
+        } => {
+            VIEWER_FIRST_FRAME_SECONDS.observe(*startup_ms as f64 / 1000.0);
+            info!(startup_ms, width, height, "viewer rendered first frame");
+            return Ok(());
+        }
         ControlIn::Unknown => {
             debug!("ignoring unknown datachannel message type");
             return Ok(());
@@ -2171,6 +2217,7 @@ async fn forward_control(
         // handled above
         ControlIn::Ping { .. }
         | ControlIn::Stats { .. }
+        | ControlIn::ViewerReady { .. }
         | ControlIn::SetVideoTransport { .. }
         | ControlIn::RequestKeyframe
         | ControlIn::CameraStart { .. }
@@ -2191,6 +2238,7 @@ fn msg_kind(msg: &ControlIn) -> &'static str {
         ControlIn::Configure { .. } => "configure",
         ControlIn::Ping { .. } => "ping",
         ControlIn::Stats { .. } => "stats",
+        ControlIn::ViewerReady { .. } => "viewer_ready",
         ControlIn::SetVideoTransport { .. } => "set_video_transport",
         ControlIn::RequestKeyframe => "request_keyframe",
         ControlIn::CameraStart { .. } => "camera_start",
@@ -2380,6 +2428,17 @@ mod tests {
             evaluate_recovery(7, 5, MAX_RESET_ATTEMPTS, true, true),
             RecoveryDecision::Confirmed,
         );
+    }
+
+    #[test]
+    fn requests_post_connect_keyframe_when_natural_idr_was_early() {
+        assert!(should_request_post_connect_keyframe(1));
+        assert!(should_request_post_connect_keyframe(12));
+    }
+
+    #[test]
+    fn keeps_natural_keyframe_when_it_has_not_arrived_yet() {
+        assert!(!should_request_post_connect_keyframe(0));
     }
 
     #[test]

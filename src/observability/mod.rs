@@ -221,6 +221,62 @@ pub static PLI_COUNT_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
     c
 });
 
+pub static ICE_DISCONNECTS_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let c = prometheus::IntCounter::new(
+        "scrcpy_bridge_ice_disconnects_total",
+        "Viewer ICE disconnected transitions",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+pub static ICE_RECOVERIES_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let c = prometheus::IntCounter::new(
+        "scrcpy_bridge_ice_recoveries_total",
+        "Viewer ICE sessions that recovered without rebuilding scrcpy",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+pub static ICE_RECOVERY_SECONDS: Lazy<prometheus::Histogram> = Lazy::new(|| {
+    let h = prometheus::Histogram::with_opts(
+        prometheus::HistogramOpts::new(
+            "scrcpy_bridge_ice_recovery_seconds",
+            "Time from viewer ICE disconnect to recovery",
+        )
+        .buckets(vec![0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0]),
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(h.clone())).unwrap();
+    h
+});
+
+pub static VIEWER_FIRST_FRAME_SECONDS: Lazy<prometheus::Histogram> = Lazy::new(|| {
+    let h = prometheus::Histogram::with_opts(
+        prometheus::HistogramOpts::new(
+            "scrcpy_bridge_viewer_first_frame_seconds",
+            "Native viewer pipeline start to first decoded frame",
+        )
+        .buckets(vec![0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 15.0, 30.0]),
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(h.clone())).unwrap();
+    h
+});
+
+pub static POST_CONNECT_KEYFRAMES_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let c = prometheus::IntCounter::new(
+        "scrcpy_bridge_post_connect_keyframes_total",
+        "Fresh scrcpy keyframes requested immediately after WebRTC became writable",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 /// Force-register every `Lazy` metric so they appear on `/metrics` from the
 /// first scrape even if no event has fired yet. Prometheus alerts are easier
 /// to author against counters that always exist (even at value 0).
@@ -242,6 +298,11 @@ pub fn init_metrics() {
     Lazy::force(&JWT_REFRESH_TOTAL);
     Lazy::force(&SCRCPY_RECONNECTS_TOTAL);
     Lazy::force(&PLI_COUNT_TOTAL);
+    Lazy::force(&ICE_DISCONNECTS_TOTAL);
+    Lazy::force(&ICE_RECOVERIES_TOTAL);
+    Lazy::force(&ICE_RECOVERY_SECONDS);
+    Lazy::force(&VIEWER_FIRST_FRAME_SECONDS);
+    Lazy::force(&POST_CONNECT_KEYFRAMES_TOTAL);
 }
 
 #[derive(Clone, Default)]

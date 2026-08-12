@@ -104,6 +104,18 @@ pub enum ControlIn {
         #[serde(default, rename = "roundTripTime")]
         round_trip_time: f64,
     },
+    /// Native viewer rendered its first decoded frame. This closes the
+    /// offer-to-visible observability gap that ICE `Connected` alone cannot
+    /// measure (the decoder may still be waiting for SPS/PPS/IDR).
+    #[serde(rename = "viewer_ready")]
+    ViewerReady {
+        #[serde(default, rename = "startupMs")]
+        startup_ms: u64,
+        #[serde(default)]
+        width: u32,
+        #[serde(default)]
+        height: u32,
+    },
     /// iOS native client opt-in: switch outgoing video transport from RTP
     /// (default, browser-compatible) to a binary DataChannel labelled
     /// `video`. Sent right after the iOS DataChannel pair (`control` +
@@ -332,6 +344,23 @@ mod tests {
                 assert!((round_trip_time - 0.05).abs() < 0.001);
             }
             other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_viewer_ready_extracts_startup_and_resolution() {
+        match parse(br#"{"type":"viewer_ready","startupMs":1234,"width":1080,"height":1920}"#)
+            .unwrap()
+        {
+            ControlIn::ViewerReady {
+                startup_ms,
+                width,
+                height,
+            } => {
+                assert_eq!(startup_ms, 1234);
+                assert_eq!((width, height), (1080, 1920));
+            }
+            other => panic!("expected ViewerReady, got {other:?}"),
         }
     }
 

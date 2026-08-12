@@ -46,7 +46,7 @@ impl Default for ScrcpyServerConfig {
             remote_jar_path: "/data/local/tmp/scrcpy-server.jar".to_string(),
             max_fps: 30,
             max_width: 1920,
-            bitrate: 16_000_000,
+            bitrate: 8_000_000,
             i_frame_interval: 2,
             audio: true,
             control: true,
