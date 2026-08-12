@@ -100,6 +100,52 @@ pub static AUDIO_PACKETS_DROPPED: Lazy<prometheus::IntCounter> = Lazy::new(|| {
     c
 });
 
+/// Inbound browser-camera H.264 access units accepted for the virtual camera.
+pub static CAMERA_FRAMES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        prometheus::Opts::new(
+            "scrcpy_bridge_camera_frames_total",
+            "Inbound browser-camera H.264 access units handled by the bridge",
+        ),
+        &["kind"], // keyframe | delta | forwarded
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+/// Camera AUs dropped for live backpressure / recovery (prefer latest frame).
+pub static CAMERA_FRAMES_DROPPED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        prometheus::Opts::new(
+            "scrcpy_bridge_camera_frames_dropped_total",
+            "Inbound camera access units dropped before reaching the virtual-camera endpoint",
+        ),
+        // coalesce = superseded by a newer AU in the peer→sink queue
+        // sink_full = AF_UNIX / CMR1 path still busy (latest-slot overwrite)
+        // waiting_idr = discarded while waiting for a recovery IDR
+        // peer_queue = depayloader could not enqueue to the session channel
+        &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+/// PLI / keyframe requests issued for the inbound camera track.
+pub static CAMERA_PLI_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        prometheus::Opts::new(
+            "scrcpy_bridge_camera_pli_total",
+            "RTCP PLI (or equivalent keyframe requests) sent to the browser camera encoder",
+        ),
+        &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 pub static VIEWER_RTT_MS: Lazy<prometheus::Gauge> = Lazy::new(|| {
     let g = prometheus::Gauge::new(
         "scrcpy_bridge_viewer_rtt_ms",
@@ -288,6 +334,9 @@ pub fn init_metrics() {
     Lazy::force(&SCRCPY_RUNNING);
     Lazy::force(&AUDIO_PACKETS_TOTAL);
     Lazy::force(&AUDIO_PACKETS_DROPPED);
+    Lazy::force(&CAMERA_FRAMES_TOTAL);
+    Lazy::force(&CAMERA_FRAMES_DROPPED);
+    Lazy::force(&CAMERA_PLI_TOTAL);
     Lazy::force(&VIEWER_RTT_MS);
     Lazy::force(&VIEWER_BITRATE_BPS);
     Lazy::force(&VIEWER_FPS);

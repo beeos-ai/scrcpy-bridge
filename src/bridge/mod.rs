@@ -26,18 +26,19 @@ use crate::bootstrap::{
     self, spawn_refresh_loop, BootstrapClient, BootstrapConfig, BootstrapEvent, BootstrapResponse,
     IceServerPayload,
 };
-use crate::camera::{CameraConfig, CameraSink};
+use crate::camera::{CameraConfig, CameraSink, PushFrameOutcome};
 use crate::config::Cli;
 use crate::datachannel::{self, ControlIn};
 use crate::mqtt::{
     MqttCredentials, MqttSignaling, MqttSignalingConfig, SignalRequest, SignalResponse,
 };
 use crate::observability::{
-    HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, CONTROL_MESSAGES_TOTAL,
-    ICE_DISCONNECTS_TOTAL, ICE_RECOVERIES_TOTAL, ICE_RECOVERY_SECONDS, PLI_COUNT_TOTAL,
-    POST_CONNECT_KEYFRAMES_TOTAL, SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED,
-    VIDEO_FRAMES_TOTAL, VIEWER_BITRATE_BPS, VIEWER_CONNECTED, VIEWER_FIRST_FRAME_SECONDS,
-    VIEWER_FPS, VIEWER_PACKETS_LOST, VIEWER_RTT_MS,
+    HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, CAMERA_FRAMES_DROPPED,
+    CAMERA_FRAMES_TOTAL, CAMERA_PLI_TOTAL, CONTROL_MESSAGES_TOTAL, ICE_DISCONNECTS_TOTAL,
+    ICE_RECOVERIES_TOTAL, ICE_RECOVERY_SECONDS, PLI_COUNT_TOTAL, POST_CONNECT_KEYFRAMES_TOTAL,
+    SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED, VIDEO_FRAMES_TOTAL,
+    VIEWER_BITRATE_BPS, VIEWER_CONNECTED, VIEWER_FIRST_FRAME_SECONDS, VIEWER_FPS,
+    VIEWER_PACKETS_LOST, VIEWER_RTT_MS,
 };
 use crate::scrcpy::protocol::{KeyAction, TouchAction};
 use crate::scrcpy::{
@@ -2230,29 +2231,84 @@ async fn forward_control(
             camera_sink.start(cfg).await;
 
             // Peer → sink pathway. The peer forwards depayloaded inbound
-            // Annex-B AUs into `frame_tx`; the drain task hands them to the
-            // sink and owns recovery for that final queue boundary. After a
-            // local drop it rejects dependent frames until an IDR arrives.
-            // The task ends when the peer drops `frame_tx`, so it needs no
-            // cancel token.
-            let (frame_tx, mut frame_rx) = mpsc::channel::<CameraFrame>(16);
+            // Annex-B AUs into a small channel; the drain task coalesces any
+            // backlog to the *latest* AU (prefer live, not stale), then hands
+            // it to the CMR1 live-slot. After a coalesce/drop of non-IDR we
+            // wait for the next keyframe so the guest decoder is never fed a
+            // broken reference chain. The task ends when the peer drops
+            // `frame_tx`.
+            let (frame_tx, mut frame_rx) = mpsc::channel::<CameraFrame>(4);
             let sink_for_task = camera_sink.clone();
             let peer_for_recovery = peer.clone();
             tokio::spawn(async move {
                 let mut waiting_for_idr = true;
-                while let Some(frame) = frame_rx.recv().await {
+                while let Some(first) = frame_rx.recv().await {
+                    // Coalesce: if the peer got ahead of AF_UNIX, keep only
+                    // the newest AU so the virtual camera tracks realtime.
+                    let mut frame = first;
+                    let mut coalesced = 0u64;
+                    while let Ok(more) = frame_rx.try_recv() {
+                        coalesced += 1;
+                        frame = more;
+                    }
+                    if coalesced > 0 {
+                        CAMERA_FRAMES_DROPPED
+                            .with_label_values(&["coalesce"])
+                            .inc_by(coalesced);
+                    }
+
                     let is_keyframe = frame.is_keyframe();
-                    if waiting_for_idr && !is_keyframe {
+                    CAMERA_FRAMES_TOTAL
+                        .with_label_values(&[if is_keyframe { "keyframe" } else { "delta" }])
+                        .inc();
+
+                    // After skipping intermediate AUs a non-IDR is unsafe —
+                    // wait for the next IDR instead of glitching the guest.
+                    if coalesced > 0 && !is_keyframe {
+                        waiting_for_idr = true;
+                        CAMERA_FRAMES_DROPPED
+                            .with_label_values(&["waiting_idr"])
+                            .inc();
+                        CAMERA_PLI_TOTAL
+                            .with_label_values(&["coalesce"])
+                            .inc();
+                        let _ = peer_for_recovery.request_camera_keyframe().await;
                         continue;
                     }
-                    if sink_for_task.push_frame(frame.data) {
-                        if is_keyframe {
-                            waiting_for_idr = false;
+
+                    if waiting_for_idr && !is_keyframe {
+                        CAMERA_FRAMES_DROPPED
+                            .with_label_values(&["waiting_idr"])
+                            .inc();
+                        continue;
+                    }
+
+                    match sink_for_task.push_frame(frame.data) {
+                        PushFrameOutcome::Queued => {
+                            CAMERA_FRAMES_TOTAL.with_label_values(&["forwarded"]).inc();
+                            if is_keyframe {
+                                waiting_for_idr = false;
+                            }
                         }
-                    } else {
-                        waiting_for_idr = true;
-                        debug!("camera endpoint queue full or closed; requesting recovery IDR");
-                        let _ = peer_for_recovery.request_camera_keyframe().await;
+                        PushFrameOutcome::Coalesced => {
+                            // Live-slot already had a pending AU; we replaced
+                            // it. Non-IDR after a replace still breaks the
+                            // chain once the older AU is gone.
+                            CAMERA_FRAMES_TOTAL.with_label_values(&["forwarded"]).inc();
+                            if is_keyframe {
+                                waiting_for_idr = false;
+                            } else {
+                                waiting_for_idr = true;
+                                CAMERA_PLI_TOTAL
+                                    .with_label_values(&["sink_coalesce"])
+                                    .inc();
+                                debug!("camera live-slot coalesced non-IDR; requesting recovery IDR");
+                                let _ = peer_for_recovery.request_camera_keyframe().await;
+                            }
+                        }
+                        PushFrameOutcome::Inactive => {
+                            debug!("camera frame while sink inactive; dropping");
+                        }
                     }
                 }
                 debug!("camera frame forwarder exiting");
@@ -2267,6 +2323,7 @@ async fn forward_control(
             // Prime an IDR from the browser so the endpoint gets a decodable
             // entry point promptly (belt-and-suspenders with the peer-side
             // priming on SetCameraSink / MediaAdded).
+            CAMERA_PLI_TOTAL.with_label_values(&["camera_start"]).inc();
             let _ = peer.request_camera_keyframe().await;
             let _ = peer
                 .send_control_text(datachannel::build_camera_status(true, "started"))

@@ -1097,7 +1097,16 @@ fn install_camera_callback(
                             waiting_for_keyframe.store(false, Ordering::Release);
                         }
                     } else {
+                        // Prefer-latest at the session boundary: drop this AU
+                        // and recover with a throttled PLI. The drain task also
+                        // coalesces any backlog that does get through.
                         waiting_for_keyframe.store(true, Ordering::Release);
+                        crate::observability::CAMERA_FRAMES_DROPPED
+                            .with_label_values(&["peer_queue"])
+                            .inc();
+                        crate::observability::CAMERA_PLI_TOTAL
+                            .with_label_values(&["peer_queue_full"])
+                            .inc();
                         debug!("camera peer queue full or closed; dropping access unit");
                         if let Some(pc) = pc_weak.upgrade() {
                             pli.request(&pc, ssrc, "peer_queue_full").await;

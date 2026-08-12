@@ -54,6 +54,8 @@
 //! datachannel messages so the browser can auto-start/stop webcam capture.
 //! Keyframe requests still flow out of band (bridge-driven PLI).
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -63,8 +65,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::OwnedReadHalf;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
+
+use crate::observability::CAMERA_FRAMES_DROPPED;
 
 /// Abstract-namespace AF_UNIX socket name of the in-guest CMR1 endpoint
 /// (without the leading NUL; that's added by `SocketAddr::from_abstract_name`).
@@ -145,23 +149,88 @@ impl CameraConfig {
     }
 }
 
-/// Messages fed to the sink task.
+/// Messages fed to the sink task (session control only — frames use
+/// [`LiveFrameSlot`] so a slow AF_UNIX write never piles up stale AUs).
 #[derive(Debug)]
 enum SinkMsg {
-    /// (Re)start a virtual-camera session with the given capability. Any
-    /// previous session's socket is torn down and reconnected so the
-    /// endpoint always sees a fresh `Config` before frames.
+    /// (Re)start a virtual-camera session with the given capability.
     Start(CameraConfig),
-    /// One Annex-B H.264 access unit from the browser uplink track.
-    Frame(Vec<u8>),
     /// End the session; the endpoint drops the virtual camera.
     Stop,
+}
+
+/// Single-slot live frame buffer: push overwrites any pending AU (prefer
+/// latest). The writer wakes via [`Notify`]. This is the right backpressure
+/// model for a real-time camera path — never ship a multi-second backlog.
+struct LiveFrameSlot {
+    pending: Mutex<Option<Vec<u8>>>,
+    notify: Notify,
+    /// How many pending AUs were overwritten before the writer consumed them.
+    overwritten: AtomicU64,
+    /// Cleared while no virtual-camera session is active so frames during
+    /// Stop→Start gaps are discarded cheaply.
+    session_active: AtomicBool,
+}
+
+impl LiveFrameSlot {
+    fn new() -> Self {
+        Self {
+            pending: Mutex::new(None),
+            notify: Notify::new(),
+            overwritten: AtomicU64::new(0),
+            session_active: AtomicBool::new(false),
+        }
+    }
+
+    fn set_session_active(&self, active: bool) {
+        self.session_active.store(active, Ordering::Release);
+        if !active {
+            // Drop any frame that would be undeliverable after Stop.
+            let _ = self.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+    }
+
+    /// Publish the latest AU. Returns how many previously-pending AUs were
+    /// discarded (0 or 1). Always succeeds while the sink task is alive.
+    fn push(&self, au: Vec<u8>) -> u64 {
+        if !self.session_active.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut slot = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let dropped = if slot.is_some() { 1 } else { 0 };
+        *slot = Some(au);
+        if dropped > 0 {
+            self.overwritten.fetch_add(dropped, Ordering::Relaxed);
+        }
+        drop(slot);
+        self.notify.notify_one();
+        dropped
+    }
+
+    fn take(&self) -> Option<Vec<u8>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+}
+
+/// Outcome of [`CameraSink::push_frame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushFrameOutcome {
+    /// Frame is the sole pending AU for the writer.
+    Queued,
+    /// A still-unwritten AU was replaced by this newer one (live coalesce).
+    Coalesced,
+    /// No active session (before Start / after Stop) — frame ignored.
+    Inactive,
 }
 
 /// Handle to the camera uplink sink task. Cheap to clone.
 #[derive(Clone)]
 pub struct CameraSink {
     tx: mpsc::Sender<SinkMsg>,
+    frames: Arc<LiveFrameSlot>,
 }
 
 impl CameraSink {
@@ -176,31 +245,50 @@ impl CameraSink {
     /// the transport moved to a fixed abstract AF_UNIX name to bypass
     /// ReDroid's ANDROID_PARANOID_NETWORK AF_INET restriction.
     pub fn spawn(_sink_addr: String) -> (Self, mpsc::Receiver<bool>) {
-        // Bounded so a wedged/slow endpoint applies backpressure without
-        // unbounded memory growth. Frames are drop-newest on a full queue
-        // (see `push_frame`) — losing a delta frame just costs one PLI.
-        let (tx, rx) = mpsc::channel(256);
+        // Control channel is tiny (Start/Stop only). Frames go through the
+        // live slot so a slow endpoint never builds multi-second latency.
+        let (tx, rx) = mpsc::channel(16);
+        let frames = Arc::new(LiveFrameSlot::new());
         let (evt_tx, evt_rx) = mpsc::channel(16);
-        tokio::spawn(run_sink(rx, evt_tx));
-        (Self { tx }, evt_rx)
+        tokio::spawn(run_sink(rx, frames.clone(), evt_tx));
+        (Self { tx, frames }, evt_rx)
     }
 
     /// Begin (or restart) a virtual-camera session.
+    ///
+    /// Session-active for the live frame slot is flipped inside the sink task
+    /// when it processes `Start`, so frames cannot race ahead of the CMR1
+    /// Config handshake.
     pub async fn start(&self, cfg: CameraConfig) {
         if self.tx.send(SinkMsg::Start(cfg)).await.is_err() {
             warn!("camera sink task gone; start dropped");
         }
     }
 
-    /// Forward one Annex-B H.264 access unit. Non-blocking: drops the frame
-    /// if the queue is full (drop-newest), matching the outbound video
-    /// pump's delta-frame backpressure policy. Returns `false` when dropped.
-    pub fn push_frame(&self, au: Vec<u8>) -> bool {
-        self.tx.try_send(SinkMsg::Frame(au)).is_ok()
+    /// Forward one Annex-B H.264 access unit. Non-blocking **prefer-latest**:
+    /// a still-pending AU is overwritten so the virtual camera never plays
+    /// a stale backlog. Callers should treat [`PushFrameOutcome::Coalesced`]
+    /// as a decode-chain break for non-IDR frames (request a keyframe).
+    pub fn push_frame(&self, au: Vec<u8>) -> PushFrameOutcome {
+        if !self.frames.session_active.load(Ordering::Acquire) {
+            return PushFrameOutcome::Inactive;
+        }
+        let dropped = self.frames.push(au);
+        if dropped > 0 {
+            CAMERA_FRAMES_DROPPED
+                .with_label_values(&["sink_full"])
+                .inc_by(dropped);
+            PushFrameOutcome::Coalesced
+        } else {
+            PushFrameOutcome::Queued
+        }
     }
 
     /// End the current session.
     pub async fn stop(&self) {
+        // Soft-disable immediately so late AUs stop enqueueing; the sink task
+        // still emits the in-band Stop on the resident socket.
+        self.frames.set_session_active(false);
         let _ = self.tx.send(SinkMsg::Stop).await;
     }
 }
@@ -209,13 +297,31 @@ impl CameraSink {
 /// the control channel so the rest of the bridge still links, but never
 /// attempt AF_UNIX.
 #[cfg(not(unix))]
-async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, _evt_tx: mpsc::Sender<bool>) {
-    while let Some(msg) = rx.recv().await {
-        if let SinkMsg::Start(cfg) = msg {
-            warn!(
-                ?cfg,
-                "camera uplink unavailable on non-Unix host (ReDroid/Linux only)"
-            );
+async fn run_sink(
+    mut rx: mpsc::Receiver<SinkMsg>,
+    frames: Arc<LiveFrameSlot>,
+    _evt_tx: mpsc::Sender<bool>,
+) {
+    loop {
+        // Keep the live slot from growing while we only log Start events.
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                None => return,
+                Some(SinkMsg::Start(cfg)) => {
+                    frames.set_session_active(true);
+                    warn!(
+                        ?cfg,
+                        "camera uplink unavailable on non-Unix host (ReDroid/Linux only)"
+                    );
+                }
+                Some(SinkMsg::Stop) => {
+                    frames.set_session_active(false);
+                }
+            },
+            _ = frames.notify.notified() => {
+                // Discard — no AF_UNIX writer on this host.
+                let _ = frames.take();
+            }
         }
     }
 }
@@ -225,15 +331,19 @@ async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, _evt_tx: mpsc::Sender<bool>) 
 /// reverse `CamInUse` events on the same socket. Reconnects with backoff on
 /// drop; replays the active session's `Config` after a mid-session reconnect.
 #[cfg(unix)]
-async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
+async fn run_sink(
+    mut rx: mpsc::Receiver<SinkMsg>,
+    frames: Arc<LiveFrameSlot>,
+    evt_tx: mpsc::Sender<bool>,
+) {
     // The current session's capability, retained so a mid-session reconnect
     // can replay the `Config` handshake before resuming frames.
     let mut active: Option<CameraConfig> = None;
 
     'reconnect: loop {
-        // ── Resident connect loop. Keep draining rx while disconnected so
-        // session state stays current (frames are dropped — they're
-        // undeliverable anyway; the post-reconnect PLI recovers video).
+        // ── Resident connect loop. Keep draining control while disconnected
+        // so session state stays current. Live-slot frames are discarded —
+        // undeliverable until the socket is up; post-reconnect PLI recovers.
         let stream = {
             let mut backoff = BACKOFF_MIN;
             let mut attempts: u32 = 0;
@@ -262,10 +372,19 @@ async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
                                         debug!("camera sink task exiting (all senders dropped)");
                                         return;
                                     }
-                                    Some(SinkMsg::Start(cfg)) => active = Some(cfg),
-                                    Some(SinkMsg::Stop) => active = None,
-                                    Some(SinkMsg::Frame(_)) => {} // undeliverable; drop
+                                    Some(SinkMsg::Start(cfg)) => {
+                                        frames.set_session_active(true);
+                                        active = Some(cfg);
+                                    }
+                                    Some(SinkMsg::Stop) => {
+                                        frames.set_session_active(false);
+                                        active = None;
+                                    }
                                 },
+                                _ = frames.notify.notified() => {
+                                    // Undeliverable while disconnected.
+                                    let _ = frames.take();
+                                }
                             }
                         }
                         backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -292,9 +411,23 @@ async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
         let evt_for_reader = evt_tx.clone();
         let mut reader = tokio::spawn(read_events(rd, evt_for_reader));
 
-        // Writer loop: serialise session messages onto the socket. Exits to
-        // 'reconnect when either half of the connection dies.
+        // Writer loop: control messages + live-slot frames. Prefer draining
+        // any pending AU after each wake so we never sit on a stale frame.
         loop {
+            // Opportunistic drain before waiting — covers the race where a
+            // frame was pushed just before we re-enter select.
+            if active.is_some() {
+                while let Some(au) = frames.take() {
+                    if let Err(e) = write_frame(&mut wr, KIND_FRAME, &au).await {
+                        warn!(error = %e, "camera uplink: frame write failed; reconnecting");
+                        reader.abort();
+                        continue 'reconnect;
+                    }
+                }
+            } else {
+                let _ = frames.take();
+            }
+
             tokio::select! {
                 _ = &mut reader => {
                     debug!("camera uplink: reader ended; reconnecting");
@@ -308,6 +441,7 @@ async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
                     }
                     Some(SinkMsg::Start(cfg)) => {
                         info!(?cfg, "camera uplink: starting virtual-camera session");
+                        frames.set_session_active(true);
                         active = Some(cfg.clone());
                         let Ok(payload) = serde_json::to_vec(&cfg) else { continue };
                         if let Err(e) = write_frame(&mut wr, KIND_CONFIG, &payload).await {
@@ -316,21 +450,13 @@ async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
                             continue 'reconnect;
                         }
                     }
-                    Some(SinkMsg::Frame(au)) => {
-                        if active.is_none() {
-                            continue; // Frame before Start (or after Stop) — ignore.
-                        }
-                        if let Err(e) = write_frame(&mut wr, KIND_FRAME, &au).await {
-                            warn!(error = %e, "camera uplink: frame write failed; reconnecting");
-                            reader.abort();
-                            continue 'reconnect;
-                        }
-                    }
                     Some(SinkMsg::Stop) => {
                         // v1.1: Stop ends the session in-band; the resident
                         // connection stays up (it carries reverse events).
                         info!("camera uplink: stopping virtual-camera session");
+                        frames.set_session_active(false);
                         active = None;
+                        let _ = frames.take();
                         if let Err(e) = write_frame(&mut wr, KIND_STOP, &[]).await {
                             warn!(error = %e, "camera uplink: stop write failed; reconnecting");
                             reader.abort();
@@ -338,6 +464,9 @@ async fn run_sink(mut rx: mpsc::Receiver<SinkMsg>, evt_tx: mpsc::Sender<bool>) {
                         }
                     }
                 },
+                _ = frames.notify.notified() => {
+                    // Loop top will drain the slot.
+                }
             }
         }
     }
@@ -467,12 +596,18 @@ mod tests {
         // Session start (Config) + a Frame with correct framing, then Stop
         // (keeps the socket), then a second Config on the SAME connection.
         sink.start(CameraConfig::new(640, 480, 30, "back")).await;
-        for _ in 0..50 {
-            if sink.push_frame(vec![0, 0, 0, 1, 0x65, 0xAA]) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Give the writer a moment to process Start before the frame slot.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let outcome = sink.push_frame(vec![0, 0, 0, 1, 0x65, 0xAA]);
+        assert!(
+            matches!(
+                outcome,
+                PushFrameOutcome::Queued | PushFrameOutcome::Coalesced
+            ),
+            "expected frame to be accepted, got {outcome:?}"
+        );
+        // Allow the AF_UNIX writer to drain the live slot.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         sink.stop().await;
         sink.start(CameraConfig::new(1280, 720, 30, "front")).await;
 
