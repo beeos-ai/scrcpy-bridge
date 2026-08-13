@@ -1,259 +1,370 @@
 name: release-scrcpy-bridge
 
-# Triggered when a tag like `scrcpy-bridge-v0.1.0` is pushed. Produces:
-#   1. Static per-target archives uploaded to the GitHub release as
-#      download assets. Consumed by `@beeos-ai/cli` when users run
-#      `beeos device attach`.
-#   2. A multi-arch Docker image, pushed to GHCR. Consumed by the ReDroid
-#      Pod sidecar. The image is built from GHA *artifacts* (musl binaries
-#      from the matrix job), NOT by re-downloading release assets from the
-#      public GitHub CDN inside `docker build` (that path is flaky under
-#      multi-arch buildx / qemu).
-#
-# Tag format conventions:
-#   - `scrcpy-bridge-v0.1.0`        -> stable release (updates `:latest`)
-#   - `scrcpy-bridge-v0.1.0-rc.1`   -> prerelease (does NOT update `:latest`,
-#                                      GH release marked prerelease)
-#   - `scrcpy-bridge-v0.1.0-staging.1` -> same prerelease semantics, for
-#                                         staging-only validation
-#
-# Any semver-style pre-release suffix (a `-` after the version) flips the
-# release into prerelease mode so staging consumers can pin to the specific
-# `:<version>` tag via `SCRCPY_BRIDGE_IMAGE` without affecting production
-# ReDroid Pods that track `:latest`.
-#
-# See Cargo.toml `[package.metadata.dist]` for the list of targets.
 on:
+  pull_request:
   push:
-    tags:
-      - "scrcpy-bridge-v*"
+    tags: ["scrcpy-bridge-v*"]
+
+concurrency:
+  group: scrcpy-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_HOME: /opt/rustup
+  RUSTUP_TOOLCHAIN: 1.96.0-x86_64-unknown-linux-gnu
+  RUST_TOOLCHAIN_BIN: /opt/rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin
+  RUSTDOC: /opt/rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin/rustdoc
 
 jobs:
-  plan:
-    name: plan
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.derive.outputs.version }}
-      prerelease: ${{ steps.derive.outputs.prerelease }}
+  linux:
+    name: Linux quality and binaries
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, oci, shared-ci, shared-ci-heavy]
+    timeout-minutes: 30
     steps:
-      - id: derive
-        run: |
-          tag="${GITHUB_REF_NAME#scrcpy-bridge-v}"
-          echo "version=$tag" >> "$GITHUB_OUTPUT"
-          if [[ "$tag" == *-* ]]; then
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  binaries:
-    name: binaries (${{ matrix.target }})
-    needs: plan
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64-unknown-linux-gnu,   runner: ubuntu-22.04 }
-          - { target: aarch64-unknown-linux-gnu,  runner: ubuntu-22.04, cross: true }
-          - { target: x86_64-unknown-linux-musl,  runner: ubuntu-22.04, cross: true }
-          - { target: aarch64-unknown-linux-musl, runner: ubuntu-22.04, cross: true }
-          # x86_64 macs are cross-compiled on a macos-14 (Apple Silicon)
-          # runner. macos-13 (Intel) runners are heavily oversubscribed
-          # in the GitHub-hosted pool and frequently take 30+ minutes
-          # to allocate; cross-compiling from arm to x86 on darwin works
-          # natively because Xcode ships both SDKs, and dtolnay's action
-          # installs the rustup target via `targets:` below.
-          - { target: x86_64-apple-darwin,        runner: macos-14 }
-          - { target: aarch64-apple-darwin,       runner: macos-14 }
-          - { target: x86_64-pc-windows-msvc,     runner: windows-2022 }
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross (Linux only)
-        if: matrix.cross == true
-        run: cargo install cross --locked
-
-      # Note: --release is the alias for --profile release; cargo 1.95+
-      # rejects combining it with an explicit --profile <other>. The
-      # `dist` profile defined in Cargo.toml already implies release-grade
-      # optimization, so we drop --release.
-      - name: Build (native)
-        if: matrix.cross != true
-        working-directory: .
-        run: cargo build --target ${{ matrix.target }} --profile dist --locked
-
-      - name: Build (cross)
-        if: matrix.cross == true
-        working-directory: .
-        run: cross build --target ${{ matrix.target }} --profile dist --locked
-
-      - name: Package archive
-        id: pack
-        shell: bash
-        # Archive name is intentionally version-less so the BeeOS CLI can
-        # fetch it at a stable URL:
-        #   /releases/latest/download/scrcpy-bridge-<target>.tar.gz
-        # GitHub redirects `latest/download` to whichever tag is marked
-        # "latest" in the repo's Releases page. See
-        # web/packages/core/src/sidecars/cargo-dist.ts (archiveName +
-        # releaseBaseUrl).
-        run: |
-          bin="scrcpy-bridge"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then bin="scrcpy-bridge.exe"; fi
-          stage="scrcpy-bridge-${{ matrix.target }}"
-          mkdir -p "$stage"
-          cp "target/${{ matrix.target }}/dist/${bin}" "$stage/"
-          cp README.md LICENSE 2>/dev/null "$stage/" || true
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            7z a "${stage}.zip" "$stage"
-            archive="${stage}.zip"
-          else
-            tar -czf "${stage}.tar.gz" "$stage"
-            archive="${stage}.tar.gz"
-          fi
-          # Publish SHA256 sidecar alongside the archive — the CLI
-          # validates archive integrity against this digest (see
-          # cargo-dist.ts). Missing digest is a soft warning for
-          # back-compat but we always ship it in prod releases to
-          # catch truncated downloads / CDN tampering.
-          if command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 "$archive" | awk '{print $1"  "$2}' > "${archive}.sha256"
-          else
-            sha256sum "$archive" | awk '{print $1"  "$2}' > "${archive}.sha256"
-          fi
-          echo "asset=$archive"            >> "$GITHUB_OUTPUT"
-          echo "digest=${archive}.sha256"  >> "$GITHUB_OUTPUT"
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            ${{ steps.pack.outputs.asset }}
-            ${{ steps.pack.outputs.digest }}
-          fail_on_unmatched_files: true
-          prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
-
-      # Musl binaries are also uploaded as GHA artifacts so the docker job
-      # can COPY them into the image without re-downloading from the public
-      # GitHub Release CDN (that path is flaky under multi-arch buildx).
-      - name: Upload musl binary for docker
-        if: contains(matrix.target, 'linux-musl')
-        uses: actions/upload-artifact@v4
-        with:
-          name: binary-${{ matrix.target }}
-          path: scrcpy-bridge-${{ matrix.target }}/scrcpy-bridge
-          if-no-files-found: error
-          retention-days: 2
-
-  docker:
-    name: distroless docker image
-    # Publish GHCR even if a non-musl matrix cell fails (e.g. Windows).
-    # Docker only consumes the two linux-musl artifacts from `binaries`.
-    needs: [plan, binaries]
-    if: ${{ always() && needs.plan.result == 'success' && !cancelled() }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # Pull the musl binaries produced by the matrix job over GHA's
-      # internal artifact store (authenticated, same-org, no CDN hop).
-      - name: Download musl binaries
-        uses: actions/download-artifact@v4
-        with:
-          pattern: binary-*-unknown-linux-musl
-          path: _musl_artifacts
-          merge-multiple: false
-
-      - name: Stage musl binaries for docker context
+          persist-credentials: false
+      - name: Verify the preinstalled Rust release toolchain
         shell: bash
         run: |
           set -euo pipefail
-          # download-artifact layout:
-          #   _musl_artifacts/binary-x86_64-unknown-linux-musl/scrcpy-bridge
-          #   _musl_artifacts/binary-aarch64-unknown-linux-musl/scrcpy-bridge
-          # Dockerfile expects:
-          #   dist/<triple>/scrcpy-bridge
-          for triple in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            src="_musl_artifacts/binary-${triple}/scrcpy-bridge"
-            if [[ ! -f "$src" ]]; then
-              echo "missing $src — musl matrix cell failed or artifact name drifted" >&2
-              find _musl_artifacts -type f 2>/dev/null || true
-              exit 1
-            fi
-            mkdir -p "dist/${triple}"
-            install -m 0755 "$src" "dist/${triple}/scrcpy-bridge"
-            ls -la "dist/${triple}/scrcpy-bridge"
-            file "dist/${triple}/scrcpy-bridge" || true
+          test -n "$CARGO_HOME"
+          test -n "$CARGO_TARGET_DIR"
+          rustc --version
+          cargo --version
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            test -d "/opt/rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/lib/rustlib/$target" || { echo "runner is missing preinstalled Rust target: $target" >&2; exit 1; }
           done
-
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image tags
-        id: imgtags
+          test -x /opt/cargo/bin/cross
+      - name: Quality gate
         shell: bash
         run: |
-          ver="${{ needs.plan.outputs.version }}"
-          {
-            echo "tags<<EOF"
-            echo "ghcr.io/beeos-ai/scrcpy-bridge:${ver}"
-            if [[ "${{ needs.plan.outputs.prerelease }}" != "true" ]]; then
-              echo "ghcr.io/beeos-ai/scrcpy-bridge:latest"
+          set -euo pipefail
+          # Keep Clippy visible without turning warnings introduced by newer
+          # stable toolchains into unrelated release blockers.
+          "$RUST_TOOLCHAIN_BIN/cargo" clippy --all-targets --locked
+          "$RUST_TOOLCHAIN_BIN/cargo" test --locked
+      - name: Build four Linux targets with bounded concurrency
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pids=()
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            cross build --target "$target" --profile dist --locked >"$RUNNER_TEMP/${target}.log" 2>&1 &
+            pids+=("$!:$target")
+            if (( ${#pids[@]} == 2 )); then
+              for item in "${pids[@]}"; do pid="${item%%:*}"; target="${item#*:}"; wait "$pid" || { cat "$RUNNER_TEMP/${target}.log"; exit 1; }; done
+              pids=()
             fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Build & push multi-arch image
-        uses: docker/build-push-action@v6
+          done
+          for item in "${pids[@]}"; do pid="${item%%:*}"; target="${item#*:}"; wait "$pid" || { cat "$RUNNER_TEMP/${target}.log"; exit 1; }; done
+      - name: Package Linux artifacts
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-assets docker-binaries
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            archive="$(scripts/package-target.sh "$target")"
+            mv "$archive" "${archive}.sha256" dist-assets/
+          done
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            install -Dm0755 "${CARGO_TARGET_DIR}/${target}/dist/scrcpy-bridge" "docker-binaries/${target}/scrcpy-bridge"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'push'
         with:
-          context: .
-          file: Dockerfile.distroless
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.imgtags.outputs.tags }}
-          build-args: |
-            VERSION=${{ needs.plan.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          name: scrcpy-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist-assets/
+            docker-binaries/
+          if-no-files-found: error
+          retention-days: 2
 
-      # ReDroid sidecars run on OKE and can only pull OCIR. GHCR remains the
-      # public/self-host artifact; copy the same digest into OCIR so Runtime
-      # can pin sin.ocir.io/...@sha256:... without a manual crane step.
-      - name: Copy image to OCIR
-        if: ${{ vars.OCIR_REGISTRY != '' && secrets.OCIR_AUTH_TOKEN != '' }}
-        env:
-          VER: ${{ needs.plan.outputs.version }}
-          OCIR_REGISTRY: ${{ vars.OCIR_REGISTRY || 'sin.ocir.io' }}
-          OCIR_NAMESPACE: ${{ vars.OCIR_NAMESPACE }}
-          OCIR_USERNAME: ${{ secrets.OCIR_USERNAME }}
-          OCIR_AUTH_TOKEN: ${{ secrets.OCIR_AUTH_TOKEN }}
+  macos:
+    name: macOS binaries
+    if: github.event_name == 'push'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: scrcpy-macos-${{ hashFiles('Cargo.lock') }}
+      - name: Build and package both macOS targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-assets
+          for target in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --target "$target" --profile dist --locked
+            archive="$(scripts/package-target.sh "$target")"
+            mv "$archive" "${archive}.sha256" dist-assets/
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scrcpy-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist-assets/
+          if-no-files-found: error
+          retention-days: 2
+
+  windows:
+    name: Windows binary
+    if: github.event_name == 'push'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: scrcpy-windows-${{ hashFiles('Cargo.lock') }}
+      - name: Build and package Windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --target x86_64-pc-windows-msvc --profile dist --locked
+          mkdir -p dist-assets
+          archive="$(scripts/package-target.sh x86_64-pc-windows-msvc)"
+          mv "$archive" "${archive}.sha256" dist-assets/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scrcpy-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist-assets/
+          if-no-files-found: error
+          retention-days: 2
+
+  staging:
+    name: Publish complete staging candidate
+    needs: [linux, macos, windows]
+    if: github.event_name == 'push'
+    runs-on: [self-hosted, linux, x64, oci, shared-ci, shared-ci-heavy]
+    environment: staging
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      prerelease: ${{ steps.identity.outputs.prerelease }}
+      digest: ${{ steps.publish.outputs.digest }}
+    permissions:
+      contents: write
+    env:
+      OCIR_REGISTRY: ${{ vars.OCIR_REGISTRY || 'sin.ocir.io' }}
+      OCIR_NAMESPACE: ${{ vars.OCIR_NAMESPACE }}
+      OCIR_USERNAME: ${{ secrets.OCIR_USERNAME }}
+      OCIR_AUTH_TOKEN: ${{ secrets.OCIR_AUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: scrcpy-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scrcpy-input
+          merge-multiple: true
+      - id: identity
+        name: Freeze and verify the complete release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#scrcpy-bridge-v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
+          test "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "${version%%-*}"
+          scripts/verify-release-assets.sh "$RUNNER_TEMP/scrcpy-input/dist-assets"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Stage exact musl binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          cp -R "$RUNNER_TEMP/scrcpy-input/docker-binaries" dist
+          test -x dist/x86_64-unknown-linux-musl/scrcpy-bridge
+          test -x dist/aarch64-unknown-linux-musl/scrcpy-bridge
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver: docker-container
+      - name: Authenticate to OCIR
+        shell: bash
         run: |
           set -euo pipefail
           test -n "$OCIR_NAMESPACE"
           echo "::add-mask::$OCIR_AUTH_TOKEN"
           printf '%s' "$OCIR_AUTH_TOKEN" | docker login "$OCIR_REGISTRY" --username "$OCIR_USERNAME" --password-stdin
-          src="ghcr.io/beeos-ai/scrcpy-bridge:${VER}"
-          digest="$(docker buildx imagetools inspect "$src" --format '{{json .Manifest}}' | jq -er '.digest')"
-          for repo in beeos/scrcpy-bridge beeos-staging/scrcpy-bridge; do
-            dst="${OCIR_REGISTRY}/${OCIR_NAMESPACE}/${repo}:${VER}"
-            docker buildx imagetools create --tag "$dst" "${src}@${digest}"
-            copied="$(docker buildx imagetools inspect "$dst" --format '{{json .Manifest}}' | jq -er '.digest')"
-            test "$copied" = "$digest"
-            echo "copied ${dst}@${copied}"
-          done
+      - id: publish
+        name: Build once and publish the OCIR staging authority
+        shell: bash
+        env:
+          VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          staging="${OCIR_REGISTRY}/${OCIR_NAMESPACE}/beeos-staging/scrcpy-bridge:${VERSION}-${GITHUB_SHA}"
+          metadata="$RUNNER_TEMP/image-metadata.json"
+          docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.distroless \
+            --build-arg "VERSION=$VERSION" --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$staging" --metadata-file "$metadata" --provenance=false \
+            --cache-from "type=registry,ref=${OCIR_REGISTRY}/${OCIR_NAMESPACE}/beeos-staging/scrcpy-bridge:buildcache" \
+            --cache-to "type=registry,ref=${OCIR_REGISTRY}/${OCIR_NAMESPACE}/beeos-staging/scrcpy-bridge:buildcache,mode=max,ignore-error=true" \
+            --push .
+          digest="$(jq -er '."containerimage.digest"' "$metadata")"
+          test "$(docker buildx imagetools inspect "$staging" --format '{{json .Manifest}}' | jq -er .digest)" = "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          jq -nS --arg commit "$GITHUB_SHA" --arg version "$VERSION" --arg digest "$digest" --arg repository "${OCIR_REGISTRY}/${OCIR_NAMESPACE}/beeos-staging/scrcpy-bridge" \
+            '{schemaVersion:1,kind:"scrcpy-bridge-image-manifest",commit:$commit,version:$version,repository:$repository,digest:$digest}' > "$RUNNER_TEMP/image-manifest.json"
+      - name: Create a draft GitHub release after all assets and images pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          PRERELEASE: ${{ steps.identity.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease > "$RUNNER_TEMP/release.json" 2>/dev/null; then
+            jq -e --argjson prerelease "$PRERELEASE" '.isDraft == true and .isPrerelease == $prerelease' "$RUNNER_TEMP/release.json" >/dev/null
+            gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP"/scrcpy-input/dist-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            args=(--repo "$GITHUB_REPOSITORY" --title "scrcpy-bridge v${VERSION}" --generate-notes --draft)
+            [[ "$PRERELEASE" != true ]] || args+=(--prerelease)
+            gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/scrcpy-input/dist-assets/* "${args[@]}"
+          fi
+      - name: Seal the staging manifest
+        shell: bash
+        run: (cd "$RUNNER_TEMP" && sha256sum image-manifest.json > image-manifest.sha256)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scrcpy-staging-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/image-manifest.json
+            ${{ runner.temp }}/image-manifest.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Dispatch the verified staging pin to Backend
+        env:
+          GH_TOKEN: ${{ secrets.BACKEND_RELEASE_TOKEN }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          gh api --method POST repos/beeos-ai/backend/dispatches \
+            -f event_type=device-images-pin-promotion \
+            -F 'client_payload[component]=scrcpy' \
+            -F 'client_payload[channel]=staging' \
+            -F "client_payload[runId]=$GITHUB_RUN_ID" \
+            -F "client_payload[runAttempt]=$GITHUB_RUN_ATTEMPT" \
+            -F "client_payload[commit]=$GITHUB_SHA" \
+            -F "client_payload[digest]=$DIGEST"
+
+  production:
+    name: Promote exact image digest to production
+    needs: staging
+    runs-on: [self-hosted, linux, x64, oci, shared-ci]
+    environment: production
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+    env:
+      OCIR_REGISTRY: ${{ vars.OCIR_REGISTRY || 'sin.ocir.io' }}
+      OCIR_NAMESPACE: ${{ vars.OCIR_NAMESPACE }}
+      OCIR_USERNAME: ${{ secrets.OCIR_USERNAME }}
+      OCIR_AUTH_TOKEN: ${{ secrets.OCIR_AUTH_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scrcpy-staging-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scrcpy-production
+      - name: Copy the verified digest without rebuilding
+        env:
+          VERSION: ${{ needs.staging.outputs.version }}
+          DIGEST: ${{ needs.staging.outputs.digest }}
+          PRERELEASE: ${{ needs.staging.outputs.prerelease }}
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd "$RUNNER_TEMP/scrcpy-production" && sha256sum -c image-manifest.sha256)
+          manifest="$RUNNER_TEMP/scrcpy-production/image-manifest.json"
+          jq -e --arg sha "$GITHUB_SHA" --arg version "$VERSION" --arg digest "$DIGEST" '.schemaVersion==1 and .kind=="scrcpy-bridge-image-manifest" and .commit==$sha and .version==$version and .digest==$digest' "$manifest" >/dev/null
+          echo "::add-mask::$OCIR_AUTH_TOKEN"
+          printf '%s' "$OCIR_AUTH_TOKEN" | skopeo login --username "$OCIR_USERNAME" --password-stdin "$OCIR_REGISTRY"
+          source="$(jq -r .repository "$manifest")@${DIGEST}"
+          target="${OCIR_REGISTRY}/${OCIR_NAMESPACE}/beeos/scrcpy-bridge:${VERSION}"
+          skopeo copy --all --preserve-digests --retry-times 3 "docker://${source}" "docker://${target}"
+          test "$(skopeo inspect --format '{{.Digest}}' "docker://${target}")" = "$DIGEST"
+          echo "::add-mask::$GITHUB_TOKEN"
+          printf '%s' "$GITHUB_TOKEN" | skopeo login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          skopeo copy --all --preserve-digests --retry-times 3 "docker://${source}" "docker://ghcr.io/beeos-ai/scrcpy-bridge:${VERSION}"
+          test "$(skopeo inspect --format '{{.Digest}}' "docker://ghcr.io/beeos-ai/scrcpy-bridge:${VERSION}")" = "$DIGEST"
+          if [[ "$PRERELEASE" != true ]]; then
+            skopeo copy --all --preserve-digests --retry-times 3 "docker://${source}" "docker://${OCIR_REGISTRY}/${OCIR_NAMESPACE}/beeos/scrcpy-bridge:latest"
+            test "$(skopeo inspect --format '{{.Digest}}' "docker://${OCIR_REGISTRY}/${OCIR_NAMESPACE}/beeos/scrcpy-bridge:latest")" = "$DIGEST"
+            skopeo copy --all --preserve-digests --retry-times 3 "docker://${source}" "docker://ghcr.io/beeos-ai/scrcpy-bridge:latest"
+            test "$(skopeo inspect --format '{{.Digest}}' "docker://ghcr.io/beeos-ai/scrcpy-bridge:latest")" = "$DIGEST"
+          fi
+      - name: Emit production promotion receipt
+        env:
+          VERSION: ${{ needs.staging.outputs.version }}
+          DIGEST: ${{ needs.staging.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/scrcpy-receipt"
+          jq -nS --arg commit "$GITHUB_SHA" --arg version "$VERSION" --arg digest "$DIGEST" \
+            --arg source "${OCIR_REGISTRY}/${OCIR_NAMESPACE}/beeos-staging/scrcpy-bridge@${DIGEST}" \
+            --arg target "${OCIR_REGISTRY}/${OCIR_NAMESPACE}/beeos/scrcpy-bridge@${DIGEST}" \
+            '{schemaVersion:1,kind:"scrcpy-bridge-promotion-receipt",commit:$commit,version:$version,digest:$digest,source:$source,production:$target,existingInstancesMutated:false}' \
+            > "$RUNNER_TEMP/scrcpy-receipt/receipt.json"
+          (cd "$RUNNER_TEMP/scrcpy-receipt" && sha256sum receipt.json > receipt.sha256)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scrcpy-production-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scrcpy-receipt/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Publish the draft GitHub release after production approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.staging.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--repo "$GITHUB_REPOSITORY" --draft=false)
+          [[ "$PRERELEASE" == true ]] || args+=(--latest)
+          gh release edit "$GITHUB_REF_NAME" "${args[@]}"
+      - name: Dispatch the verified production pin to Backend
+        env:
+          GH_TOKEN: ${{ secrets.BACKEND_RELEASE_TOKEN }}
+          DIGEST: ${{ needs.staging.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          gh api --method POST repos/beeos-ai/backend/dispatches \
+            -f event_type=device-images-pin-promotion \
+            -F 'client_payload[component]=scrcpy' \
+            -F 'client_payload[channel]=production' \
+            -F "client_payload[runId]=$GITHUB_RUN_ID" \
+            -F "client_payload[runAttempt]=$GITHUB_RUN_ATTEMPT" \
+            -F "client_payload[commit]=$GITHUB_SHA" \
+            -F "client_payload[digest]=$DIGEST"

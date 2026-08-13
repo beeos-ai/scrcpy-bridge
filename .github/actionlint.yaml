@@ -1,0 +1,6 @@
+self-hosted-runner:
+  labels:
+    - oci
+    - shared-ci
+    - shared-ci-heavy
+    - shared-ci-no-docker
