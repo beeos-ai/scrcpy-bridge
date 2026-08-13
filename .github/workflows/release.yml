@@ -231,3 +231,29 @@ jobs:
             VERSION=${{ needs.plan.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ReDroid sidecars run on OKE and can only pull OCIR. GHCR remains the
+      # public/self-host artifact; copy the same digest into OCIR so Runtime
+      # can pin sin.ocir.io/...@sha256:... without a manual crane step.
+      - name: Copy image to OCIR
+        if: ${{ vars.OCIR_REGISTRY != '' && secrets.OCIR_AUTH_TOKEN != '' }}
+        env:
+          VER: ${{ needs.plan.outputs.version }}
+          OCIR_REGISTRY: ${{ vars.OCIR_REGISTRY || 'sin.ocir.io' }}
+          OCIR_NAMESPACE: ${{ vars.OCIR_NAMESPACE }}
+          OCIR_USERNAME: ${{ secrets.OCIR_USERNAME }}
+          OCIR_AUTH_TOKEN: ${{ secrets.OCIR_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$OCIR_NAMESPACE"
+          echo "::add-mask::$OCIR_AUTH_TOKEN"
+          printf '%s' "$OCIR_AUTH_TOKEN" | docker login "$OCIR_REGISTRY" --username "$OCIR_USERNAME" --password-stdin
+          src="ghcr.io/beeos-ai/scrcpy-bridge:${VER}"
+          digest="$(docker buildx imagetools inspect "$src" --format '{{json .Manifest}}' | jq -er '.digest')"
+          for repo in beeos/scrcpy-bridge beeos-staging/scrcpy-bridge; do
+            dst="${OCIR_REGISTRY}/${OCIR_NAMESPACE}/${repo}:${VER}"
+            docker buildx imagetools create --tag "$dst" "${src}@${digest}"
+            copied="$(docker buildx imagetools inspect "$dst" --format '{{json .Manifest}}' | jq -er '.digest')"
+            test "$copied" = "$digest"
+            echo "copied ${dst}@${copied}"
+          done
