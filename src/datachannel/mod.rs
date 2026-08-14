@@ -10,7 +10,8 @@
 //! - `key`      — `action` (down/up), `keycode` (string name)
 //! - `text`     — `content`
 //! - `back`     (no payload) / `home` (no payload)
-//! - `configure` — `maxFps?`, `maxWidth?`, `bitrate?`, `iFrameInterval?`
+//! - `configure` — `maxFps?`, `maxWidth?`, `bitrate?`, `iFrameInterval?`.
+//!   Persisted for the next scrcpy start; the live WebRTC session is kept.
 //! - `ping`     — `ts` (ms). Device replies with `pong` mirroring `ts`.
 //! - `stats`    — periodic client-side WebRTC stats (fps, rtt, bitrate, …).
 //!                Consumed by the bridge for Prometheus metrics.
