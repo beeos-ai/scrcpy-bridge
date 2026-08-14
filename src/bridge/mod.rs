@@ -336,9 +336,12 @@ impl Bridge {
         //    no zombie tasks ever touch a reborn scrcpy socket.
         //
         //    The encoder config lives in its own Arc so the DataChannel
-        //    `configure` handler can mutate it between sessions (G8 hot
-        //    reconfigure). Every `on_offer` snapshots this Arc when spawning
-        //    a new ScrcpyServer.
+        //    `configure` handler can persist knobs for the *next* scrcpy
+        //    start. A live session is never torn down for encoder prefs —
+        //    mobile used to send GOP=1 after the first DC open, and the
+        //    old G8 restart (`stream_restarted` + session.shutdown) made
+        //    every first connect rebuild WebRTC. Every `on_offer`
+        //    snapshots this Arc when spawning a new ScrcpyServer.
         let current_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
         let scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>> =
             Arc::new(RwLock::new(self.initial_scrcpy_config()));
@@ -545,8 +548,8 @@ impl Bridge {
 
     /// Build the initial `ScrcpyServerConfig` from CLI flags. Once the bridge
     /// is running, the DataChannel `configure` handler mutates a shared
-    /// `Arc<RwLock<ScrcpyServerConfig>>` so subsequent scrcpy restarts pick
-    /// up the new encoder knobs without requiring a full bridge reboot.
+    /// `Arc<RwLock<ScrcpyServerConfig>>` so the next `on_offer` picks up
+    /// the new encoder knobs. The live session is not restarted.
     fn initial_scrcpy_config(&self) -> ScrcpyServerConfig {
         ScrcpyServerConfig {
             scrcpy_version: crate::SCRCPY_VERSION.to_string(),
@@ -1618,9 +1621,16 @@ async fn run_event_pump(
                             .await;
                     }
                     PeerEvent::ControlMessage(text) => {
-                        if let Err(e) =
-                            forward_control(&text, control.as_ref(), &scrcpy_cfg, &peer, &health,
-                                &current_session, scroll_sensitivity, &camera_sink).await
+                        if let Err(e) = forward_control(
+                            &text,
+                            control.as_ref(),
+                            &scrcpy_cfg,
+                            &peer,
+                            &health,
+                            scroll_sensitivity,
+                            &camera_sink,
+                        )
+                        .await
                         {
                             warn!(error = %e, "forward control");
                         }
@@ -2044,6 +2054,48 @@ async fn run_audio_pump(mut reader: AudioReader, peer: WebRtcPeer, cancel: Cance
 
 // ---------------------------------------------------------------------------
 
+/// Merge optional encoder knobs into `cfg`. Returns whether any field changed.
+///
+/// Used by the DataChannel `configure` handler so the next `on_offer`
+/// starts scrcpy with the viewer's prefs. The live peer is left alone —
+/// applying width/bitrate/GOP requires a new `app_process`, and the old
+/// G8 path tore down WebRTC to get there (~several seconds of black on
+/// every first mobile connect).
+fn merge_scrcpy_configure(
+    cfg: &mut ScrcpyServerConfig,
+    max_fps: Option<u32>,
+    max_width: Option<u32>,
+    bitrate: Option<u32>,
+    i_frame_interval: Option<u32>,
+) -> bool {
+    let mut changed = false;
+    if let Some(v) = max_fps {
+        if cfg.max_fps != v {
+            cfg.max_fps = v;
+            changed = true;
+        }
+    }
+    if let Some(v) = max_width {
+        if cfg.max_width != v {
+            cfg.max_width = v;
+            changed = true;
+        }
+    }
+    if let Some(v) = bitrate {
+        if cfg.bitrate != v {
+            cfg.bitrate = v;
+            changed = true;
+        }
+    }
+    if let Some(v) = i_frame_interval {
+        if cfg.i_frame_interval != v {
+            cfg.i_frame_interval = v;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Translate a browser DataChannel message into scrcpy control socket calls
 /// or metrics updates. `peer` is used to send replies (pong, ack) back.
 async fn forward_control(
@@ -2052,7 +2104,6 @@ async fn forward_control(
     scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
     peer: &WebRtcPeer,
     _health: &HealthFlags,
-    current_session: &Arc<Mutex<Option<Session>>>,
     scroll_sensitivity: f32,
     camera_sink: &CameraSink,
 ) -> Result<()> {
@@ -2154,44 +2205,23 @@ async fn forward_control(
             bitrate,
             i_frame_interval,
         } => {
-            // Hot reconfigure (G8):
-            //   1. Merge the new encoder knobs into the shared
-            //      `ScrcpyServerConfig` so the next `on_offer` spins up
-            //      scrcpy with the updated values.
-            //   2. Emit `stream_restarted` on the DataChannel so the
-            //      browser's `reconnectForStreamRestart` kicks in.
-            //   3. Tear down the currently running scrcpy server — its
-            //      video pump exits, the WebRTC peer shuts down
-            //      naturally, and the browser's reconnect lands on a
-            //      clean slot with fresh encoder settings.
-            let mut changed = false;
-            {
+            // Persist encoder prefs for the next scrcpy start. Do **not**
+            // emit `stream_restarted` or drop the live session: iOS and
+            // Android send `configure` the moment the control DC opens,
+            // and tearing WebRTC down there is the first-connect black
+            // screen (old iOS skipped configure and came up in one hop).
+            // Width / bitrate / GOP cannot be applied to a running
+            // `app_process`; they take effect on the next offer.
+            let changed = {
                 let mut cfg = scrcpy_cfg.write().await;
-                if let Some(v) = *max_fps {
-                    if cfg.max_fps != v {
-                        cfg.max_fps = v;
-                        changed = true;
-                    }
-                }
-                if let Some(v) = *max_width {
-                    if cfg.max_width != v {
-                        cfg.max_width = v;
-                        changed = true;
-                    }
-                }
-                if let Some(v) = *bitrate {
-                    if cfg.bitrate != v {
-                        cfg.bitrate = v;
-                        changed = true;
-                    }
-                }
-                if let Some(v) = *i_frame_interval {
-                    if cfg.i_frame_interval != v {
-                        cfg.i_frame_interval = v;
-                        changed = true;
-                    }
-                }
-            }
+                merge_scrcpy_configure(
+                    &mut cfg,
+                    *max_fps,
+                    *max_width,
+                    *bitrate,
+                    *i_frame_interval,
+                )
+            };
             if !changed {
                 debug!("configure no-op (identical values)");
                 return Ok(());
@@ -2201,21 +2231,13 @@ async fn forward_control(
                 max_width = ?max_width,
                 bitrate = ?bitrate,
                 i_frame_interval = ?i_frame_interval,
-                "hot reconfigure: restarting scrcpy server"
+                "configure persisted for next scrcpy start — keeping live session"
             );
-            let _ = peer
-                .send_control_text(datachannel::build_stream_restarted())
-                .await;
-            if let Some(session) = current_session.lock().await.take() {
-                // Session::shutdown cancels tasks and reaps scrcpy. The
-                // browser's `stream_restarted` handler reconnects shortly
-                // after and picks up the fresh encoder config on the
-                // next offer.
-                tokio::spawn(async move {
-                    session.shutdown().await;
-                });
+            if let Some(ctrl) = control {
+                if let Err(e) = ctrl.reset_video().await {
+                    warn!(error = %e, "scrcpy reset_video after configure");
+                }
             }
-            SCRCPY_RUNNING.set(0);
             return Ok(());
         }
         ControlIn::CameraStart {
@@ -2646,6 +2668,73 @@ mod tests {
             evaluate_recovery(7, 5, MAX_RESET_ATTEMPTS, true, true),
             RecoveryDecision::Confirmed,
         );
+    }
+
+    // ── configure merge (must not imply a live-session restart) ───────────
+
+    fn sample_scrcpy_cfg() -> ScrcpyServerConfig {
+        ScrcpyServerConfig {
+            max_fps: 30,
+            max_width: 1920,
+            bitrate: 8_000_000,
+            i_frame_interval: 2,
+            ..ScrcpyServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn configure_merge_applies_each_changed_knob() {
+        let mut cfg = sample_scrcpy_cfg();
+        assert!(merge_scrcpy_configure(
+            &mut cfg,
+            Some(30),
+            Some(1080),
+            Some(6_000_000),
+            Some(1),
+        ));
+        assert_eq!(cfg.max_fps, 30);
+        assert_eq!(cfg.max_width, 1080);
+        assert_eq!(cfg.bitrate, 6_000_000);
+        assert_eq!(cfg.i_frame_interval, 1);
+    }
+
+    #[test]
+    fn configure_merge_is_noop_when_values_match() {
+        let mut cfg = sample_scrcpy_cfg();
+        let max_fps = cfg.max_fps;
+        let max_width = cfg.max_width;
+        let bitrate = cfg.bitrate;
+        let i_frame_interval = cfg.i_frame_interval;
+        assert!(!merge_scrcpy_configure(
+            &mut cfg,
+            Some(max_fps),
+            Some(max_width),
+            Some(bitrate),
+            Some(i_frame_interval),
+        ));
+    }
+
+    #[test]
+    fn configure_merge_ignores_absent_fields() {
+        let mut cfg = sample_scrcpy_cfg();
+        let before = cfg.clone();
+        assert!(!merge_scrcpy_configure(&mut cfg, None, None, None, None));
+        assert_eq!(cfg.max_fps, before.max_fps);
+        assert_eq!(cfg.max_width, before.max_width);
+        assert_eq!(cfg.bitrate, before.bitrate);
+        assert_eq!(cfg.i_frame_interval, before.i_frame_interval);
+    }
+
+    #[test]
+    fn configure_merge_gop_only_still_counts_as_change() {
+        // This is the mobile first-connect payload when width/bitrate
+        // already match production defaults — GOP 2 → 1 used to tear
+        // the peer down by itself.
+        let mut cfg = sample_scrcpy_cfg();
+        assert!(merge_scrcpy_configure(&mut cfg, None, None, None, Some(1)));
+        assert_eq!(cfg.i_frame_interval, 1);
+        assert_eq!(cfg.max_width, 1920);
+        assert_eq!(cfg.bitrate, 8_000_000);
     }
 
     #[test]
