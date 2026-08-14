@@ -1,0 +1,7 @@
+[build.env]
+passthrough = ["RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE"]
+volumes = [
+  "SCCACHE_BINARY=/usr/local/bin/sccache",
+  "SCCACHE_WRAPPER=/usr/local/bin/shared-ci-sccache",
+  "SCCACHE_DIR",
+]

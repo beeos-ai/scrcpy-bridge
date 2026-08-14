@@ -27,6 +27,7 @@ jobs:
       RUSTUP_TOOLCHAIN: 1.96.0-x86_64-unknown-linux-gnu
       RUST_TOOLCHAIN_BIN: /opt/rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin
       RUSTDOC: /opt/rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin/rustdoc
+      CROSS_CONFIG: .github/cross-shared-cache.toml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,9 +40,15 @@ jobs:
           test -n "$CARGO_TARGET_DIR"
           test "$CROSS_CUSTOM_TOOLCHAIN" = 1
           test "$RUSTUP_AUTO_INSTALL" = 0
+          test "$RUSTC_WRAPPER" = /usr/local/bin/shared-ci-sccache
+          test -x "$RUSTC_WRAPPER"
+          test -x "$SCCACHE_BINARY"
+          test "$SCCACHE_WRAPPER" = "$RUSTC_WRAPPER"
+          case "$SCCACHE_DIR" in */organizations/beeos-ai/rust-sccache) ;; *) echo "unexpected shared sccache path: $SCCACHE_DIR" >&2; exit 1;; esac
           test "$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" = "$RUST_RELEASE_TOOLCHAIN"
           rustc --version
           cargo --version
+          sccache --version
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             test -d "/opt/rustup/toolchains/${RUST_RELEASE_TOOLCHAIN}-x86_64-unknown-linux-gnu/lib/rustlib/$target" || { echo "runner is missing preinstalled Rust target: $target" >&2; exit 1; }
           done
@@ -50,6 +57,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          scripts/ci-cache-contract-test.sh
           # Keep Clippy visible without turning warnings introduced by newer
           # stable toolchains into unrelated release blockers.
           "$RUST_TOOLCHAIN_BIN/cargo" clippy --all-targets --locked
@@ -82,6 +90,10 @@ jobs:
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             install -Dm0755 "${CARGO_TARGET_DIR}/${target}/dist/scrcpy-bridge" "release-output/docker-binaries/${target}/scrcpy-bridge"
           done
+      - name: Report shared Rust compiler cache
+        if: always()
+        shell: bash
+        run: sccache --show-stats
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: github.event_name == 'push'
         with:
