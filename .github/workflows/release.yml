@@ -23,8 +23,6 @@ jobs:
     runs-on: [self-hosted, linux, x64, oci, shared-ci, shared-ci-heavy]
     timeout-minutes: 30
     env:
-      CROSS_CUSTOM_TOOLCHAIN: "1"
-      RUSTUP_AUTO_INSTALL: "0"
       RUSTUP_HOME: /opt/rustup
       RUSTUP_TOOLCHAIN: 1.96.0-x86_64-unknown-linux-gnu
       RUST_TOOLCHAIN_BIN: /opt/rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin
@@ -39,6 +37,8 @@ jobs:
           set -euo pipefail
           test -n "$CARGO_HOME"
           test -n "$CARGO_TARGET_DIR"
+          test "$CROSS_CUSTOM_TOOLCHAIN" = 1
+          test "$RUSTUP_AUTO_INSTALL" = 0
           test "$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" = "$RUST_RELEASE_TOOLCHAIN"
           rustc --version
           cargo --version
@@ -111,6 +111,8 @@ jobs:
             ~/.cargo/registry
             target
           key: scrcpy-macos-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            scrcpy-macos-
       - name: Build and package both macOS targets
         shell: bash
         run: |
@@ -147,6 +149,8 @@ jobs:
             ~/.cargo/registry
             target
           key: scrcpy-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            scrcpy-windows-
       - name: Build and package Windows
         shell: bash
         run: |
