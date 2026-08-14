@@ -2228,12 +2228,14 @@ async fn forward_control(
             i_frame_interval,
         } => {
             // Persist encoder prefs for the next scrcpy start. Do **not**
-            // emit `stream_restarted` or drop the live session: iOS and
-            // Android send `configure` the moment the control DC opens,
-            // and tearing WebRTC down there is the first-connect black
-            // screen (old iOS skipped configure and came up in one hop).
-            // Width / bitrate / GOP cannot be applied to a running
-            // `app_process`; they take effect on the next offer.
+            // emit `stream_restarted`, drop the live session, or
+            // `reset_video`: iOS and Android send `configure` the
+            // moment the control DC opens. Width / bitrate / GOP cannot
+            // be applied to a running `app_process` (they take effect
+            // on the next offer), so a live IDR here only drops the
+            // first frame that just became writable after ICE.
+            // Old mobile clients skipped configure and came up in one
+            // hop; keep that first-connect path.
             let changed = {
                 let mut cfg = scrcpy_cfg.write().await;
                 merge_scrcpy_configure(
@@ -2253,13 +2255,8 @@ async fn forward_control(
                 max_width = ?max_width,
                 bitrate = ?bitrate,
                 i_frame_interval = ?i_frame_interval,
-                "configure persisted for next scrcpy start — keeping live session"
+                "configure persisted for next scrcpy start — keeping live session and current GOP"
             );
-            if let Some(ctrl) = control {
-                if let Err(e) = ctrl.reset_video().await {
-                    warn!(error = %e, "scrcpy reset_video after configure");
-                }
-            }
             return Ok(());
         }
         ControlIn::CameraStart {
@@ -2749,9 +2746,8 @@ mod tests {
 
     #[test]
     fn configure_merge_gop_only_still_counts_as_change() {
-        // This is the mobile first-connect payload when width/bitrate
-        // already match production defaults — GOP 2 → 1 used to tear
-        // the peer down by itself.
+        // Mobile first-connect often only changes GOP. That must stay a
+        // persist-only merge — never a live encoder restart.
         let mut cfg = sample_scrcpy_cfg();
         assert!(merge_scrcpy_configure(&mut cfg, None, None, None, Some(1)));
         assert_eq!(cfg.i_frame_interval, 1);
