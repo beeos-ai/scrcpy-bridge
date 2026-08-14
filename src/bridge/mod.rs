@@ -1396,6 +1396,19 @@ fn should_request_post_connect_keyframe(keyframes_observed: u64) -> bool {
     keyframes_observed > 0
 }
 
+/// After `StreamReady` the first IDR is sent on the default RTP track.
+/// iOS then opens the `video` DataChannel and switches transport; that
+/// RTP IDR never reaches `AVSampleBufferDisplayLayer`. A transport
+/// switch onto DC must emit a fresh IDR (with prepended SPS/PPS) or
+/// the decoder stays black until the next GOP — and the client's
+/// `request_keyframe` is often throttled against the just-spent RTP IDR.
+fn should_reset_video_on_transport_switch(
+    previous: VideoTransport,
+    next: VideoTransport,
+) -> bool {
+    previous != next && next == VideoTransport::DataChannel
+}
+
 /// Pump peer events out to MQTT, back into scrcpy control (PLI → reset_video,
 /// DataChannel control messages → touches/keys/etc), and surface connection
 /// state changes to the observability layer.
@@ -2167,8 +2180,17 @@ async fn forward_control(
                 }
             };
             if let Some(m) = new_mode {
-                info!(mode = ?m, "set_video_transport applied");
+                let previous = peer.video_transport();
+                info!(mode = ?m, previous = ?previous, "set_video_transport applied");
                 peer.set_video_transport(m);
+                if should_reset_video_on_transport_switch(previous, m) {
+                    if let Some(ctrl) = control {
+                        info!("video transport switched to datachannel — requesting IDR");
+                        if let Err(e) = ctrl.reset_video().await {
+                            warn!(error = %e, "scrcpy reset_video after set_video_transport");
+                        }
+                    }
+                }
             }
             return Ok(());
         }
@@ -2746,6 +2768,30 @@ mod tests {
     #[test]
     fn keeps_natural_keyframe_when_it_has_not_arrived_yet() {
         assert!(!should_request_post_connect_keyframe(0));
+    }
+
+    #[test]
+    fn dc_switch_from_rtp_requests_idr() {
+        assert!(should_reset_video_on_transport_switch(
+            VideoTransport::Rtp,
+            VideoTransport::DataChannel,
+        ));
+    }
+
+    #[test]
+    fn dc_switch_is_noop_when_already_on_dc() {
+        assert!(!should_reset_video_on_transport_switch(
+            VideoTransport::DataChannel,
+            VideoTransport::DataChannel,
+        ));
+    }
+
+    #[test]
+    fn rtp_switch_does_not_request_idr() {
+        assert!(!should_reset_video_on_transport_switch(
+            VideoTransport::DataChannel,
+            VideoTransport::Rtp,
+        ));
     }
 
     #[test]
