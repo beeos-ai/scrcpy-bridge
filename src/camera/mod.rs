@@ -89,17 +89,18 @@ const CMR1_ABSTRACT_NAME: &[u8] = b"beeos_camera_cmr1";
 /// and the release matrix's Windows job was skipping the GHCR docker push
 /// (docker `needs: binaries` fails closed when any matrix cell fails).
 #[cfg(unix)]
-async fn connect_cmr1() -> std::io::Result<UnixStream> {
+async fn connect_cmr1(abstract_name: &[u8]) -> std::io::Result<UnixStream> {
     #[cfg(target_os = "linux")]
     {
         use std::os::linux::net::SocketAddrExt;
-        let addr = std::os::unix::net::SocketAddr::from_abstract_name(CMR1_ABSTRACT_NAME)?;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name)?;
         let std_stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
         std_stream.set_nonblocking(true)?;
         UnixStream::from_std(std_stream)
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = abstract_name;
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "abstract AF_UNIX sockets are Linux-only",
@@ -245,12 +246,20 @@ impl CameraSink {
     /// the transport moved to a fixed abstract AF_UNIX name to bypass
     /// ReDroid's ANDROID_PARANOID_NETWORK AF_INET restriction.
     pub fn spawn(_sink_addr: String) -> (Self, mpsc::Receiver<bool>) {
+        #[cfg(unix)]
+        let abstract_name: Arc<[u8]> = Arc::from(CMR1_ABSTRACT_NAME);
+        #[cfg(not(unix))]
+        let abstract_name: Arc<[u8]> = Arc::from(&[][..]);
+        Self::spawn_with_abstract_name(abstract_name)
+    }
+
+    fn spawn_with_abstract_name(abstract_name: Arc<[u8]>) -> (Self, mpsc::Receiver<bool>) {
         // Control channel is tiny (Start/Stop only). Frames go through the
         // live slot so a slow endpoint never builds multi-second latency.
         let (tx, rx) = mpsc::channel(16);
         let frames = Arc::new(LiveFrameSlot::new());
         let (evt_tx, evt_rx) = mpsc::channel(16);
-        tokio::spawn(run_sink(rx, frames.clone(), evt_tx));
+        tokio::spawn(run_sink(rx, frames.clone(), evt_tx, abstract_name));
         (Self { tx, frames }, evt_rx)
     }
 
@@ -301,6 +310,7 @@ async fn run_sink(
     mut rx: mpsc::Receiver<SinkMsg>,
     frames: Arc<LiveFrameSlot>,
     _evt_tx: mpsc::Sender<bool>,
+    _abstract_name: Arc<[u8]>,
 ) {
     loop {
         // Keep the live slot from growing while we only log Start events.
@@ -335,6 +345,7 @@ async fn run_sink(
     mut rx: mpsc::Receiver<SinkMsg>,
     frames: Arc<LiveFrameSlot>,
     evt_tx: mpsc::Sender<bool>,
+    abstract_name: Arc<[u8]>,
 ) {
     // The current session's capability, retained so a mid-session reconnect
     // can replay the `Config` handshake before resuming frames.
@@ -348,7 +359,7 @@ async fn run_sink(
             let mut backoff = BACKOFF_MIN;
             let mut attempts: u32 = 0;
             loop {
-                match connect_cmr1().await {
+                match connect_cmr1(&abstract_name).await {
                     Ok(s) => {
                         info!("camera uplink: connected (resident, AF_UNIX @beeos_camera_cmr1)");
                         break s;
@@ -556,9 +567,9 @@ mod tests {
     /// CamInUse surfacing on the event channel, and Stop-keepalive (a
     /// follow-up Config flows on the same still-open connection).
     ///
-    /// Linux-only: the sink hard-codes the abstract-namespace name (a Linux
-    /// extension), and the single fixed name means this test must run alone
-    /// (there is one endpoint per process). macOS dev builds skip it.
+    /// Linux-only: abstract-namespace sockets are a Linux extension. The test
+    /// uses a process-unique endpoint so unrelated parallel bridge tests cannot
+    /// connect to its listener. macOS dev builds skip it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn resident_connection_framing_reverse_and_stop_keepalive() {
@@ -566,12 +577,14 @@ mod tests {
         use tokio::io::AsyncReadExt;
         use tokio::net::UnixListener;
 
-        let addr = std::os::unix::net::SocketAddr::from_abstract_name(CMR1_ABSTRACT_NAME).unwrap();
+        let abstract_name = format!("beeos_camera_cmr1_test_{}", std::process::id()).into_bytes();
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&abstract_name).unwrap();
         let std_listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
         std_listener.set_nonblocking(true).unwrap();
         let listener = UnixListener::from_std(std_listener).unwrap();
 
-        let (sink, mut evt_rx) = CameraSink::spawn(String::new());
+        let (sink, mut evt_rx) =
+            CameraSink::spawn_with_abstract_name(Arc::from(abstract_name));
 
         // Sink connects at spawn — no session needed (resident).
         let (mut sock, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
