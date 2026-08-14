@@ -74,21 +74,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist-assets docker-binaries
+          mkdir -p release-output/dist-assets release-output/docker-binaries
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             archive="$(scripts/package-target.sh "$target")"
-            mv "$archive" "${archive}.sha256" dist-assets/
+            mv "$archive" "${archive}.sha256" release-output/dist-assets/
           done
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            install -Dm0755 "${CARGO_TARGET_DIR}/${target}/dist/scrcpy-bridge" "docker-binaries/${target}/scrcpy-bridge"
+            install -Dm0755 "${CARGO_TARGET_DIR}/${target}/dist/scrcpy-bridge" "release-output/docker-binaries/${target}/scrcpy-bridge"
           done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: github.event_name == 'push'
         with:
           name: scrcpy-linux-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            dist-assets/
-            docker-binaries/
+          path: release-output/
           if-no-files-found: error
           retention-days: 2
 
@@ -117,16 +115,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist-assets
+          mkdir -p release-output/dist-assets
           for target in x86_64-apple-darwin aarch64-apple-darwin; do
             cargo build --target "$target" --profile dist --locked
             archive="$(scripts/package-target.sh "$target")"
-            mv "$archive" "${archive}.sha256" dist-assets/
+            mv "$archive" "${archive}.sha256" release-output/dist-assets/
           done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scrcpy-macos-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist-assets/
+          path: release-output/
           if-no-files-found: error
           retention-days: 2
 
@@ -156,13 +154,13 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --target x86_64-pc-windows-msvc --profile dist --locked
-          mkdir -p dist-assets
+          mkdir -p release-output/dist-assets
           archive="$(scripts/package-target.sh x86_64-pc-windows-msvc)"
-          mv "$archive" "${archive}.sha256" dist-assets/
+          mv "$archive" "${archive}.sha256" release-output/dist-assets/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scrcpy-windows-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist-assets/
+          path: release-output/
           if-no-files-found: error
           retention-days: 2
 
