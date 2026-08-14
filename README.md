@@ -99,6 +99,15 @@ set `BEEOS_SCRCPY_BRIDGE_RELEASE_URL` to a base URL that serves the same
 `scrcpy-bridge-<target-triple>.{tar.gz,zip}` file names. `beeos device upgrade`
 force-refreshes the managed binary alongside the Python device-agent venv.
 
+Release tags run one shared Linux quality/build job, keep macOS and Windows
+artifacts on their native GitHub-hosted runners, publish a complete OCIR
+staging candidate, then wait for the protected `production` environment
+before promoting the exact digest. GitHub Releases remain draft until that
+promotion succeeds. Repository environments provide `OCIR_USERNAME`,
+`OCIR_AUTH_TOKEN`, and `BACKEND_RELEASE_TOKEN`; OCIR is authoritative and
+GHCR tags are digest-identical mirrors. AWS mirroring is a separate manual,
+default-disabled workflow and never rebuilds the image.
+
 ## Run
 
 ### Agent Gateway bootstrap + JWT auto-refresh (the only supported path)
