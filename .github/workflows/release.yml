@@ -262,6 +262,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.BACKEND_RELEASE_TOKEN }}
           DIGEST: ${{ steps.publish.outputs.digest }}
+          VERSION: ${{ steps.identity.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -273,7 +274,8 @@ jobs:
             -F "client_payload[runId]=$GITHUB_RUN_ID" \
             -F "client_payload[runAttempt]=$GITHUB_RUN_ATTEMPT" \
             -F "client_payload[commit]=$GITHUB_SHA" \
-            -F "client_payload[digest]=$DIGEST"
+            -F "client_payload[digest]=$DIGEST" \
+            -F "client_payload[version]=$VERSION"
 
   production:
     name: Promote exact image digest to production
@@ -356,6 +358,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.BACKEND_RELEASE_TOKEN }}
           DIGEST: ${{ needs.staging.outputs.digest }}
+          VERSION: ${{ needs.staging.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -367,4 +370,5 @@ jobs:
             -F "client_payload[runId]=$GITHUB_RUN_ID" \
             -F "client_payload[runAttempt]=$GITHUB_RUN_ATTEMPT" \
             -F "client_payload[commit]=$GITHUB_SHA" \
-            -F "client_payload[digest]=$DIGEST"
+            -F "client_payload[digest]=$DIGEST" \
+            -F "client_payload[version]=$VERSION"
