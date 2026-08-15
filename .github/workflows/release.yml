@@ -62,6 +62,17 @@ jobs:
           # stable toolchains into unrelated release blockers.
           "$RUST_TOOLCHAIN_BIN/cargo" clippy --all-targets --locked
           "$RUST_TOOLCHAIN_BIN/cargo" test --locked
+      # Anonymous GHCR pulls of ghcr.io/cross-rs/* 403 on this runner
+      # ("denied: denied"). A GITHUB_TOKEN login lifts the unauthenticated
+      # rate limit so `cross` can pull the target images.
+      - name: Authenticate to GHCR for cross-rs images
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Build four Linux targets with bounded concurrency
         if: github.event_name == 'push'
         shell: bash
