@@ -335,13 +335,12 @@ impl Bridge {
         //    session first cancels + joins the previous one, guaranteeing
         //    no zombie tasks ever touch a reborn scrcpy socket.
         //
-        //    The encoder config lives in its own Arc so the DataChannel
-        //    `configure` handler can persist knobs for the *next* scrcpy
-        //    start. A live session is never torn down for encoder prefs —
-        //    mobile used to send GOP=1 after the first DC open, and the
-        //    old G8 restart (`stream_restarted` + session.shutdown) made
-        //    every first connect rebuild WebRTC. Every `on_offer`
-        //    snapshots this Arc when spawning a new ScrcpyServer.
+        //    The encoder config lives in its own Arc so a future control-
+        //    plane profile push can update knobs for the *next* scrcpy
+        //    start without tearing the live peer. Viewer `configure` is
+        //    no longer authoritative (Stream Protocol v1). Every
+        //    `on_offer` snapshots this Arc when spawning a new
+        //    ScrcpyServer.
         let current_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
         let scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>> =
             Arc::new(RwLock::new(self.initial_scrcpy_config()));
@@ -364,13 +363,19 @@ impl Bridge {
                     cam_state.store(in_use, Ordering::Relaxed);
                     let guard = session_for_cam.lock().await;
                     if let Some(session) = guard.as_ref() {
-                        info!(in_use, "camera usage edge -> notifying viewer (camera_needed)");
+                        info!(
+                            in_use,
+                            "camera usage edge -> notifying viewer (camera_needed)"
+                        );
                         let _ = session
                             .peer
                             .send_control_text(datachannel::build_camera_needed(in_use))
                             .await;
                     } else {
-                        debug!(in_use, "camera usage edge with no viewer; will replay on connect");
+                        debug!(
+                            in_use,
+                            "camera usage edge with no viewer; will replay on connect"
+                        );
                     }
                 }
             });
@@ -546,10 +551,10 @@ impl Bridge {
         Ok(())
     }
 
-    /// Build the initial `ScrcpyServerConfig` from CLI flags. Once the bridge
-    /// is running, the DataChannel `configure` handler mutates a shared
-    /// `Arc<RwLock<ScrcpyServerConfig>>` so the next `on_offer` picks up
-    /// the new encoder knobs. The live session is not restarted.
+    /// Build the initial `ScrcpyServerConfig` from CLI flags. Stream
+    /// Protocol v1 treats those flags (and any later control-plane
+    /// write to the shared `Arc<RwLock<ScrcpyServerConfig>>`) as the
+    /// only encoder authority. Viewer `configure` messages are ignored.
     fn initial_scrcpy_config(&self) -> ScrcpyServerConfig {
         ScrcpyServerConfig {
             scrcpy_version: crate::SCRCPY_VERSION.to_string(),
@@ -1402,10 +1407,7 @@ fn should_request_post_connect_keyframe(keyframes_observed: u64) -> bool {
 /// switch onto DC must emit a fresh IDR (with prepended SPS/PPS) or
 /// the decoder stays black until the next GOP — and the client's
 /// `request_keyframe` is often throttled against the just-spent RTP IDR.
-fn should_reset_video_on_transport_switch(
-    previous: VideoTransport,
-    next: VideoTransport,
-) -> bool {
+fn should_reset_video_on_transport_switch(previous: VideoTransport, next: VideoTransport) -> bool {
     previous != next && next == VideoTransport::DataChannel
 }
 
@@ -2114,7 +2116,7 @@ fn merge_scrcpy_configure(
 async fn forward_control(
     text: &str,
     control: Option<&Arc<ControlSocket>>,
-    scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
+    _scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
     peer: &WebRtcPeer,
     _health: &HealthFlags,
     scroll_sensitivity: f32,
@@ -2227,35 +2229,19 @@ async fn forward_control(
             bitrate,
             i_frame_interval,
         } => {
-            // Persist encoder prefs for the next scrcpy start. Do **not**
-            // emit `stream_restarted`, drop the live session, or
-            // `reset_video`: iOS and Android send `configure` the
-            // moment the control DC opens. Width / bitrate / GOP cannot
-            // be applied to a running `app_process` (they take effect
-            // on the next offer), so a live IDR here only drops the
-            // first frame that just became writable after ICE.
-            // Old mobile clients skipped configure and came up in one
-            // hop; keep that first-connect path.
-            let changed = {
-                let mut cfg = scrcpy_cfg.write().await;
-                merge_scrcpy_configure(
-                    &mut cfg,
-                    *max_fps,
-                    *max_width,
-                    *bitrate,
-                    *i_frame_interval,
-                )
-            };
-            if !changed {
-                debug!("configure no-op (identical values)");
-                return Ok(());
-            }
+            // Stream Protocol v1: encoder knobs are server-owned
+            // (CLI/env / control plane). ≤1.3.32 viewers still send
+            // `configure` the moment the control DC opens; accepting
+            // the message keeps the wire compatible, but mutating
+            // `scrcpy_cfg` would let a frozen app override the next
+            // `app_process` profile. Do not persist, do not IDR, do
+            // not emit `stream_restarted`.
             info!(
                 max_fps = ?max_fps,
                 max_width = ?max_width,
                 bitrate = ?bitrate,
                 i_frame_interval = ?i_frame_interval,
-                "configure persisted for next scrcpy start — keeping live session and current GOP"
+                "ignoring viewer configure — encoder profile is server-owned"
             );
             return Ok(());
         }
@@ -2310,9 +2296,7 @@ async fn forward_control(
                         CAMERA_FRAMES_DROPPED
                             .with_label_values(&["waiting_idr"])
                             .inc();
-                        CAMERA_PLI_TOTAL
-                            .with_label_values(&["coalesce"])
-                            .inc();
+                        CAMERA_PLI_TOTAL.with_label_values(&["coalesce"]).inc();
                         let _ = peer_for_recovery.request_camera_keyframe().await;
                         continue;
                     }
@@ -2340,10 +2324,10 @@ async fn forward_control(
                                 waiting_for_idr = false;
                             } else {
                                 waiting_for_idr = true;
-                                CAMERA_PLI_TOTAL
-                                    .with_label_values(&["sink_coalesce"])
-                                    .inc();
-                                debug!("camera live-slot coalesced non-IDR; requesting recovery IDR");
+                                CAMERA_PLI_TOTAL.with_label_values(&["sink_coalesce"]).inc();
+                                debug!(
+                                    "camera live-slot coalesced non-IDR; requesting recovery IDR"
+                                );
                                 let _ = peer_for_recovery.request_camera_keyframe().await;
                             }
                         }
@@ -2386,7 +2370,10 @@ async fn forward_control(
     let Some(control) = control else {
         // Ping/stats already returned above. Touch/key/etc. need the
         // scrcpy control socket — log so "DC works but no inject" is visible.
-        warn!(kind, "control message dropped: scrcpy control socket not connected");
+        warn!(
+            kind,
+            "control message dropped: scrcpy control socket not connected"
+        );
         return Ok(());
     };
 

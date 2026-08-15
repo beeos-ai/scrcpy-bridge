@@ -1,0 +1,125 @@
+# BeeOS Stream Protocol v1
+
+Public contract for cloud-phone video, audio, and input. Aligns with
+IETF WebRTC (SDP, ICE, DTLS-SRTP, RTP, RTCP) plus a thin MQTT signaling
+channel and a versioned DataChannel for *input*, not encoder policy.
+
+This is the document external integrators should implement. Quality
+caps live on the server (CLI/env / stream-params / session plan).
+Viewers do **not** own bitrate, resolution, or GOP.
+
+## Layers
+
+```
+A. Control plane   GET .../stream-params
+B. Signaling       MQTT JSON: offer | answer | ice | close
+C. Media           RTP H.264 + Opus; SCTP DataChannel "control" for input
+```
+
+Unknown JSON keys and unknown DataChannel `type` values MUST be ignored
+on both sides (additive compatibility).
+
+## A. Stream params
+
+`GET /api/v1/instances/{id}/device/stream-params`  
+`GET /api/v1/instances/{id}/mobile/stream-params`
+
+Existing fields (required for a session):
+
+| Field | Meaning |
+|-------|---------|
+| `mqttUrl` / `mqttToken` / `deviceTopic` | Signaling credentials |
+| `iceServers` | Standard `RTCIceServer` list |
+| `expiresAt` | Token expiry (unix seconds) |
+| `viewUrl` | Optional dashboard URL |
+
+Additive (v1 viewers apply only the WebRTC-standard fields):
+
+| Field | Client action |
+|-------|----------------|
+| `iceTransportPolicy` | `RTCIceTransportPolicy` (`all` \| `relay`) |
+| `video.maxWidth` / `video.maxFps` / `video.maxBitrate` / `video.codec` | **Read-only echo** of the server-selected cap. Do not send `configure`. |
+| `videoTransport` | BeeOS iOS implementation detail (`rtp` default, `datachannel` fallback). Not part of the public media contract. |
+
+Optional query the last frozen client should send so the server can pick
+a profile forever without another app release:
+
+```
+?viewportWidth=390&viewportHeight=844&dpr=3
+```
+
+The viewer reports screen size only. It never reports a bitrate.
+
+## B. Signaling
+
+Topic prefix comes from `deviceTopic`. Payloads:
+
+```json
+{"type":"offer","sdp":"...","viewerId":"...","traceId":"..."}
+{"type":"answer","sdp":"..."}
+{"type":"ice","candidate":{}}
+{"type":"close","reason":"...","viewerId":"..."}
+```
+
+ICE restart is a new `offer` on the **same** `RTCPeerConnection` whose
+SDP changes `ice-ufrag` / `ice-pwd`. The boolean `iceRestart` field is
+not part of the contract; the bridge keys off DTLS fingerprint + ufrag.
+
+## C. Media
+
+Public offer MUST include:
+
+- `m=audio` recvonly Opus
+- `m=video` recvonly H.264 Constrained Baseline
+- `m=application` SCTP with a `control` DataChannel
+
+Keyframe recovery on the RTP path is **RTCP PLI** (RFC 4585). The
+bridge already maps PLI → scrcpy `ResetVideo`.
+
+Video over a binary DataChannel is an iOS-only workaround, not the
+external media contract.
+
+## D. DataChannel `control`
+
+### Viewer → bridge
+
+| `type` | Role |
+|--------|------|
+| `touch` / `scroll` / `key` / `text` / `back` / `home` | Input |
+| `camera_start` / `camera_stop` | Camera uplink |
+| `ping` / `stats` / `viewer_ready` | Diagnostics |
+
+`stats.packetsLost` may be signed; the bridge clamps to `≥ 0`.
+
+### Deprecated (accepted, not authoritative)
+
+| `type` | v1 behavior |
+|--------|-------------|
+| `configure` | Parsed and **ignored**. Encoder knobs are server-owned. |
+| `set_video_transport` | Internal iOS fallback only. |
+| `request_keyframe` | Internal DC-video path. RTP uses PLI. |
+
+### Bridge → viewer
+
+| `type` | v1 viewer behavior |
+|--------|--------------------|
+| `pong` / `device_info` / `camera_needed` / `camera_status` | Existing |
+| `viewer_kicked` | Stop; do not steal the session back |
+| `stream_restarted` | Flush the decoder and wait for the next IDR. **Do not** tear down the PeerConnection if ICE/SCTP are still up. |
+| unknown | Ignore |
+
+## Encoder authority
+
+`MAX_FPS`, `MAX_WIDTH`, `VIDEO_BITRATE`, and `I_FRAME_INTERVAL` (and
+the same values when injected by the control plane) are the only
+source of truth. They apply at the next `app_process` start.
+
+scrcpy 3.x cannot change width/bitrate/GOP on a live process. Mid-session
+the bridge can emit IDRs. Changing resolution later means restarting
+the encoder while keeping the WebRTC peer when possible.
+
+## What this protocol is not
+
+- Not a client-side recovery DSL (`session_policy`, grace timers, Retry UI).
+- Not a client-owned ABR ladder.
+- Not WHIP/WHEP yet (signaling remains MQTT). Media is still WebRTC.
