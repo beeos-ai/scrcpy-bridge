@@ -80,6 +80,23 @@ pub struct BootstrapResponse {
     /// accepted by EMQX.
     #[serde(rename = "expiresAt", default)]
     pub expires_at: i64,
+    /// Server-owned encoder cap (SKU ∩ last viewport). Absent on older
+    /// Runtimes; the sidecar then keeps CLI / ExtraEnv defaults.
+    #[serde(default)]
+    pub video: Option<VideoCap>,
+}
+
+/// Read-only `video` object from `DeviceStreamParams`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct VideoCap {
+    #[serde(default)]
+    pub codec: String,
+    #[serde(default, rename = "maxWidth")]
+    pub max_width: u32,
+    #[serde(default, rename = "maxFps")]
+    pub max_fps: u32,
+    #[serde(default, rename = "maxBitrate")]
+    pub max_bitrate: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -221,11 +238,7 @@ pub fn spawn_refresh_loop(
             match client.fetch().await {
                 Ok(fresh) => {
                     current_expiry = fresh.expires_at;
-                    if tx
-                        .send(BootstrapEvent::Refreshed(fresh))
-                        .await
-                        .is_err()
-                    {
+                    if tx.send(BootstrapEvent::Refreshed(fresh)).await.is_err() {
                         return; // bridge shutting down
                     }
                 }
@@ -286,10 +299,12 @@ fn load_signing_key(b64: &str) -> Result<SigningKey> {
     let seed_bytes = B64
         .decode(trimmed.as_bytes())
         .context("base64 decode ed25519 private key")?;
-    let seed: [u8; 32] = seed_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("ed25519 private key must be 32 bytes, got {}", seed_bytes.len()))?;
+    let seed: [u8; 32] = seed_bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "ed25519 private key must be 32 bytes, got {}",
+            seed_bytes.len()
+        )
+    })?;
     Ok(SigningKey::from_bytes(&seed))
 }
 
@@ -532,5 +547,28 @@ mod tests {
         f.write_all(json.as_bytes()).unwrap();
         let got = read_public_key_file(f.path()).await.unwrap();
         assert_eq!(got, pub_b64);
+    }
+
+    #[test]
+    fn bootstrap_response_decodes_video_cap() {
+        let raw = r#"{
+            "mqttUrl":"mqtts://broker:8883",
+            "mqttToken":"tok",
+            "deviceTopic":"devices/redroid-1",
+            "video":{"codec":"H264","maxWidth":720,"maxFps":30,"maxBitrate":2500000}
+        }"#;
+        let parsed: BootstrapResponse = serde_json::from_str(raw).unwrap();
+        let video = parsed.video.expect("video present");
+        assert_eq!(video.max_width, 720);
+        assert_eq!(video.max_bitrate, 2_500_000);
+        assert_eq!(video.max_fps, 30);
+        assert_eq!(video.codec, "H264");
+    }
+
+    #[test]
+    fn bootstrap_response_video_optional_for_old_runtime() {
+        let raw = r#"{"mqttUrl":"mqtts://broker:8883","mqttToken":"tok"}"#;
+        let parsed: BootstrapResponse = serde_json::from_str(raw).unwrap();
+        assert!(parsed.video.is_none());
     }
 }

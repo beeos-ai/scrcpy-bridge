@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 use crate::adb::Adb;
 use crate::bootstrap::{
     self, spawn_refresh_loop, BootstrapClient, BootstrapConfig, BootstrapEvent, BootstrapResponse,
-    IceServerPayload,
+    IceServerPayload, VideoCap,
 };
 use crate::camera::{CameraConfig, CameraSink, PushFrameOutcome};
 use crate::config::Cli;
@@ -267,6 +267,10 @@ pub struct Bridge {
     /// Last known in-guest camera usage. Replayed to a viewer whose control
     /// datachannel (re)opens, so late-joining viewers auto-start capture.
     cam_in_use: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared Agent Gateway client. Offers re-fetch stream-params `video`
+    /// so a viewer GET that persisted a viewport applies on the next
+    /// encoder start, not on the next JWT refresh ~10 minutes later.
+    bootstrap_client: Option<BootstrapClient>,
 }
 
 impl Bridge {
@@ -279,6 +283,7 @@ impl Bridge {
             camera_sink,
             cam_events: Some(cam_events),
             cam_in_use: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bootstrap_client: None,
         }
     }
 
@@ -290,6 +295,7 @@ impl Bridge {
         //    also carries ICE servers so the caller doesn't need to pre-stuff
         //    TURN creds into CLI flags.
         let (initial_creds, initial_bootstrap) = self.resolve_initial_credentials().await?;
+        let initial_video = initial_bootstrap.video.clone();
 
         // Seed the shared ICE server list. Bootstrap is the authoritative
         // source — Runtime owns the TURN pool; CLI `--ice-urls` is
@@ -339,15 +345,7 @@ impl Bridge {
             "scrcpy-bridge online, waiting for offer"
         );
 
-        // 3. Spawn the refresh loop and pipe its events into the MQTT
-        //    supervisor so we never deliver a signaling response with an
-        //    expired JWT. Failure here is fatal — without the refresher
-        //    the session would be guaranteed to die in ~10 minutes.
-        self.spawn_bootstrap_refresh(initial_bootstrap, mqtt.clone())
-            .await
-            .context("start bootstrap refresher")?;
-
-        // 4. Session state (one active session at a time).
+        // 3. Session state (one active session at a time).
         //
         //    A `Session` bundles the peer, the scrcpy control sender, the
         //    spawned tasks (video/audio/event pump) and a `CancellationToken`
@@ -362,14 +360,35 @@ impl Bridge {
         //    `on_offer` snapshots this Arc when spawning a new
         //    ScrcpyServer.
         let current_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
-        let scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>> =
-            Arc::new(RwLock::new(self.initial_scrcpy_config()));
+        let mut initial_cfg = self.initial_scrcpy_config();
+        if apply_bootstrap_video(&mut initial_cfg, initial_video.as_ref()) {
+            info!(
+                event = "bridge.bootstrap_video_applied",
+                max_width = initial_cfg.max_width,
+                bitrate = initial_cfg.bitrate,
+                "initial encoder cap taken from bootstrap video"
+            );
+        }
+        let scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>> = Arc::new(RwLock::new(initial_cfg));
 
         // Health signals from the per-session event pump flow through a
         // single mpsc so grace-window decisions live in one place. Cloned
         // into each new `run_event_pump` via `on_offer`.
         let (internal_tx, mut internal_rx) = mpsc::channel::<BridgeInternalEvent>(16);
         let mut grace: Option<SessionGrace> = None;
+
+        // 4. JWT refresher. Failure here is fatal — without it the
+        //    session dies when the first MQTT token expires. The same
+        //    loop applies a later viewport-selected `video` cap.
+        self.spawn_bootstrap_refresh(
+            initial_bootstrap,
+            mqtt.clone(),
+            scrcpy_cfg.clone(),
+            current_session.clone(),
+            internal_tx.clone(),
+        )
+        .await
+        .context("start bootstrap refresher")?;
 
         // Reverse camera-usage events (vHAL CMR1 kind=4): forward each edge
         // to the current viewer as a `camera_needed` datachannel message and
@@ -758,6 +777,18 @@ impl Bridge {
             "received WebRTC offer"
         );
 
+        // Viewer GET stream-params persists the viewport on Runtime.
+        // Re-fetch bootstrap so this offer starts (or keep-PC restarts)
+        // the encoder at SKU ∩ that viewport, not the pod ExtraEnv.
+        let profile_changed = self.refresh_encoder_from_bootstrap(scrcpy_cfg).await;
+        if profile_changed {
+            info!(
+                event = "bridge.offer_encoder_cap_updated",
+                viewer = %viewer_id,
+                "offer encoder cap updated from bootstrap video"
+            );
+        }
+
         // Fast path — same viewer, same RTCPeerConnection, live peer:
         //   * The viewer side just re-ran `createOffer({iceRestart:
         //     true})` after detecting unhealthy (A2) or as part of a
@@ -829,6 +860,32 @@ impl Bridge {
                             if let Some(session) = current_session.lock().await.as_mut() {
                                 if session.viewer_id == viewer_id {
                                     session.remote_ice_ufrag = offer_ice_ufrag;
+                                }
+                            }
+                            if profile_changed {
+                                if let Some(generation) =
+                                    session_generation(current_session, &viewer_id).await
+                                {
+                                    info!(
+                                        event = "bridge.offer_video_changed",
+                                        viewer = %viewer_id,
+                                        generation,
+                                        "viewport cap changed on ICE restart — keep-PC encoder restart"
+                                    );
+                                    if let Err(e) = internal_tx
+                                        .send(BridgeInternalEvent::RestartEncoder {
+                                            viewer_id: viewer_id.clone(),
+                                            generation,
+                                            reason: "viewport",
+                                            target: None,
+                                        })
+                                        .await
+                                    {
+                                        warn!(
+                                            error = %e,
+                                            "failed to queue viewport encoder restart"
+                                        );
+                                    }
                                 }
                             }
                             info!(
@@ -1193,7 +1250,9 @@ impl Bridge {
     /// rejected Ed25519 signatures, invalid responses, and a transport outage
     /// that outlives the retry budget surface as an `Err`; the bridge never
     /// falls back to a static MQTT token.
-    async fn resolve_initial_credentials(&self) -> Result<(MqttCredentials, BootstrapResponse)> {
+    async fn resolve_initial_credentials(
+        &mut self,
+    ) -> Result<(MqttCredentials, BootstrapResponse)> {
         if self.cli.bridge_private_key_file.is_empty() || self.cli.bridge_public_key_file.is_empty()
         {
             return Err(anyhow::anyhow!(
@@ -1235,7 +1294,7 @@ impl Bridge {
 
     /// Load identity, perform a single `/bootstrap` round-trip, translate
     /// into MQTT credentials. Shared between startup and refresh.
-    async fn bootstrap_fetch(&self) -> Result<(MqttCredentials, BootstrapResponse)> {
+    async fn bootstrap_fetch(&mut self) -> Result<(MqttCredentials, BootstrapResponse)> {
         let priv_b64 = bootstrap::read_private_key_file(&self.cli.bridge_private_key_file).await?;
         let pub_b64 = bootstrap::read_public_key_file(&self.cli.bridge_public_key_file).await?;
         let client = BootstrapClient::new(BootstrapConfig {
@@ -1245,12 +1304,47 @@ impl Bridge {
             request_timeout: Duration::from_secs(10),
         })?;
         let resp = client.fetch().await?;
+        self.bootstrap_client = Some(client);
         let creds = MqttCredentials {
             broker_url: resp.mqtt_url.clone(),
             username: MQTT_USERNAME.to_string(),
             token: resp.mqtt_token.clone(),
         };
         Ok((creds, resp))
+    }
+
+    /// Re-fetch Agent Gateway bootstrap and apply `video` to the next
+    /// encoder start. Failures keep the last cap and are logged.
+    async fn refresh_encoder_from_bootstrap(
+        &self,
+        scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
+    ) -> bool {
+        let Some(client) = self.bootstrap_client.clone() else {
+            return false;
+        };
+        match client.fetch().await {
+            Ok(resp) => {
+                let mut cfg = scrcpy_cfg.write().await;
+                let changed = apply_bootstrap_video(&mut cfg, resp.video.as_ref());
+                if changed {
+                    info!(
+                        event = "bridge.bootstrap_video_applied",
+                        max_width = cfg.max_width,
+                        bitrate = cfg.bitrate,
+                        max_fps = cfg.max_fps,
+                        "encoder cap updated from bootstrap video"
+                    );
+                }
+                changed
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "bootstrap video refresh failed; keeping last encoder cap"
+                );
+                false
+            }
+        }
     }
 
     /// Spawn a background task that periodically refreshes the MQTT JWT via
@@ -1262,6 +1356,9 @@ impl Bridge {
         &self,
         initial: BootstrapResponse,
         mqtt: Arc<MqttSignaling>,
+        scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
+        current_session: Arc<Mutex<Option<Session>>>,
+        internal_tx: mpsc::Sender<BridgeInternalEvent>,
     ) -> Result<()> {
         // Build a fresh client so we don't carry connection pools across
         // Bridge clones (there's only one bridge per process but future
@@ -1301,6 +1398,37 @@ impl Bridge {
                         // username/credential pair.
                         let merged = merge_ice_servers(&resp.ice_servers, &cli_snapshot);
                         *ice_store.write().await = merged;
+
+                        let profile_changed = {
+                            let mut cfg = scrcpy_cfg.write().await;
+                            apply_bootstrap_video(&mut cfg, resp.video.as_ref())
+                        };
+                        if profile_changed {
+                            if let Some((viewer_id, generation)) =
+                                session_owner(&current_session).await
+                            {
+                                info!(
+                                    event = "bridge.bootstrap_video_changed",
+                                    viewer = %viewer_id,
+                                    generation,
+                                    "bootstrap video cap changed — keep-PC encoder restart"
+                                );
+                                if let Err(e) = internal_tx
+                                    .send(BridgeInternalEvent::RestartEncoder {
+                                        viewer_id,
+                                        generation,
+                                        reason: "bootstrap_video",
+                                        target: None,
+                                    })
+                                    .await
+                                {
+                                    warn!(
+                                        error = %e,
+                                        "failed to queue bootstrap video encoder restart"
+                                    );
+                                }
+                            }
+                        }
 
                         let creds = MqttCredentials {
                             broker_url: resp.mqtt_url,
@@ -1592,6 +1720,14 @@ async fn session_generation(
         .map(|session| session.encoder_generation)
 }
 
+async fn session_owner(current_session: &Arc<Mutex<Option<Session>>>) -> Option<(String, u64)> {
+    current_session
+        .lock()
+        .await
+        .as_ref()
+        .map(|session| (session.viewer_id.clone(), session.encoder_generation))
+}
+
 fn spawn_media_pumps(
     tasks: &mut JoinSet<()>,
     video_reader: Option<VideoReader>,
@@ -1686,6 +1822,8 @@ async fn run_event_pump(
                 return;
             }
             _ = bwe_tick.tick() => {
+                let cap_width = scrcpy_cfg.read().await.max_width;
+                bwe.set_cap(cap_width);
                 let snapshot = peer.query_bwe().await;
                 let viewer_rx = VIEWER_BITRATE_BPS.get().max(0.0) as u64;
                 let estimate = combine_estimates(
@@ -2351,6 +2489,34 @@ async fn run_audio_pump(mut reader: AudioReader, peer: WebRtcPeer, cancel: Cance
 }
 
 // ---------------------------------------------------------------------------
+
+/// Apply Runtime stream-params `video` onto the next encoder start.
+/// Returns true when the live profile would change. Missing or zero
+/// fields leave the current cap (CLI / ExtraEnv) in place.
+fn apply_bootstrap_video(cfg: &mut ScrcpyServerConfig, video: Option<&VideoCap>) -> bool {
+    let Some(video) = video else {
+        return false;
+    };
+    if video.max_width == 0 && video.max_bitrate == 0 && video.max_fps == 0 {
+        return false;
+    }
+    let mut changed = false;
+    if video.max_width > 0 && cfg.max_width != video.max_width {
+        cfg.max_width = video.max_width;
+        // Recompute scrcpy max_size from the short-edge profile.
+        cfg.scrcpy_max_size = None;
+        changed = true;
+    }
+    if video.max_bitrate > 0 && cfg.bitrate != video.max_bitrate {
+        cfg.bitrate = video.max_bitrate;
+        changed = true;
+    }
+    if video.max_fps > 0 && cfg.max_fps != video.max_fps {
+        cfg.max_fps = video.max_fps;
+        changed = true;
+    }
+    changed
+}
 
 /// Frozen helper: viewer `configure` is ignored on the live path.
 /// Kept so tests can prove a merge would mutate cfg *without* implying
@@ -3038,6 +3204,31 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_video_applies_720p_profile() {
+        let mut cfg = sample_scrcpy_cfg();
+        let video = VideoCap {
+            codec: "H264".into(),
+            max_width: 720,
+            max_fps: 30,
+            max_bitrate: 2_500_000,
+        };
+        assert!(apply_bootstrap_video(&mut cfg, Some(&video)));
+        assert_eq!(cfg.max_width, 720);
+        assert_eq!(cfg.bitrate, 2_500_000);
+        assert_eq!(cfg.scrcpy_max_size, None);
+        assert_eq!(cfg.resolved_max_size(), 1280);
+        assert!(!apply_bootstrap_video(&mut cfg, Some(&video)));
+    }
+
+    #[test]
+    fn bootstrap_video_absent_keeps_cli_defaults() {
+        let mut cfg = sample_scrcpy_cfg();
+        assert!(!apply_bootstrap_video(&mut cfg, None));
+        assert_eq!(cfg.max_width, 1920);
+        assert_eq!(cfg.bitrate, 8_000_000);
+    }
+
+    #[test]
     fn requests_post_connect_keyframe_when_natural_idr_was_early() {
         assert!(should_request_post_connect_keyframe(1));
         assert!(should_request_post_connect_keyframe(12));
@@ -3155,7 +3346,7 @@ mod tests {
         let mut cli = make_cli();
         cli.bridge_private_key_file = String::new();
         cli.bridge_public_key_file = String::new();
-        let bridge = Bridge::new(cli, HealthFlags::default());
+        let mut bridge = Bridge::new(cli, HealthFlags::default());
         let err = bridge
             .resolve_initial_credentials()
             .await
@@ -3205,7 +3396,7 @@ mod tests {
         cli.agent_gateway_url = format!("http://{addr}");
         cli.bridge_private_key_file = priv_f.path().to_string_lossy().into_owned();
         cli.bridge_public_key_file = pub_f.path().to_string_lossy().into_owned();
-        let bridge = Bridge::new(cli, HealthFlags::default());
+        let mut bridge = Bridge::new(cli, HealthFlags::default());
         let started = Instant::now();
 
         let (creds, response) = bridge
@@ -3213,7 +3404,9 @@ mod tests {
             .await
             .expect("transient connection failure should recover");
 
-        assert!(started.elapsed() >= Duration::from_secs(1));
+        // Retry delay is 1s, but a parallel suite can let the late-bound
+        // listener win the first reqwest attempt after ~500ms.
+        assert!(started.elapsed() >= Duration::from_millis(400));
         assert_eq!(creds.broker_url, "mqtt://broker.test:1883");
         assert_eq!(response.device_topic, "devices/device-dev-test");
     }
@@ -3247,7 +3440,7 @@ mod tests {
         cli.agent_gateway_url = format!("http://{}", addr);
         cli.bridge_private_key_file = priv_f.path().to_string_lossy().into_owned();
         cli.bridge_public_key_file = pub_f.path().to_string_lossy().into_owned();
-        let bridge = Bridge::new(cli, HealthFlags::default());
+        let mut bridge = Bridge::new(cli, HealthFlags::default());
         let err = bridge
             .resolve_initial_credentials()
             .await

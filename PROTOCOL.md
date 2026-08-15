@@ -111,8 +111,11 @@ external media contract.
 ## Encoder authority
 
 `MAX_FPS`, `MAX_WIDTH`, `VIDEO_BITRATE`, and `I_FRAME_INTERVAL` (and
-the same values when injected by the control plane) are the only
-source of truth. They apply at the next `app_process` start.
+the same values when injected by the control plane) plus bootstrap
+`video.*` are the encoder authority. A later viewer viewport is
+persisted by Runtime and applied on the next `app_process` start
+(offer re-fetch, JWT refresh, or keep-PC restart). They apply at the
+next `app_process` start.
 
 `video.maxWidth` / `MAX_WIDTH` is the **short-edge** profile (`720` or
 `1080`). scrcpy 3.x `max_size` is the **longer** edge, so the sidecar
@@ -131,7 +134,8 @@ Sender BWE (TWCC on the outbound screen track + `get_stats`
 `availableOutgoingBitrate`, conservative-min'd with the viewer's reported
 receive bitrate) can downshift 1080 → 720 when the estimate stays under
 1.8 Mbps for 3 s. Upshift waits 10 s and never exceeds the SKU / viewport
-cap injected at session start. A restart is rate-limited to once per 8 s.
+cap from the latest bootstrap `video` (SKU ∩ persisted viewport). A
+restart is rate-limited to once per 8 s.
 
 ## What this protocol is not
 
