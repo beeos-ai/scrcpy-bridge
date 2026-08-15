@@ -134,6 +134,15 @@ impl BweController {
         LADDER[self.current_idx]
     }
 
+    /// Lower (or raise) the SKU / viewport ceiling. Clamps the live
+    /// rung so BWE cannot upshift past a newly persisted 720p cap.
+    pub fn set_cap(&mut self, cap_width: u32) {
+        self.cap_idx = rung_index_for_width(cap_width);
+        if self.current_idx > self.cap_idx {
+            self.current_idx = self.cap_idx;
+        }
+    }
+
     pub fn observe(&mut self, estimated_bps: Option<u64>, now: Instant) -> BweDecision {
         let Some(estimate) = estimated_bps.filter(|bps| *bps > 0) else {
             return BweDecision::Hold;
@@ -300,6 +309,18 @@ mod tests {
             BweDecision::Hold
         );
         assert_eq!(ctl.current_rung(), RUNG_720);
+    }
+
+    #[test]
+    fn set_cap_clamps_live_rung() {
+        let start = t0();
+        let mut ctl = BweController::new(1080, 1080, start);
+        ctl.set_cap(720);
+        assert_eq!(ctl.current_rung(), RUNG_720);
+        assert_eq!(
+            ctl.observe(Some(8_000_000), start + Duration::from_secs(30)),
+            BweDecision::Hold
+        );
     }
 
     #[test]
