@@ -48,9 +48,17 @@ pub struct Cli {
     #[arg(long, env = "MAX_FPS", default_value_t = 30)]
     pub max_fps: u32,
 
-    /// Max frame width passed to scrcpy-server (auto aspect).
+    /// Stream Protocol short-edge profile (`720` or `1080`). scrcpy
+    /// `max_size` is the long edge: 720 → 1280, 1080 → 1920. Passing
+    /// 720 here as scrcpy `max_size` downscales a 720×1280 display to
+    /// 408×720.
     #[arg(long, env = "MAX_WIDTH", default_value_t = 1920)]
     pub max_width: u32,
+
+    /// Optional explicit scrcpy `max_size` (longer encoded edge).
+    /// Overrides the 720→1280 / 1080→1920 profile mapping.
+    #[arg(long, env = "SCRCPY_MAX_SIZE")]
+    pub scrcpy_max_size: Option<u32>,
 
     /// Encode bitrate in bits/second.
     #[arg(long, env = "VIDEO_BITRATE", default_value_t = 8_000_000)]
