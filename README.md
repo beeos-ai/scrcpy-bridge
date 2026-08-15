@@ -5,6 +5,9 @@ H.264 stream to a browser via WebRTC — with **zero decode/re-encode**. Sidecar
 for the Python `device-agent`; the two processes are independent and share only
 the host's ADB daemon.
 
+The viewer/sidecar wire contract (signaling, RTP, DataChannel input,
+server-owned encoder knobs) is documented in [`PROTOCOL.md`](PROTOCOL.md).
+
 ## Why
 
 The original Python `device-agent` did H.264 decode → raw frame → re-encode for

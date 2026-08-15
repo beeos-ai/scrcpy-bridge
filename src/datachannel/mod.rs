@@ -11,16 +11,20 @@
 //! - `text`     — `content`
 //! - `back`     (no payload) / `home` (no payload)
 //! - `configure` — `maxFps?`, `maxWidth?`, `bitrate?`, `iFrameInterval?`.
-//!   Persisted for the next scrcpy start; the live WebRTC session is kept.
+//!   Accepted for wire compatibility with ≤1.3.32 viewers. **Not
+//!   authoritative**: Stream Protocol v1 encoder knobs come from
+//!   CLI/env / the control plane (see `PROTOCOL.md`).
 //! - `ping`     — `ts` (ms). Device replies with `pong` mirroring `ts`.
 //! - `stats`    — periodic client-side WebRTC stats (fps, rtt, bitrate, …).
 //!                Consumed by the bridge for Prometheus metrics.
+//!                `packetsLost` is clamped to `≥ 0` (iOS can report a
+//!                signed delta).
 //!
 //! ### Device → browser (outgoing, see [`build_*`] helpers)
 //! - `pong`            — `ts: <mirror>` replying to a `ping`.
-//! - `stream_restarted` — emitted when scrcpy pipeline was rebuilt; triggers
-//!                        a fresh session on the browser (see `webrtc-client.ts`
-//!                        `reconnectForStreamRestart`).
+//! - `stream_restarted` — scrcpy encoder was rebuilt. v1 viewers flush the
+//!                        decoder and wait for the next IDR; they must not
+//!                        tear down a still-live PeerConnection.
 //! - `viewer_kicked`    — sent to a *previous* viewer right before we replace
 //!                        them with a new offer.
 //! - `device_info`      — optional metadata (resolution, codec profile) to
@@ -30,6 +34,32 @@
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
+
+/// Accept signed or unsigned `packetsLost`. iOS WebRTC stats have been
+/// observed sending a negative delta; treating the field as `u64` used
+/// to fail the whole `stats` message every two seconds.
+fn deserialize_packets_lost<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(0),
+        serde_json::Value::Number(n) => {
+            if let Some(unsigned) = n.as_u64() {
+                return Ok(unsigned);
+            }
+            if let Some(signed) = n.as_i64() {
+                return Ok(signed.max(0) as u64);
+            }
+            if let Some(float) = n.as_f64() {
+                return Ok(float.max(0.0) as u64);
+            }
+            Ok(0)
+        }
+        _ => Ok(0),
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -100,7 +130,11 @@ pub enum ControlIn {
         fps: f64,
         #[serde(default, rename = "bitrate")]
         bitrate_bps: f64,
-        #[serde(default, rename = "packetsLost")]
+        #[serde(
+            default,
+            rename = "packetsLost",
+            deserialize_with = "deserialize_packets_lost"
+        )]
         packets_lost: u64,
         #[serde(default, rename = "roundTripTime")]
         round_trip_time: f64,
@@ -276,7 +310,14 @@ mod tests {
     fn parse_touch() {
         let j = br#"{"type":"touch","action":"down","x":10,"y":20,"pointerId":0,"pressure":0.5,"screenWidth":1080,"screenHeight":1920}"#;
         match parse(j).unwrap() {
-            ControlIn::Touch { action, x, y, screen_width, screen_height, .. } => {
+            ControlIn::Touch {
+                action,
+                x,
+                y,
+                screen_width,
+                screen_height,
+                ..
+            } => {
                 assert_eq!(action, "down");
                 assert_eq!(x, 10);
                 assert_eq!(y, 20);
@@ -289,8 +330,14 @@ mod tests {
 
     #[test]
     fn parse_key_back_home() {
-        assert!(matches!(parse(br#"{"type":"back"}"#).unwrap(), ControlIn::Back));
-        assert!(matches!(parse(br#"{"type":"home"}"#).unwrap(), ControlIn::Home));
+        assert!(matches!(
+            parse(br#"{"type":"back"}"#).unwrap(),
+            ControlIn::Back
+        ));
+        assert!(matches!(
+            parse(br#"{"type":"home"}"#).unwrap(),
+            ControlIn::Home
+        ));
     }
 
     #[test]
@@ -344,6 +391,14 @@ mod tests {
                 assert_eq!(packets_lost, 2);
                 assert!((round_trip_time - 0.05).abs() < 0.001);
             }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_stats_clamps_negative_packets_lost() {
+        match parse(br#"{"type":"stats","packetsLost":-13}"#).unwrap() {
+            ControlIn::Stats { packets_lost, .. } => assert_eq!(packets_lost, 0),
             other => panic!("expected Stats, got {other:?}"),
         }
     }
