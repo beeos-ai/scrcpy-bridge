@@ -25,11 +25,13 @@
 
 pub mod audio;
 pub mod control;
+pub mod max_size;
 pub mod protocol;
 pub mod server;
 pub mod video;
 
 pub use audio::{AudioPacket, AudioReader};
 pub use control::ControlSocket;
+pub use max_size::scrcpy_max_size;
 pub use server::{ScrcpyServer, ScrcpyServerConfig, ScrcpySessionParts, ScrcpyShutdown};
 pub use video::{VideoFrame, VideoReader};

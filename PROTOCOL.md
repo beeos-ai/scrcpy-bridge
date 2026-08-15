@@ -114,6 +114,12 @@ external media contract.
 the same values when injected by the control plane) are the only
 source of truth. They apply at the next `app_process` start.
 
+`video.maxWidth` / `MAX_WIDTH` is the **short-edge** profile (`720` or
+`1080`). scrcpy 3.x `max_size` is the **longer** edge, so the sidecar
+maps `720 → max_size=1280` and `1080 → max_size=1920`. A 720×1280
+portrait framebuffer must encode as 720×1280, not 408×720. Override
+with `SCRCPY_MAX_SIZE` only when the long edge is not 16:9.
+
 scrcpy 3.x cannot change width/bitrate/GOP on a live process. Mid-session
 the bridge can emit IDRs. Changing resolution later means restarting
 the encoder while keeping the WebRTC peer when possible. There is no

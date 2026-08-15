@@ -29,7 +29,11 @@ pub struct ScrcpyServerConfig {
     pub scrcpy_version: String,
     pub remote_jar_path: String,
     pub max_fps: u32,
+    /// Stream Protocol short-edge profile (`MAX_WIDTH` 720 / 1080).
     pub max_width: u32,
+    /// Optional explicit scrcpy `max_size` (long edge). When unset,
+    /// [`super::scrcpy_max_size`] maps `max_width`.
+    pub scrcpy_max_size: Option<u32>,
     pub bitrate: u32,
     pub i_frame_interval: u32,
     pub audio: bool,
@@ -39,6 +43,16 @@ pub struct ScrcpyServerConfig {
     pub override_jar: Option<PathBuf>,
 }
 
+impl ScrcpyServerConfig {
+    /// scrcpy `max_size` long-edge cap for this profile.
+    pub fn resolved_max_size(&self) -> u32 {
+        match self.scrcpy_max_size {
+            Some(v) if v > 0 => v,
+            _ => super::scrcpy_max_size(self.max_width),
+        }
+    }
+}
+
 impl Default for ScrcpyServerConfig {
     fn default() -> Self {
         Self {
@@ -46,6 +60,7 @@ impl Default for ScrcpyServerConfig {
             remote_jar_path: "/data/local/tmp/scrcpy-server.jar".to_string(),
             max_fps: 30,
             max_width: 1920,
+            scrcpy_max_size: None,
             bitrate: 8_000_000,
             i_frame_interval: 2,
             audio: true,
@@ -178,7 +193,7 @@ impl ScrcpyServer {
             c.scrcpy_version.clone(),
             "video_codec=h264".to_string(),
             format!("max_fps={}", c.max_fps),
-            format!("max_size={}", c.max_width),
+            format!("max_size={}", c.resolved_max_size()),
             format!("video_bit_rate={}", c.bitrate),
             format!(
                 "video_codec_options=i-frame-interval={}",

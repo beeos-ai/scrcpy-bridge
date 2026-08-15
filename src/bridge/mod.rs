@@ -560,6 +560,7 @@ impl Bridge {
             scrcpy_version: crate::SCRCPY_VERSION.to_string(),
             max_fps: self.cli.max_fps,
             max_width: self.cli.max_width,
+            scrcpy_max_size: self.cli.scrcpy_max_size,
             bitrate: self.cli.bitrate,
             i_frame_interval: self.cli.i_frame_interval,
             audio: !self.cli.disable_audio,
@@ -821,6 +822,7 @@ impl Bridge {
             trace_id = %trace_id,
             bitrate = cfg_snapshot.bitrate,
             max_width = cfg_snapshot.max_width,
+            max_size = cfg_snapshot.resolved_max_size(),
             max_fps = cfg_snapshot.max_fps,
             "starting scrcpy server"
         );
@@ -2819,6 +2821,7 @@ mod tests {
             adb_port: 5037,
             max_fps: 30,
             max_width: 1920,
+            scrcpy_max_size: None,
             bitrate: 4_000_000,
             i_frame_interval: 2,
             disable_audio: true,
