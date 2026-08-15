@@ -116,7 +116,8 @@ source of truth. They apply at the next `app_process` start.
 
 scrcpy 3.x cannot change width/bitrate/GOP on a live process. Mid-session
 the bridge can emit IDRs. Changing resolution later means restarting
-the encoder while keeping the WebRTC peer when possible.
+the encoder while keeping the WebRTC peer when possible. There is no
+MediaCodec `setParameters` path in stock 3.1.
 
 ## What this protocol is not
 
