@@ -121,9 +121,17 @@ portrait framebuffer must encode as 720×1280, not 408×720. Override
 with `SCRCPY_MAX_SIZE` only when the long edge is not 16:9.
 
 scrcpy 3.x cannot change width/bitrate/GOP on a live process. Mid-session
-the bridge can emit IDRs. Changing resolution later means restarting
-the encoder while keeping the WebRTC peer when possible. There is no
-MediaCodec `setParameters` path in stock 3.1.
+the bridge can emit IDRs. Changing resolution or bitrate later **restarts
+the encoder and keeps the WebRTC PeerConnection**. The viewer flushes its
+decoder on `stream_restarted` and waits for the next SPS/PPS + IDR. There
+is a brief black frame; there is no MediaCodec `setParameters` path in
+stock 3.1.
+
+Sender BWE (TWCC on the outbound screen track + `get_stats`
+`availableOutgoingBitrate`, conservative-min'd with the viewer's reported
+receive bitrate) can downshift 1080 → 720 when the estimate stays under
+1.8 Mbps for 3 s. Upshift waits 10 s and never exceeds the SKU / viewport
+cap injected at session start. A restart is rate-limited to once per 8 s.
 
 ## What this protocol is not
 
