@@ -23,7 +23,10 @@ pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
 pub static VIDEO_FRAMES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
-        prometheus::Opts::new("scrcpy_bridge_video_frames_total", "H.264 frames forwarded to WebRTC"),
+        prometheus::Opts::new(
+            "scrcpy_bridge_video_frames_total",
+            "H.264 frames forwarded to WebRTC",
+        ),
         &["kind"],
     )
     .unwrap();
@@ -254,6 +257,31 @@ pub static SCRCPY_RECONNECTS_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| 
     c
 });
 
+/// Encoder-only restarts that keep the WebRTC PeerConnection (BWE
+/// downshift, keyframe-stuck recovery, unexpected video EOF).
+pub static ENCODER_RESTARTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        prometheus::Opts::new(
+            "scrcpy_bridge_encoder_restarts_total",
+            "scrcpy encoder restarts that kept the WebRTC PeerConnection",
+        ),
+        &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+pub static BWE_ESTIMATE_BPS: Lazy<prometheus::Gauge> = Lazy::new(|| {
+    let g = prometheus::Gauge::new(
+        "scrcpy_bridge_bwe_estimate_bps",
+        "Conservative sender BWE estimate used for encoder ladder shifts",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
 /// Cumulative count of RTCP PLI (Picture Loss Indication) / FIR messages
 /// received from the browser. Incremented in the bridge event pump on
 /// `PeerEvent::KeyframeRequested`.
@@ -378,7 +406,9 @@ pub async fn serve(addr: SocketAddr, health: HealthFlags) -> Result<()> {
                 let health = health.clone();
                 async move { Ok::<_, std::convert::Infallible>(route(req, health).await) }
             });
-            let _ = HttpBuilder::new(TokioExecutor::new()).serve_connection(io, svc).await;
+            let _ = HttpBuilder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
         });
     }
 }
@@ -389,8 +419,12 @@ async fn route(req: Request<Incoming>, health: HealthFlags) -> Response<Full<Byt
     }
     match req.uri().path() {
         "/healthz" => {
-            let mqtt = health.mqtt_connected.load(std::sync::atomic::Ordering::Relaxed);
-            let scrcpy = health.scrcpy_running.load(std::sync::atomic::Ordering::Relaxed);
+            let mqtt = health
+                .mqtt_connected
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let scrcpy = health
+                .scrcpy_running
+                .load(std::sync::atomic::Ordering::Relaxed);
             let ok = mqtt && scrcpy;
             let body = serde_json::json!({
                 "ok": ok,
@@ -399,7 +433,11 @@ async fn route(req: Request<Incoming>, health: HealthFlags) -> Response<Full<Byt
             })
             .to_string();
             Response::builder()
-                .status(if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE })
+                .status(if ok {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                })
                 .header("content-type", "application/json")
                 .body(Full::new(Bytes::from(body)))
                 .unwrap()

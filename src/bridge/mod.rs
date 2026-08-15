@@ -9,8 +9,12 @@
 //!      socket (no IPC, no Python involved).
 //!   6. When the viewer disconnects, keep scrcpy running for a grace period
 //!      so a page refresh can reconnect without losing the encoder.
+//!   7. BWE / recovery restarts only the encoder (`app_process`) and keeps
+//!      the WebRTC PeerConnection. Viewers flush on `stream_restarted`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+mod bwe;
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,12 +37,12 @@ use crate::mqtt::{
     MqttCredentials, MqttSignaling, MqttSignalingConfig, SignalRequest, SignalResponse,
 };
 use crate::observability::{
-    HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, CAMERA_FRAMES_DROPPED,
-    CAMERA_FRAMES_TOTAL, CAMERA_PLI_TOTAL, CONTROL_MESSAGES_TOTAL, ICE_DISCONNECTS_TOTAL,
-    ICE_RECOVERIES_TOTAL, ICE_RECOVERY_SECONDS, PLI_COUNT_TOTAL, POST_CONNECT_KEYFRAMES_TOTAL,
-    SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED, VIDEO_FRAMES_TOTAL,
-    VIEWER_BITRATE_BPS, VIEWER_CONNECTED, VIEWER_FIRST_FRAME_SECONDS, VIEWER_FPS,
-    VIEWER_PACKETS_LOST, VIEWER_RTT_MS,
+    HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, BWE_ESTIMATE_BPS,
+    CAMERA_FRAMES_DROPPED, CAMERA_FRAMES_TOTAL, CAMERA_PLI_TOTAL, CONTROL_MESSAGES_TOTAL,
+    ENCODER_RESTARTS_TOTAL, ICE_DISCONNECTS_TOTAL, ICE_RECOVERIES_TOTAL, ICE_RECOVERY_SECONDS,
+    PLI_COUNT_TOTAL, POST_CONNECT_KEYFRAMES_TOTAL, SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING,
+    VIDEO_FRAMES_DROPPED, VIDEO_FRAMES_TOTAL, VIEWER_BITRATE_BPS, VIEWER_CONNECTED,
+    VIEWER_FIRST_FRAME_SECONDS, VIEWER_FPS, VIEWER_PACKETS_LOST, VIEWER_RTT_MS,
 };
 use crate::scrcpy::protocol::{KeyAction, TouchAction};
 use crate::scrcpy::{
@@ -48,6 +52,13 @@ use crate::scrcpy::{
 use crate::webrtc::{
     CameraFrame, IceServer, NegotiationKind, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer,
 };
+
+use self::bwe::{
+    combine_estimates, encoder_restart_kind, video_eof_action, BweController, BweDecision,
+    EncoderEofAction, EncoderRestartKind, EncoderRung,
+};
+
+type ControlSlot = Arc<RwLock<Option<Arc<ControlSocket>>>>;
 
 /// MQTT username expected by the EMQX JWT auth plugin. All device-scoped
 /// connections log in as `device`; the JWT payload carries the true identity.
@@ -108,6 +119,15 @@ enum BridgeInternalEvent {
     /// accidentally shut down a freshly installed session belonging
     /// to someone else.
     ClearGraceFor { viewer_id: String },
+    /// Restart scrcpy (`app_process`) without closing the WebRTC peer.
+    /// `generation` must still match `Session.encoder_generation` or the
+    /// event is ignored (stale pump / overlapping BWE).
+    RestartEncoder {
+        viewer_id: String,
+        generation: u64,
+        reason: &'static str,
+        target: Option<EncoderRung>,
+    },
 }
 
 /// Grace-window state held locally by `Bridge::run`. Never shared
@@ -467,6 +487,56 @@ impl Bridge {
                                 grace = None;
                             }
                         }
+                        BridgeInternalEvent::RestartEncoder {
+                            viewer_id,
+                            generation,
+                            reason,
+                            target,
+                        } => {
+                            let mut guard = current_session.lock().await;
+                            let should_run = guard.as_ref().is_some_and(|session| {
+                                session.viewer_id == viewer_id
+                                    && session.encoder_generation == generation
+                                    && !session.restarting_encoder.load(Ordering::Acquire)
+                            });
+                            if !should_run {
+                                debug!(
+                                    viewer = %viewer_id,
+                                    generation,
+                                    reason,
+                                    "stale encoder restart ignored"
+                                );
+                                continue;
+                            }
+                            let Some(session) = guard.as_mut() else { continue };
+                            match self
+                                .restart_encoder(
+                                    session,
+                                    &scrcpy_cfg,
+                                    &current_session,
+                                    &internal_tx,
+                                    reason,
+                                    target,
+                                )
+                                .await
+                            {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    error!(
+                                        error = format!("{:#}", e),
+                                        viewer = %viewer_id,
+                                        reason,
+                                        "keep-PC encoder restart failed — tearing down session"
+                                    );
+                                    if let Some(session) = guard.take() {
+                                        drop(guard);
+                                        session.shutdown().await;
+                                        self.health.scrcpy_running.store(false, Ordering::Relaxed);
+                                        SCRCPY_RUNNING.set(0);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -568,6 +638,97 @@ impl Bridge {
             override_jar: self.cli.scrcpy_server_jar.clone(),
             remote_jar_path: self.cli.remote_jar_path.clone(),
         }
+    }
+
+    /// Restart `app_process` with the current (or BWE-selected) profile
+    /// and rebind media pumps onto the existing `WebRtcPeer`. Never
+    /// called from `Session::shutdown` — that path still closes the PC.
+    async fn restart_encoder(
+        &self,
+        session: &mut Session,
+        scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
+        current_session: &Arc<Mutex<Option<Session>>>,
+        internal_tx: &mpsc::Sender<BridgeInternalEvent>,
+        reason: &'static str,
+        target: Option<EncoderRung>,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            encoder_restart_kind(),
+            EncoderRestartKind::KeepPeerConnection
+        );
+        session.restarting_encoder.store(true, Ordering::Release);
+        session.encoder_generation = session.encoder_generation.wrapping_add(1);
+        let generation = session.encoder_generation;
+        session.encoder_cancel.cancel();
+
+        info!(
+            event = "bridge.encoder_restart_begin",
+            viewer = %session.viewer_id,
+            generation,
+            reason,
+            target_width = target.map(|r| r.max_width),
+            target_bitrate = target.map(|r| r.bitrate),
+            "restarting scrcpy encoder — PeerConnection kept"
+        );
+
+        session.shutdown.shutdown().await;
+
+        if let Some(rung) = target {
+            let mut cfg = scrcpy_cfg.write().await;
+            rung.apply(&mut cfg);
+        }
+        let cfg_snapshot = scrcpy_cfg.read().await.clone();
+        let mut server = ScrcpyServer::new(session.adb.clone(), cfg_snapshot.clone());
+        server.start().await.context("restart scrcpy encoder")?;
+        let parts = server.split();
+        session.shutdown = parts.shutdown;
+        *session.control.write().await = parts.control;
+        session.encoder_cancel = session.cancel.child_token();
+        session.keyframes_observed.store(0, Ordering::Relaxed);
+
+        spawn_media_pumps(
+            &mut session.tasks,
+            parts.video,
+            parts.audio,
+            session.peer.clone(),
+            session.encoder_cancel.clone(),
+            current_session.clone(),
+            session.viewer_id.clone(),
+            internal_tx.clone(),
+            session.keyframes_observed.clone(),
+            generation,
+            session.restarting_encoder.clone(),
+        );
+
+        if let Err(e) = session
+            .peer
+            .send_control_text(datachannel::build_stream_restarted())
+            .await
+        {
+            warn!(error = %e, "stream_restarted after encoder restart");
+        }
+        if let Some(ctrl) = session.control.read().await.clone() {
+            if let Err(e) = ctrl.reset_video().await {
+                warn!(error = %e, "reset_video after encoder restart");
+            }
+        }
+
+        session.restarting_encoder.store(false, Ordering::Release);
+        self.health.scrcpy_running.store(true, Ordering::Relaxed);
+        SCRCPY_RUNNING.set(1);
+        SCRCPY_RECONNECTS_TOTAL.inc();
+        ENCODER_RESTARTS_TOTAL.with_label_values(&[reason]).inc();
+        info!(
+            event = "bridge.encoder_restart_end",
+            viewer = %session.viewer_id,
+            generation,
+            reason,
+            max_width = cfg_snapshot.max_width,
+            max_size = cfg_snapshot.resolved_max_size(),
+            bitrate = cfg_snapshot.bitrate,
+            "encoder restart complete — PC still up"
+        );
+        Ok(())
     }
 
     async fn on_offer(
@@ -842,7 +1003,7 @@ impl Bridge {
         let parts = server.split();
         let video_reader = parts.video;
         let audio_reader = parts.audio;
-        let control_sender = parts.control;
+        let control_slot: ControlSlot = Arc::new(RwLock::new(parts.control));
         let mut shutdown = parts.shutdown;
 
         // 2. Spawn WebRTC peer.
@@ -886,6 +1047,7 @@ impl Bridge {
 
         // 3. Per-session plumbing.
         let cancel = CancellationToken::new();
+        let encoder_cancel = cancel.child_token();
         let mut tasks: JoinSet<()> = JoinSet::new();
 
         // Shared count of IDR keyframes the video pump has actually shipped
@@ -894,12 +1056,19 @@ impl Bridge {
         // silently-wedged scrcpy capture), driving the keyframe-recovery
         // escalation in `run_event_pump`.
         let keyframes_observed = Arc::new(AtomicU64::new(0));
+        let restarting_encoder = Arc::new(AtomicBool::new(false));
+        let encoder_generation = 1_u64;
+        let adb_for_session = Adb {
+            serial: self.cli.adb_serial.clone(),
+            host: self.cli.adb_host.clone(),
+            port: self.cli.adb_port,
+        };
 
         // 3a. Event pump: peer -> MQTT + control forwarding + PLI handling.
         {
             let peer_for_evt = peer.clone();
             let mqtt_evt = mqtt.clone();
-            let control_for_evt = control_sender.clone();
+            let control_for_evt = control_slot.clone();
             let scrcpy_cfg_for_evt = scrcpy_cfg.clone();
             let health = self.health.clone();
             let session_flag_for_evt = current_session.clone();
@@ -936,43 +1105,19 @@ impl Bridge {
             });
         }
 
-        // 3b. Video pump: scrcpy VideoReader -> peer RTP.
-        if let Some(reader) = video_reader {
-            let peer_for_video = peer.clone();
-            let cancel_for_video = cancel.clone();
-            let session_flag_for_video = current_session.clone();
-            let viewer_for_video = viewer_id.clone();
-            let internal_tx_for_video = internal_tx.clone();
-            let keyframes_for_video = keyframes_observed.clone();
-            tasks.spawn(async move {
-                run_video_pump(
-                    reader,
-                    peer_for_video,
-                    cancel_for_video,
-                    session_flag_for_video,
-                    viewer_for_video,
-                    internal_tx_for_video,
-                    keyframes_for_video,
-                )
-                .await;
-            });
-        } else {
-            warn!("scrcpy video socket was not open — session starts without video");
-        }
-
-        // 3c. Audio pump: scrcpy AudioReader -> peer RTP.
-        if let Some(reader) = audio_reader {
-            let peer_for_audio = peer.clone();
-            let cancel_for_audio = cancel.clone();
-            tasks.spawn(async move {
-                run_audio_pump(reader, peer_for_audio, cancel_for_audio).await;
-            });
-        }
-
-        // Suppress the unused-binding lint: control_sender lives only via
-        // the `Arc` clone captured by the event pump; when that task exits
-        // (on `cancel`), the last clone drops and the drainer aborts.
-        drop(control_sender);
+        spawn_media_pumps(
+            &mut tasks,
+            video_reader,
+            audio_reader,
+            peer.clone(),
+            encoder_cancel.clone(),
+            current_session.clone(),
+            viewer_id.clone(),
+            internal_tx.clone(),
+            keyframes_observed.clone(),
+            encoder_generation,
+            restarting_encoder.clone(),
+        );
 
         *current_session.lock().await = Some(Session {
             viewer_id,
@@ -980,8 +1125,14 @@ impl Bridge {
             remote_ice_ufrag: offer_ice_ufrag,
             peer,
             cancel,
+            encoder_cancel,
             tasks,
             shutdown,
+            adb: adb_for_session,
+            control: control_slot,
+            keyframes_observed,
+            encoder_generation,
+            restarting_encoder,
         });
         Ok(())
     }
@@ -1297,9 +1448,18 @@ pub(crate) struct Session {
     /// a real ICE restart and begins a new relay-validation generation.
     remote_ice_ufrag: Option<String>,
     peer: WebRtcPeer,
+    /// Cancels the whole session (event pump + encoder pumps + peer).
     cancel: CancellationToken,
+    /// Child of `cancel`. Cancelled on encoder-only restart so video/audio
+    /// pumps exit without taking the event pump or PeerConnection with them.
+    encoder_cancel: CancellationToken,
     tasks: JoinSet<()>,
     shutdown: ScrcpyShutdown,
+    adb: Adb,
+    control: ControlSlot,
+    keyframes_observed: Arc<AtomicU64>,
+    encoder_generation: u64,
+    restarting_encoder: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -1308,7 +1468,7 @@ impl Session {
     /// the scrcpy `app_process` has been reaped.
     pub(crate) async fn shutdown(mut self) {
         self.cancel.cancel();
-        // Close the peer synchronously (this drops the str0m Rtc, which
+        // Close the peer synchronously (this drops the webrtc-rs PC, which
         // also drops the UDP socket — unblocking any reader task).
         self.peer.close().await;
         // Drain tasks; they each race a `cancel.cancelled()` branch.
@@ -1416,10 +1576,73 @@ fn should_reset_video_on_transport_switch(previous: VideoTransport, next: VideoT
 /// Pump peer events out to MQTT, back into scrcpy control (PLI → reset_video,
 /// DataChannel control messages → touches/keys/etc), and surface connection
 /// state changes to the observability layer.
+async fn live_control(slot: &ControlSlot) -> Option<Arc<ControlSocket>> {
+    slot.read().await.clone()
+}
+
+async fn session_generation(
+    current_session: &Arc<Mutex<Option<Session>>>,
+    viewer_id: &str,
+) -> Option<u64> {
+    current_session
+        .lock()
+        .await
+        .as_ref()
+        .filter(|session| session.viewer_id == viewer_id)
+        .map(|session| session.encoder_generation)
+}
+
+fn spawn_media_pumps(
+    tasks: &mut JoinSet<()>,
+    video_reader: Option<VideoReader>,
+    audio_reader: Option<AudioReader>,
+    peer: WebRtcPeer,
+    encoder_cancel: CancellationToken,
+    current_session: Arc<Mutex<Option<Session>>>,
+    viewer_id: String,
+    internal_tx: mpsc::Sender<BridgeInternalEvent>,
+    keyframes_observed: Arc<AtomicU64>,
+    generation: u64,
+    restarting_encoder: Arc<AtomicBool>,
+) {
+    if let Some(reader) = video_reader {
+        let peer_for_video = peer.clone();
+        let cancel_for_video = encoder_cancel.clone();
+        let session_flag_for_video = current_session;
+        let viewer_for_video = viewer_id;
+        let internal_tx_for_video = internal_tx;
+        let keyframes_for_video = keyframes_observed;
+        tasks.spawn(async move {
+            run_video_pump(
+                reader,
+                peer_for_video,
+                cancel_for_video,
+                session_flag_for_video,
+                viewer_for_video,
+                internal_tx_for_video,
+                keyframes_for_video,
+                generation,
+                restarting_encoder,
+            )
+            .await;
+        });
+    } else {
+        warn!("scrcpy video socket was not open — session starts without video");
+    }
+
+    if let Some(reader) = audio_reader {
+        let peer_for_audio = peer;
+        let cancel_for_audio = encoder_cancel;
+        tasks.spawn(async move {
+            run_audio_pump(reader, peer_for_audio, cancel_for_audio).await;
+        });
+    }
+}
+
 async fn run_event_pump(
     peer: WebRtcPeer,
     mqtt: Arc<MqttSignaling>,
-    control: Option<Arc<ControlSocket>>,
+    control: ControlSlot,
     scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
     current_session: Arc<Mutex<Option<Session>>>,
     health: HealthFlags,
@@ -1448,6 +1671,11 @@ async fn run_event_pump(
     let mut last_rebuild = Instant::now() - REBUILD_THROTTLE;
     let mut recovery_tick = tokio::time::interval(RECOVERY_TICK);
     recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut bwe_tick = tokio::time::interval(Duration::from_secs(1));
+    bwe_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let cap_width = scrcpy_cfg.read().await.max_width;
+    let live_width = cap_width;
+    let mut bwe = BweController::new(cap_width, live_width, std::time::Instant::now());
     let mut ice_disconnected_at: Option<Instant> = None;
 
     loop {
@@ -1456,6 +1684,47 @@ async fn run_event_pump(
             _ = cancel.cancelled() => {
                 debug!("event pump cancelled");
                 return;
+            }
+            _ = bwe_tick.tick() => {
+                let snapshot = peer.query_bwe().await;
+                let viewer_rx = VIEWER_BITRATE_BPS.get().max(0.0) as u64;
+                let estimate = combine_estimates(
+                    snapshot.available_outgoing_bps,
+                    snapshot.outbound_video_bps,
+                    viewer_rx,
+                );
+                if let Some(bps) = estimate {
+                    BWE_ESTIMATE_BPS.set(bps as f64);
+                }
+                match bwe.observe(estimate, std::time::Instant::now()) {
+                    BweDecision::Hold => {}
+                    BweDecision::Downshift(rung) | BweDecision::Upshift(rung) => {
+                        if let Some(generation) =
+                            session_generation(&current_session, &viewer_id).await
+                        {
+                            info!(
+                                event = "bridge.bwe_shift",
+                                viewer = %viewer_id,
+                                generation,
+                                target_width = rung.max_width,
+                                target_bitrate = rung.bitrate,
+                                estimate_bps = estimate,
+                                "BWE requested keep-PC encoder restart"
+                            );
+                            if let Err(e) = internal_tx
+                                .send(BridgeInternalEvent::RestartEncoder {
+                                    viewer_id: viewer_id.clone(),
+                                    generation,
+                                    reason: "bwe",
+                                    target: Some(rung),
+                                })
+                                .await
+                            {
+                                warn!(error = %e, "failed to queue BWE encoder restart");
+                            }
+                        }
+                    }
+                }
             }
             _ = recovery_tick.tick() => {
                 let Some(state) = recovery.as_ref() else { continue };
@@ -1478,7 +1747,7 @@ async fn run_event_pump(
                     RecoveryDecision::Retry => {
                         let next_attempt = attempts + 1;
                         warn!(attempt = next_attempt, "no IDR after reset_video — retrying");
-                        if let Some(ctrl) = control.as_ref() {
+                        if let Some(ctrl) = live_control(&control).await {
                             if let Err(e) = ctrl.reset_video().await {
                                 warn!(error = %e, "scrcpy reset_video retry");
                             }
@@ -1494,24 +1763,26 @@ async fn run_event_pump(
                         warn!("keyframe recovery failed but rebuild throttled — waiting for next PLI");
                     }
                     RecoveryDecision::Rebuild => {
-                        // reset_video repeatedly failed to produce an IDR (e.g.
-                        // a silently-wedged capture). Rebuild the scrcpy session
-                        // the same way hot-reconfigure / video-eof do — emit
-                        // `stream_restarted` and drop the session so the browser
-                        // reconnects onto a fresh scrcpy whose first NAL is a
-                        // natural IDR.
+                        // reset_video repeatedly failed to produce an IDR.
+                        // Restart the encoder only — keep the PeerConnection.
                         recovery = None;
                         last_rebuild = Instant::now();
-                        warn!("video stuck after repeated reset_video — rebuilding scrcpy session");
-                        let _ = peer
-                            .send_control_text(datachannel::build_stream_restarted())
-                            .await;
-                        if let Some(session) = current_session.lock().await.take() {
-                            tokio::spawn(async move {
-                                session.shutdown().await;
-                            });
+                        warn!("video stuck after repeated reset_video — keep-PC encoder restart");
+                        if let Some(generation) =
+                            session_generation(&current_session, &viewer_id).await
+                        {
+                            if let Err(e) = internal_tx
+                                .send(BridgeInternalEvent::RestartEncoder {
+                                    viewer_id: viewer_id.clone(),
+                                    generation,
+                                    reason: "keyframe-stuck",
+                                    target: None,
+                                })
+                                .await
+                            {
+                                warn!(error = %e, "failed to queue keyframe encoder restart");
+                            }
                         }
-                        SCRCPY_RUNNING.set(0);
                     }
                 }
             }
@@ -1589,7 +1860,7 @@ async fn run_event_pump(
                         // initialized and avoids resetVideo's startup NPE.
                         let baseline = keyframes_observed.load(Ordering::Relaxed);
                         if should_request_post_connect_keyframe(baseline) {
-                            if let Some(ctrl) = control.as_ref() {
+                            if let Some(ctrl) = live_control(&control).await {
                                 info!(
                                     baseline,
                                     "stream ready after pre-connect IDR — requesting fresh keyframe"
@@ -1638,9 +1909,10 @@ async fn run_event_pump(
                             .await;
                     }
                     PeerEvent::ControlMessage(text) => {
+                        let ctrl = live_control(&control).await;
                         if let Err(e) = forward_control(
                             &text,
-                            control.as_ref(),
+                            ctrl.as_ref(),
                             &scrcpy_cfg,
                             &peer,
                             &health,
@@ -1679,7 +1951,7 @@ async fn run_event_pump(
                             continue;
                         }
                         last_reset_video = now;
-                        if let Some(ctrl) = control.as_ref() {
+                        if let Some(ctrl) = live_control(&control).await {
                             info!("PLI received — asking scrcpy for keyframe");
                             // Snapshot BEFORE the reset so a fresh IDR strictly
                             // after this point is what confirms recovery.
@@ -1940,6 +2212,8 @@ async fn run_video_pump(
     viewer_id: String,
     internal_tx: mpsc::Sender<BridgeInternalEvent>,
     keyframes_observed: Arc<AtomicU64>,
+    generation: u64,
+    restarting_encoder: Arc<AtomicBool>,
 ) {
     let mut latest_config: Option<VideoFrame> = None;
     let mut previous_frame_was_config = false;
@@ -2003,34 +2277,41 @@ async fn run_video_pump(
         previous_frame_was_config = is_config;
     };
 
-    // scrcpy video pipeline ended. Only tell the browser to reset its
-    // session when the scrcpy side itself went away; `cancelled` means
-    // the supervisor is tearing us down on purpose (page refresh / new
-    // offer) and the browser already knows.
+    // scrcpy video pipeline ended. `cancelled` is the supervisor recycling
+    // the encoder (or the whole session). Unexpected EOF/error restarts
+    // only the encoder and keeps the PeerConnection.
     if matches!(exit_reason, "video-eof" | "video-error") {
-        let _ = peer
-            .send_control_text(datachannel::build_stream_restarted())
-            .await;
-        // Invalidate any grace window still pointing at this viewer —
-        // the session we would have held onto during grace is gone,
-        // so a future same-viewer offer must go through the full
-        // rebuild path. Without this, grace could expire ~30 s later
-        // and (through the ownership check) log spuriously or — if a
-        // new viewer has replaced us — just be a noisy no-op.
-        let _ = internal_tx
-            .send(BridgeInternalEvent::ClearGraceFor {
-                viewer_id: viewer_id.clone(),
-            })
-            .await;
-        // Drop the whole session so the next offer spawns a clean one.
-        if let Some(session) = current_session.lock().await.take() {
-            // Avoid blocking the current task on its own JoinSet join
-            // (we're inside one of the joined tasks) — spawn the shutdown.
-            tokio::spawn(async move {
-                session.shutdown().await;
-            });
+        let action = video_eof_action(
+            restarting_encoder.load(Ordering::Acquire),
+            session_generation(&current_session, &viewer_id)
+                .await
+                .is_some_and(|live| live == generation),
+        );
+        match action {
+            EncoderEofAction::Ignore => {
+                debug!(
+                    reason = exit_reason,
+                    generation, "video pump exit ignored — encoder restart already in flight"
+                );
+            }
+            EncoderEofAction::RestartKeepPc => {
+                warn!(
+                    reason = exit_reason,
+                    generation, "scrcpy video ended — keep-PC encoder restart"
+                );
+                if let Err(e) = internal_tx
+                    .send(BridgeInternalEvent::RestartEncoder {
+                        viewer_id: viewer_id.clone(),
+                        generation,
+                        reason: exit_reason,
+                        target: None,
+                    })
+                    .await
+                {
+                    warn!(error = %e, "failed to queue video-eof encoder restart");
+                }
+            }
         }
-        SCRCPY_RUNNING.set(0);
     }
     debug!(reason = exit_reason, "video pump exited");
 }
@@ -2071,13 +2352,9 @@ async fn run_audio_pump(mut reader: AudioReader, peer: WebRtcPeer, cancel: Cance
 
 // ---------------------------------------------------------------------------
 
-/// Merge optional encoder knobs into `cfg`. Returns whether any field changed.
-///
-/// Used by the DataChannel `configure` handler so the next `on_offer`
-/// starts scrcpy with the viewer's prefs. The live peer is left alone —
-/// applying width/bitrate/GOP requires a new `app_process`, and the old
-/// G8 path tore down WebRTC to get there (~several seconds of black on
-/// every first mobile connect).
+/// Frozen helper: viewer `configure` is ignored on the live path.
+/// Kept so tests can prove a merge would mutate cfg *without* implying
+/// the DataChannel handler still writes it or restarts the encoder.
 fn merge_scrcpy_configure(
     cfg: &mut ScrcpyServerConfig,
     max_fps: Option<u32>,
@@ -2675,6 +2952,22 @@ mod tests {
         assert_eq!(
             evaluate_recovery(7, 5, MAX_RESET_ATTEMPTS, true, true),
             RecoveryDecision::Confirmed,
+        );
+    }
+
+    #[test]
+    fn recovery_rebuild_keeps_peer_connection() {
+        assert_eq!(
+            encoder_restart_kind(),
+            EncoderRestartKind::KeepPeerConnection
+        );
+    }
+
+    #[test]
+    fn unexpected_video_eof_restarts_encoder_not_peer() {
+        assert_eq!(
+            video_eof_action(false, true),
+            EncoderEofAction::RestartKeepPc
         );
     }
 

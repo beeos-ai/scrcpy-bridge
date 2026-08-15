@@ -23,7 +23,7 @@ use rtp::codecs::h264::{
 use rtp::packetizer::Depacketizer;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, info, warn};
-use webrtc::api::interceptor_registry::register_default_interceptors;
+use webrtc::api::interceptor_registry::{configure_nack, configure_rtcp_reports, configure_twcc};
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
@@ -40,6 +40,7 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
+use webrtc::stats::StatsReportType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
@@ -128,7 +129,22 @@ pub enum PeerCommand {
     RequestKeyframe,
     SetCameraSink(Option<mpsc::Sender<CameraFrame>>),
     RequestCameraKeyframe,
+    QueryBwe {
+        done: oneshot::Sender<BweSnapshot>,
+    },
     Close,
+}
+
+/// Sender-side bandwidth samples from webrtc-rs `get_stats`.
+///
+/// `available_outgoing_bps` is GCC/ICE's estimate when it is populated.
+/// `outbound_video_bps` is the recent video `bytesSent` rate. Either may
+/// be missing; the BWE controller conservative-mins the positives with
+/// the viewer's reported receive bitrate.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BweSnapshot {
+    pub available_outgoing_bps: Option<u64>,
+    pub outbound_video_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +400,14 @@ impl WebRtcPeer {
 
     pub async fn close(&self) {
         let _ = self.send(PeerCommand::Close).await;
+    }
+
+    pub async fn query_bwe(&self) -> BweSnapshot {
+        let (done, completed) = oneshot::channel();
+        if self.send(PeerCommand::QueryBwe { done }).await.is_err() {
+            return BweSnapshot::default();
+        }
+        completed.await.unwrap_or_default()
     }
 
     pub async fn next_event(&self) -> Option<PeerEvent> {
@@ -653,8 +677,13 @@ async fn run_peer(
 ) -> Result<()> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
+    // Default webrtc-rs registry only installs TWCC *receiver* (camera
+    // uplink). Screen video is outbound: we need the sender interceptor
+    // so the viewer emits transport-cc feedback we can turn into BWE.
     let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut media_engine)?;
+    registry = configure_nack(registry, &mut media_engine);
+    registry = configure_rtcp_reports(registry);
+    registry = configure_twcc(registry, &mut media_engine)?;
 
     // OKE is IPv4-only. Limiting gathering to UDP4 also avoids an upstream
     // resolver failure where an unavailable IPv6 route aborts IPv4 TURN.
@@ -748,6 +777,7 @@ async fn run_peer(
 
     let mut last_video_pts = None;
     let mut last_audio_pts = None;
+    let mut outbound_rate = OutboundRateTracker::default();
 
     while let Some(command) = cmd_rx.recv().await {
         match command {
@@ -857,6 +887,12 @@ async fn run_peer(
             // bridge's scrcpy ResetVideo command. No local WebRTC action is
             // required here.
             PeerCommand::RequestKeyframe => {}
+            PeerCommand::QueryBwe { done } => {
+                let snapshot = collect_bwe_snapshot(&pc, &mut outbound_rate).await;
+                if done.send(snapshot).is_err() {
+                    debug!("bwe query dropped — caller gone");
+                }
+            }
             PeerCommand::Close => {
                 let _ = pc.close().await;
                 let _ = evt_tx.send(PeerEvent::Disconnected);
@@ -867,6 +903,67 @@ async fn run_peer(
 
     let _ = pc.close().await;
     Ok(())
+}
+
+#[derive(Default)]
+struct OutboundRateTracker {
+    last_bytes: Option<u64>,
+    last_at: Option<Instant>,
+}
+
+impl OutboundRateTracker {
+    fn update(&mut self, bytes_sent: u64, now: Instant) -> Option<u64> {
+        let bps = match (self.last_bytes, self.last_at) {
+            (Some(prev_bytes), Some(prev_at)) if bytes_sent >= prev_bytes => {
+                let elapsed = now.saturating_duration_since(prev_at);
+                let millis = elapsed.as_millis();
+                if millis >= 400 {
+                    Some(
+                        (bytes_sent - prev_bytes)
+                            .saturating_mul(8)
+                            .saturating_mul(1000)
+                            / millis as u64,
+                    )
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        self.last_bytes = Some(bytes_sent);
+        self.last_at = Some(now);
+        bps
+    }
+}
+
+async fn collect_bwe_snapshot(
+    pc: &RTCPeerConnection,
+    rate: &mut OutboundRateTracker,
+) -> BweSnapshot {
+    let report = pc.get_stats().await;
+    let mut available = 0.0_f64;
+    let mut video_bytes = 0_u64;
+    for stat in report.reports.into_values() {
+        match stat {
+            StatsReportType::CandidatePair(pair) if pair.nominated => {
+                if pair.available_outgoing_bitrate > available {
+                    available = pair.available_outgoing_bitrate;
+                }
+            }
+            StatsReportType::OutboundRTP(stream) if stream.kind == "video" => {
+                video_bytes = video_bytes.saturating_add(stream.bytes_sent);
+            }
+            _ => {}
+        }
+    }
+    BweSnapshot {
+        available_outgoing_bps: if available > 0.0 {
+            Some(available as u64)
+        } else {
+            None
+        },
+        outbound_video_bps: rate.update(video_bytes, Instant::now()),
+    }
 }
 
 fn install_state_callbacks(
