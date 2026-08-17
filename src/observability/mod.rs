@@ -341,6 +341,23 @@ pub static VIEWER_FIRST_FRAME_SECONDS: Lazy<prometheus::Histogram> = Lazy::new(|
     h
 });
 
+/// First keyframe the bridge successfully handed to the current video
+/// transport. This is the sealed-client substitute for `viewer_ready`:
+/// iOS never sends that ack. Label is `rtp` or `datachannel`. A DC
+/// increment is the closest proxy to "iOS can paint" without a new app.
+pub static FIRST_KEYFRAME_SENT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        prometheus::Opts::new(
+            "scrcpy_bridge_first_keyframe_sent_total",
+            "First keyframe delivered on a video transport (rtp or datachannel)",
+        ),
+        &["transport"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 pub static POST_CONNECT_KEYFRAMES_TOTAL: Lazy<prometheus::IntCounter> = Lazy::new(|| {
     let c = prometheus::IntCounter::new(
         "scrcpy_bridge_post_connect_keyframes_total",
@@ -379,6 +396,7 @@ pub fn init_metrics() {
     Lazy::force(&ICE_RECOVERIES_TOTAL);
     Lazy::force(&ICE_RECOVERY_SECONDS);
     Lazy::force(&VIEWER_FIRST_FRAME_SECONDS);
+    Lazy::force(&FIRST_KEYFRAME_SENT_TOTAL);
     Lazy::force(&POST_CONNECT_KEYFRAMES_TOTAL);
 }
 

@@ -39,9 +39,9 @@ use crate::mqtt::{
 use crate::observability::{
     HealthFlags, AUDIO_PACKETS_DROPPED, AUDIO_PACKETS_TOTAL, BWE_ESTIMATE_BPS,
     CAMERA_FRAMES_DROPPED, CAMERA_FRAMES_TOTAL, CAMERA_PLI_TOTAL, CONTROL_MESSAGES_TOTAL,
-    ENCODER_RESTARTS_TOTAL, ICE_DISCONNECTS_TOTAL, ICE_RECOVERIES_TOTAL, ICE_RECOVERY_SECONDS,
-    PLI_COUNT_TOTAL, POST_CONNECT_KEYFRAMES_TOTAL, SCRCPY_RECONNECTS_TOTAL, SCRCPY_RUNNING,
-    VIDEO_FRAMES_DROPPED, VIDEO_FRAMES_TOTAL, VIEWER_BITRATE_BPS, VIEWER_CONNECTED,
+    ENCODER_RESTARTS_TOTAL, FIRST_KEYFRAME_SENT_TOTAL, ICE_DISCONNECTS_TOTAL, ICE_RECOVERIES_TOTAL,
+    ICE_RECOVERY_SECONDS, PLI_COUNT_TOTAL, POST_CONNECT_KEYFRAMES_TOTAL, SCRCPY_RECONNECTS_TOTAL,
+    SCRCPY_RUNNING, VIDEO_FRAMES_DROPPED, VIDEO_FRAMES_TOTAL, VIEWER_BITRATE_BPS, VIEWER_CONNECTED,
     VIEWER_FIRST_FRAME_SECONDS, VIEWER_FPS, VIEWER_PACKETS_LOST, VIEWER_RTT_MS,
 };
 use crate::scrcpy::protocol::{KeyAction, TouchAction};
@@ -1691,14 +1691,75 @@ fn should_request_post_connect_keyframe(keyframes_observed: u64) -> bool {
     keyframes_observed > 0
 }
 
-/// After `StreamReady` the first IDR is sent on the default RTP track.
-/// iOS then opens the `video` DataChannel and switches transport; that
-/// RTP IDR never reaches `AVSampleBufferDisplayLayer`. A transport
-/// switch onto DC must emit a fresh IDR (with prepended SPS/PPS) or
-/// the decoder stays black until the next GOP — and the client's
-/// `request_keyframe` is often throttled against the just-spent RTP IDR.
+/// After `StreamReady` the first IDR is sent on the current transport.
+/// iOS is the only viewer that opens `label="video"`; the event pump
+/// adopts DataChannel at that edge so this IDR is not burned on RTP.
+/// A later RTP→DC switch (sealed-client 2.5s fallback, or an explicit
+/// `set_video_transport`) still needs a fresh IDR: the RTP one never
+/// reaches `AVSampleBufferDisplayLayer`, and the client's
+/// `request_keyframe` is often throttled against that just-spent IDR.
 fn should_reset_video_on_transport_switch(previous: VideoTransport, next: VideoTransport) -> bool {
     previous != next && next == VideoTransport::DataChannel
+}
+
+fn parse_video_transport_mode(mode: &str) -> Option<VideoTransport> {
+    match mode {
+        "datachannel" | "dc" | "data_channel" => Some(VideoTransport::DataChannel),
+        "rtp" => Some(VideoTransport::Rtp),
+        _ => None,
+    }
+}
+
+/// Sealed iOS never sends `viewer_ready`. Log the first keyframe the
+/// pump actually handed to each transport so bridge logs still show a
+/// first-frame edge. A `datachannel` increment is the closest proxy
+/// to "iOS can paint"; an `rtp` increment is what web/Android see.
+fn should_log_first_keyframe_sent(
+    last_logged: Option<VideoTransport>,
+    current: VideoTransport,
+    is_keyframe: bool,
+) -> bool {
+    is_keyframe && last_logged != Some(current)
+}
+
+async fn apply_video_transport(
+    peer: &WebRtcPeer,
+    control: Option<&Arc<ControlSocket>>,
+    next: VideoTransport,
+    reason: &'static str,
+) {
+    let previous = peer.video_transport();
+    if previous == next {
+        debug!(
+            reason,
+            transport = next.as_str(),
+            "video transport already applied"
+        );
+        return;
+    }
+    info!(
+        event = "bridge.video_transport",
+        reason,
+        previous = previous.as_str(),
+        next = next.as_str(),
+        "video transport applied"
+    );
+    peer.set_video_transport(next);
+    if should_reset_video_on_transport_switch(previous, next) {
+        if let Some(ctrl) = control {
+            info!(
+                reason,
+                "video transport switched to datachannel — requesting IDR"
+            );
+            if let Err(e) = ctrl.reset_video().await {
+                warn!(
+                    error = %e,
+                    reason,
+                    "scrcpy reset_video after video transport switch"
+                );
+            }
+        }
+    }
 }
 
 /// Pump peer events out to MQTT, back into scrcpy control (PLI → reset_video,
@@ -2075,6 +2136,23 @@ async fn run_event_pump(
                                 .await;
                         }
                     }
+                    PeerEvent::VideoDataChannelOpen => {
+                        // Web and Android only open `control` and stay on
+                        // RTP. iOS is the only viewer that opens `video`.
+                        // Adopt DC here so the first writable IDR lands on
+                        // the path the sealed client can actually decode,
+                        // instead of waiting for its 2.5s rtp-timeout
+                        // `set_video_transport` (which it may never ack
+                        // with `viewer_ready`).
+                        let ctrl = live_control(&control).await;
+                        apply_video_transport(
+                            &peer,
+                            ctrl.as_ref(),
+                            VideoTransport::DataChannel,
+                            "video-dc-open",
+                        )
+                        .await;
+                    }
                     PeerEvent::KeyframeRequested => {
                         PLI_COUNT_TOTAL.inc();
                         // Already recovering: we drive reset_video on our own
@@ -2355,6 +2433,7 @@ async fn run_video_pump(
 ) {
     let mut latest_config: Option<VideoFrame> = None;
     let mut previous_frame_was_config = false;
+    let mut first_keyframe_transport: Option<VideoTransport> = None;
 
     let exit_reason: &'static str = loop {
         let frame = tokio::select! {
@@ -2411,6 +2490,20 @@ async fn run_video_pump(
         // failed to ship".
         if is_keyframe {
             keyframes_observed.fetch_add(1, Ordering::Relaxed);
+            let transport = peer.video_transport();
+            if should_log_first_keyframe_sent(first_keyframe_transport, transport, true) {
+                first_keyframe_transport = Some(transport);
+                FIRST_KEYFRAME_SENT_TOTAL
+                    .with_label_values(&[transport.as_str()])
+                    .inc();
+                info!(
+                    event = "bridge.first_keyframe_sent",
+                    viewer = %viewer_id,
+                    transport = transport.as_str(),
+                    generation,
+                    "first keyframe delivered to peer"
+                );
+            }
         }
         previous_frame_was_config = is_config;
     };
@@ -2610,33 +2703,16 @@ async fn forward_control(
             return Ok(());
         }
         ControlIn::SetVideoTransport { mode } => {
-            // iOS native client opt-in for binary video transport. The
-            // selector is read by `run_video_pump` on every frame via
-            // `peer.video_transport()` (an Arc<AtomicU8>) — no command
-            // channel round-trip required.
-            //
-            // Browser viewers never send this; bridge default is
-            // `VideoTransport::Rtp`, which keeps the existing webrtc-client
-            // path on the `m=video` RTP track.
-            let new_mode = match mode.as_str() {
-                "datachannel" | "dc" | "data_channel" => Some(VideoTransport::DataChannel),
-                "rtp" => Some(VideoTransport::Rtp),
-                other => {
-                    warn!(mode = %other, "unknown set_video_transport mode; ignoring");
-                    None
+            // Kept for the sealed iOS 2.5s fallback and for any older
+            // build that still opts in explicitly. Current bridge also
+            // adopts DC when the `video` DataChannel opens, so this
+            // message is usually a no-op after `video-dc-open`.
+            match parse_video_transport_mode(mode) {
+                Some(next) => {
+                    apply_video_transport(peer, control, next, "set_video_transport").await;
                 }
-            };
-            if let Some(m) = new_mode {
-                let previous = peer.video_transport();
-                info!(mode = ?m, previous = ?previous, "set_video_transport applied");
-                peer.set_video_transport(m);
-                if should_reset_video_on_transport_switch(previous, m) {
-                    if let Some(ctrl) = control {
-                        info!("video transport switched to datachannel — requesting IDR");
-                        if let Err(e) = ctrl.reset_video().await {
-                            warn!(error = %e, "scrcpy reset_video after set_video_transport");
-                        }
-                    }
+                None => {
+                    warn!(mode = %mode, "unknown set_video_transport mode; ignoring");
                 }
             }
             return Ok(());
@@ -3260,6 +3336,40 @@ mod tests {
         assert!(!should_reset_video_on_transport_switch(
             VideoTransport::DataChannel,
             VideoTransport::Rtp,
+        ));
+    }
+
+    #[test]
+    fn parses_video_transport_aliases() {
+        assert_eq!(
+            parse_video_transport_mode("datachannel"),
+            Some(VideoTransport::DataChannel)
+        );
+        assert_eq!(parse_video_transport_mode("rtp"), Some(VideoTransport::Rtp));
+        assert_eq!(parse_video_transport_mode("udp"), None);
+    }
+
+    #[test]
+    fn logs_first_keyframe_once_per_transport() {
+        assert!(should_log_first_keyframe_sent(
+            None,
+            VideoTransport::Rtp,
+            true
+        ));
+        assert!(!should_log_first_keyframe_sent(
+            Some(VideoTransport::Rtp),
+            VideoTransport::Rtp,
+            true
+        ));
+        assert!(should_log_first_keyframe_sent(
+            Some(VideoTransport::Rtp),
+            VideoTransport::DataChannel,
+            true
+        ));
+        assert!(!should_log_first_keyframe_sent(
+            None,
+            VideoTransport::DataChannel,
+            false
         ));
     }
 

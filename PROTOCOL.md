@@ -77,7 +77,9 @@ Keyframe recovery on the RTP path is **RTCP PLI** (RFC 4585). The
 bridge already maps PLI → scrcpy `ResetVideo`.
 
 Video over a binary DataChannel is an iOS-only workaround, not the
-external media contract.
+external media contract. The bridge adopts that path the moment the
+viewer opens a `label="video"` DataChannel (iOS is the only client
+that does). It does not wait for `set_video_transport`.
 
 ## D. DataChannel `control`
 
@@ -87,7 +89,7 @@ external media contract.
 |--------|------|
 | `touch` / `scroll` / `key` / `text` / `back` / `home` | Input |
 | `camera_start` / `camera_stop` | Camera uplink |
-| `ping` / `stats` / `viewer_ready` | Diagnostics |
+| `ping` / `stats` / `viewer_ready` | Diagnostics. `viewer_ready` is a client-acked first paint. iOS 1.3.33 does not send it; the bridge logs `bridge.first_keyframe_sent` instead. |
 
 `stats.packetsLost` may be signed; the bridge clamps to `≥ 0`.
 
