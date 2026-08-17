@@ -67,6 +67,13 @@ impl VideoTransport {
             Self::Rtp
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rtp => "rtp",
+            Self::DataChannel => "datachannel",
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -168,6 +175,11 @@ pub enum PeerEvent {
     Disconnected,
     ControlMessage(String),
     ControlChannelOpen,
+    /// iOS opens a second `label="video"` DataChannel. That is the sealed
+    /// client's capability signal: it can decode H.264 on DC, not on the
+    /// RTP renderer. The bridge adopts DC immediately so the first IDR
+    /// is not burned on a path iOS cannot display.
+    VideoDataChannelOpen,
     KeyframeRequested,
     Error(String),
 }
@@ -1041,6 +1053,14 @@ fn install_data_channel_callback(
 
             if label == "video" {
                 *video_slot.write().await = Some(channel.clone());
+                let open_tx = evt_tx.clone();
+                channel.on_open(Box::new(move || {
+                    let tx = open_tx.clone();
+                    Box::pin(async move {
+                        info!("video datachannel open");
+                        let _ = tx.send(PeerEvent::VideoDataChannelOpen);
+                    })
+                }));
                 let slot = video_slot.clone();
                 channel.on_close(Box::new(move || {
                     let slot = slot.clone();

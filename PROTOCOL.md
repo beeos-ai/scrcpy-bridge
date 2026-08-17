@@ -39,7 +39,15 @@ Additive (v1 viewers apply only the WebRTC-standard fields):
 |-------|----------------|
 | `iceTransportPolicy` | `RTCIceTransportPolicy` (`all` \| `relay`) |
 | `video.maxWidth` / `video.maxFps` / `video.maxBitrate` / `video.codec` | **Read-only echo** of the server-selected cap. Do not send `configure`. |
-| `videoTransport` | BeeOS iOS implementation detail (`rtp` default, `datachannel` fallback). Not part of the public media contract. |
+| `videoTransport` | Server-owned iOS path: `auto` (default, try RTP then DC), `rtp`, or `datachannel`. Web/Android ignore. |
+| `videoTransportFallbackMs` | `auto` only. How long iOS waits for an RTP paint before opening the video DataChannel (default 8000, clamp 1000–30000). |
+| `videoDcReliability` | iOS video DC: `unreliable` (default, `maxRetransmits=0`) or `reliable`. |
+
+Runtime ExtraEnv (SKU / ConfigMap) steers those three fields without an app release:
+
+- `VIDEO_TRANSPORT` = `auto` \| `rtp` \| `datachannel`
+- `VIDEO_TRANSPORT_FALLBACK_MS` = 1000–30000 (default 8000)
+- `VIDEO_DC_RELIABILITY` = `unreliable` \| `reliable`
 
 Optional query the last frozen client should send so the server can pick
 a profile forever without another app release:
@@ -77,7 +85,9 @@ Keyframe recovery on the RTP path is **RTCP PLI** (RFC 4585). The
 bridge already maps PLI → scrcpy `ResetVideo`.
 
 Video over a binary DataChannel is an iOS-only workaround, not the
-external media contract.
+external media contract. The bridge adopts that path the moment the
+viewer opens a `label="video"` DataChannel (iOS is the only client
+that does). It does not wait for `set_video_transport`.
 
 ## D. DataChannel `control`
 
@@ -87,7 +97,7 @@ external media contract.
 |--------|------|
 | `touch` / `scroll` / `key` / `text` / `back` / `home` | Input |
 | `camera_start` / `camera_stop` | Camera uplink |
-| `ping` / `stats` / `viewer_ready` | Diagnostics |
+| `ping` / `stats` / `viewer_ready` | Diagnostics. `viewer_ready` is a client-acked first paint. iOS 1.3.33 does not send it; the bridge logs `bridge.first_keyframe_sent` instead. |
 
 `stats.packetsLost` may be signed; the bridge clamps to `≥ 0`.
 
