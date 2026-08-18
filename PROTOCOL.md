@@ -109,6 +109,12 @@ therefore waits for that relay and embeds it in SDP. Trickle is still
 published as a backup. Viewer candidates that arrive before the peer
 exists are buffered, not dropped.
 
+One process owns one media session. A same-`viewerId` offer with a
+**new** DTLS fingerprint is a second PeerConnection (iOS remount /
+params refetch / two views), not an ICE restart. While ICE is still
+Checking or Connected that offer is ignored. After ICE is lost it is
+accepted as a genuine reload.
+
 ## C. Media
 
 Public offer MUST include:

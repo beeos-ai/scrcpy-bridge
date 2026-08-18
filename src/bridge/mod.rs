@@ -14,7 +14,7 @@
 
 mod bwe;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -243,6 +243,42 @@ fn fast_path_eligible(session_fp: Option<&str>, offer_fp: Option<&str>) -> bool 
         (Some(s), Some(o)) => s == o,
         _ => false,
     }
+}
+
+/// ICE liveness of the one session this process owns.
+///
+/// A new DTLS fingerprint is a new PeerConnection. That is a genuine
+/// reload only after the current PC has already lost ICE. While we are
+/// still Checking or Connected, the second offer is a duplicate iOS/web
+/// pipeline (Expo remount, react-query refetch, two views) sharing the
+/// same `viewerId`. Replacing the live session is what colleagues see
+/// as "connected then 连不上" every ~6 s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IcePhase {
+    Checking = 0,
+    Connected = 1,
+    Disconnected = 2,
+}
+
+impl IcePhase {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Connected,
+            2 => Self::Disconnected,
+            _ => Self::Checking,
+        }
+    }
+}
+
+fn should_ignore_duplicate_offer(
+    same_viewer: bool,
+    session_fp: Option<&str>,
+    offer_fp: Option<&str>,
+    ice_phase: IcePhase,
+) -> bool {
+    let known_new_certificate =
+        matches!((session_fp, offer_fp), (Some(session), Some(offer)) if session != offer);
+    same_viewer && known_new_certificate && ice_phase != IcePhase::Disconnected
 }
 
 pub struct Bridge {
@@ -855,10 +891,11 @@ impl Bridge {
                             s.peer.clone(),
                             s.remote_fingerprint.clone(),
                             s.remote_ice_ufrag.clone(),
+                            IcePhase::from_u8(s.ice_phase.load(Ordering::Acquire)),
                         )
                     })
             };
-            if let Some((peer, session_fingerprint, session_ice_ufrag)) = peer_opt {
+            if let Some((peer, session_fingerprint, session_ice_ufrag, ice_phase)) = peer_opt {
                 if fast_path_eligible(session_fingerprint.as_deref(), offer_fingerprint.as_deref())
                 {
                     let kind = classify_in_place_negotiation(
@@ -935,6 +972,22 @@ impl Bridge {
                             // as a different-viewer takeover.
                         }
                     }
+                } else if should_ignore_duplicate_offer(
+                    true,
+                    session_fingerprint.as_deref(),
+                    offer_fingerprint.as_deref(),
+                    ice_phase,
+                ) {
+                    info!(
+                        event = "bridge.duplicate_pc_ignored",
+                        viewer = %viewer_id,
+                        trace_id = %trace_id,
+                        ?ice_phase,
+                        session_fp_short = %fingerprint_short(session_fingerprint.as_deref()),
+                        offer_fp_short = %dtls_fp_short,
+                        "same-viewer new PeerConnection while session is live — keeping the working PC"
+                    );
+                    return Ok(());
                 } else {
                     info!(
                         event = "bridge.session_full_rebuild",
@@ -1138,6 +1191,7 @@ impl Bridge {
         let keyframes_observed = Arc::new(AtomicU64::new(0));
         let restarting_encoder = Arc::new(AtomicBool::new(false));
         let encoder_generation = 1_u64;
+        let ice_phase = Arc::new(AtomicU8::new(IcePhase::Checking as u8));
         let adb_for_session = Adb {
             serial: self.cli.adb_serial.clone(),
             host: self.cli.adb_host.clone(),
@@ -1162,6 +1216,7 @@ impl Bridge {
             let keyframes_for_evt = keyframes_observed.clone();
             let camera_sink_for_evt = self.camera_sink.clone();
             let cam_in_use_for_evt = self.cam_in_use.clone();
+            let ice_phase_for_evt = ice_phase.clone();
             tasks.spawn(async move {
                 run_event_pump(
                     peer_for_evt,
@@ -1180,6 +1235,7 @@ impl Bridge {
                     keyframes_for_evt,
                     camera_sink_for_evt,
                     cam_in_use_for_evt,
+                    ice_phase_for_evt,
                 )
                 .await;
             });
@@ -1213,6 +1269,7 @@ impl Bridge {
             keyframes_observed,
             encoder_generation,
             restarting_encoder,
+            ice_phase,
         });
         Ok(())
     }
@@ -1611,6 +1668,9 @@ pub(crate) struct Session {
     keyframes_observed: Arc<AtomicU64>,
     encoder_generation: u64,
     restarting_encoder: Arc<AtomicBool>,
+    /// Shared with the event pump so `on_offer` can refuse a second
+    /// PeerConnection while this one is still checking or connected.
+    ice_phase: Arc<AtomicU8>,
 }
 
 impl Session {
@@ -1876,6 +1936,7 @@ async fn run_event_pump(
     keyframes_observed: Arc<AtomicU64>,
     camera_sink: CameraSink,
     cam_in_use: Arc<std::sync::atomic::AtomicBool>,
+    ice_phase: Arc<AtomicU8>,
 ) {
     // Browsers emit PLI roughly every 200 ms after any packet loss. Scrcpy
     // needs ~1 encode cycle to emit a new IDR, so we rate-limit how often
@@ -2047,6 +2108,7 @@ async fn run_event_pump(
                         }
                     }
                     PeerEvent::Connected => {
+                        ice_phase.store(IcePhase::Connected as u8, Ordering::Release);
                         VIEWER_CONNECTED.set(1);
                         if let Some(disconnected_at) = ice_disconnected_at.take() {
                             ICE_RECOVERIES_TOTAL.inc();
@@ -2103,6 +2165,7 @@ async fn run_event_pump(
                         }
                     }
                     PeerEvent::Disconnected => {
+                        ice_phase.store(IcePhase::Disconnected as u8, Ordering::Release);
                         VIEWER_CONNECTED.set(0);
                         if ice_disconnected_at.is_none() {
                             ICE_DISCONNECTS_TOTAL.inc();
@@ -3253,6 +3316,54 @@ mod tests {
         }
         assert_eq!(pending.len(), PendingRemoteIce::MAX_BUFFERED);
         assert!(pending.candidates[0].candidate.ends_with(":2"));
+    }
+
+    #[test]
+    fn duplicate_offer_ignored_while_checking_or_connected() {
+        assert!(should_ignore_duplicate_offer(
+            true,
+            Some(FP_A),
+            Some(FP_B),
+            IcePhase::Checking,
+        ));
+        assert!(should_ignore_duplicate_offer(
+            true,
+            Some(FP_A),
+            Some(FP_B),
+            IcePhase::Connected,
+        ));
+    }
+
+    #[test]
+    fn duplicate_offer_accepted_after_ice_lost() {
+        assert!(!should_ignore_duplicate_offer(
+            true,
+            Some(FP_A),
+            Some(FP_B),
+            IcePhase::Disconnected,
+        ));
+    }
+
+    #[test]
+    fn duplicate_offer_never_blocks_ice_restart_or_other_viewer() {
+        assert!(!should_ignore_duplicate_offer(
+            true,
+            Some(FP_A),
+            Some(FP_A),
+            IcePhase::Connected,
+        ));
+        assert!(!should_ignore_duplicate_offer(
+            false,
+            Some(FP_A),
+            Some(FP_B),
+            IcePhase::Connected,
+        ));
+        assert!(!should_ignore_duplicate_offer(
+            true,
+            None,
+            Some(FP_B),
+            IcePhase::Connected,
+        ));
     }
 
     #[test]
