@@ -50,7 +50,8 @@ use crate::scrcpy::{
     VideoReader,
 };
 use crate::webrtc::{
-    CameraFrame, IceServer, NegotiationKind, PeerEvent, PeerOptions, VideoTransport, WebRtcPeer,
+    CameraFrame, IceServer, NegotiationKind, PeerEvent, PeerOptions, RemoteIceInit, VideoTransport,
+    WebRtcPeer,
 };
 
 use self::bwe::{
@@ -376,6 +377,7 @@ impl Bridge {
         // into each new `run_event_pump` via `on_offer`.
         let (internal_tx, mut internal_rx) = mpsc::channel::<BridgeInternalEvent>(16);
         let mut grace: Option<SessionGrace> = None;
+        let mut pending_remote_ice = PendingRemoteIce::default();
 
         // 4. JWT refresher. Failure here is fatal — without it the
         //    session dies when the first MQTT token expires. The same
@@ -587,16 +589,37 @@ impl Bridge {
                                 .await
                             {
                                 error!(error = format!("{:#}", e), "handle offer failed");
+                                pending_remote_ice.clear();
+                            } else {
+                                flush_pending_remote_ice(
+                                    &current_session,
+                                    &mut pending_remote_ice,
+                                )
+                                .await;
                             }
                         }
-                        SignalRequest::Ice { candidate } => {
-                            let guard = current_session.lock().await;
-                            if let Some(session) = guard.as_ref() {
-                                if let Some(cand_str) = candidate_as_string(&candidate) {
-                                    let _ = session.peer.add_remote_ice(cand_str).await;
+                        SignalRequest::Ice {
+                            candidate,
+                            sdp_mid,
+                            sdp_mline_index,
+                        } => {
+                            if let Some(init) =
+                                parse_remote_ice(&candidate, sdp_mid, sdp_mline_index)
+                            {
+                                let guard = current_session.lock().await;
+                                if let Some(session) = guard.as_ref() {
+                                    if let Err(error) =
+                                        session.peer.add_remote_ice(init).await
+                                    {
+                                        warn!(%error, "add remote ICE candidate");
+                                    }
+                                } else {
+                                    pending_remote_ice.push(init);
+                                    info!(
+                                        buffered = pending_remote_ice.len(),
+                                        "buffering remote ICE until peer exists"
+                                    );
                                 }
-                            } else {
-                                warn!("ICE candidate received before peer was created");
                             }
                         }
                         SignalRequest::Close { reason, viewer_id } => {
@@ -3014,17 +3037,104 @@ fn msg_kind(msg: &ControlIn) -> &'static str {
     }
 }
 
-/// Pull the actual candidate SDP line out of either `{candidate: "..."}` or a
-/// plain string — matches what the Python client sends.
-fn candidate_as_string(v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Object(o) => o
-            .get("candidate")
-            .and_then(|c| c.as_str())
-            .map(str::to_string),
+/// Every viewer ICE shape we have actually shipped:
+/// - string `candidate` with sibling `sdpMid` (desktop-viewer)
+/// - `{candidate, sdpMid, sdpMLineIndex}` (web device-viewer `toJSON()`)
+/// - nested `{candidate: {candidate, sdpMid, sdpMLineIndex}}` (iOS)
+fn parse_remote_ice(
+    candidate: &serde_json::Value,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
+) -> Option<RemoteIceInit> {
+    match candidate {
+        serde_json::Value::String(line) => {
+            RemoteIceInit::from_parts(line.clone(), sdp_mid, sdp_mline_index)
+        }
+        serde_json::Value::Object(object) => {
+            let nested_mid = object
+                .get("sdpMid")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+                .or(sdp_mid);
+            let nested_index = json_mline_index(object.get("sdpMLineIndex")).or(sdp_mline_index);
+            match object.get("candidate") {
+                Some(inner) if inner.is_object() || inner.is_string() => {
+                    parse_remote_ice(inner, nested_mid, nested_index)
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
+}
+
+fn json_mline_index(value: Option<&serde_json::Value>) -> Option<u16> {
+    match value? {
+        serde_json::Value::Number(number) => {
+            number.as_u64().and_then(|value| u16::try_from(value).ok())
+        }
+        serde_json::Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Trickle ICE that arrived before `on_offer` installed a peer.
+/// MQTT can deliver the viewer's first relay ahead of the offer;
+/// dropping it is why some sessions never form a pair.
+struct PendingRemoteIce {
+    candidates: Vec<RemoteIceInit>,
+}
+
+impl Default for PendingRemoteIce {
+    fn default() -> Self {
+        Self {
+            candidates: Vec::new(),
+        }
+    }
+}
+
+impl PendingRemoteIce {
+    const MAX_BUFFERED: usize = 32;
+
+    fn push(&mut self, init: RemoteIceInit) {
+        if self.candidates.len() >= Self::MAX_BUFFERED {
+            self.candidates.remove(0);
+        }
+        self.candidates.push(init);
+    }
+
+    fn len(&self) -> usize {
+        self.candidates.len()
+    }
+
+    fn clear(&mut self) {
+        self.candidates.clear();
+    }
+
+    fn drain(&mut self) -> std::vec::Drain<'_, RemoteIceInit> {
+        self.candidates.drain(..)
+    }
+}
+
+async fn flush_pending_remote_ice(
+    current_session: &Mutex<Option<Session>>,
+    pending: &mut PendingRemoteIce,
+) {
+    if pending.len() == 0 {
+        return;
+    }
+    let guard = current_session.lock().await;
+    let Some(session) = guard.as_ref() else {
+        pending.clear();
+        return;
+    };
+    let flushed = pending.len();
+    for init in pending.drain() {
+        if let Err(error) = session.peer.add_remote_ice(init).await {
+            warn!(%error, "flush buffered remote ICE");
+        }
+    }
+    info!(flushed, "applied buffered remote ICE to new peer");
 }
 
 #[cfg(test)]
@@ -3080,6 +3190,69 @@ mod tests {
             extract_dtls_fingerprint(&upper),
             extract_dtls_fingerprint(&lower),
         );
+    }
+
+    #[test]
+    fn parse_remote_ice_string_with_sibling_mid() {
+        let init = parse_remote_ice(
+            &serde_json::json!("candidate:1 1 udp 1 1.2.3.4 9 typ relay"),
+            Some("0".into()),
+            Some(0),
+        )
+        .expect("string candidate");
+        assert_eq!(init.sdp_mid.as_deref(), Some("0"));
+        assert_eq!(init.sdp_mline_index, Some(0));
+    }
+
+    #[test]
+    fn parse_remote_ice_object_to_json_shape() {
+        let init = parse_remote_ice(
+            &serde_json::json!({
+                "candidate": "candidate:1 1 udp 1 1.2.3.4 9 typ relay",
+                "sdpMid": "1",
+                "sdpMLineIndex": 1
+            }),
+            None,
+            None,
+        )
+        .expect("object candidate");
+        assert_eq!(init.sdp_mid.as_deref(), Some("1"));
+        assert_eq!(init.sdp_mline_index, Some(1));
+    }
+
+    #[test]
+    fn parse_remote_ice_nested_ios_shape() {
+        let init = parse_remote_ice(
+            &serde_json::json!({
+                "candidate": {
+                    "candidate": "candidate:1 1 udp 1 1.2.3.4 9 typ relay",
+                    "sdpMid": "0",
+                    "sdpMLineIndex": 0
+                }
+            }),
+            None,
+            None,
+        )
+        .expect("nested candidate");
+        assert_eq!(init.sdp_mid.as_deref(), Some("0"));
+        assert_eq!(init.candidate.contains("typ relay"), true);
+    }
+
+    #[test]
+    fn parse_remote_ice_ignores_empty_end_of_candidates() {
+        assert!(parse_remote_ice(&serde_json::json!(""), None, None).is_none());
+        assert!(parse_remote_ice(&serde_json::json!({"candidate": ""}), None, None).is_none());
+    }
+
+    #[test]
+    fn pending_remote_ice_drops_oldest_when_full() {
+        let mut pending = PendingRemoteIce::default();
+        for index in 0..(PendingRemoteIce::MAX_BUFFERED + 2) {
+            pending
+                .push(RemoteIceInit::from_parts(format!("candidate:{index}"), None, None).unwrap());
+        }
+        assert_eq!(pending.len(), PendingRemoteIce::MAX_BUFFERED);
+        assert!(pending.candidates[0].candidate.ends_with(":2"));
     }
 
     #[test]

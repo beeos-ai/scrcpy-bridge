@@ -43,7 +43,6 @@ pub struct Cli {
     // process refreshes them before expiry, rebuilding the rumqttc client
     // each cycle. The MQTT username is always `device` — matching EMQX's
     // JWT auth config — and is not user-configurable.
-
     /// Max encode FPS passed to scrcpy-server.
     #[arg(long, env = "MAX_FPS", default_value_t = 30)]
     pub max_fps: u32,
@@ -84,7 +83,12 @@ pub struct Cli {
     /// for local `cargo run` sessions where no Runtime TURN config is
     /// available — the default `stun:stun.l.google.com:19302` keeps
     /// host-candidate P2P working on a laptop with no TURN at all.
-    #[arg(long, env = "ICE_URLS", value_delimiter = ',', default_value = "stun:stun.l.google.com:19302")]
+    #[arg(
+        long,
+        env = "ICE_URLS",
+        value_delimiter = ',',
+        default_value = "stun:stun.l.google.com:19302"
+    )]
     pub ice_urls: Vec<String>,
 
     /// Dev-only TURN username paired with `--ice-urls` entries. Never
@@ -128,12 +132,11 @@ pub struct Cli {
     #[arg(long, env = "PUBLIC_IPS", value_delimiter = ',', default_value = "")]
     pub public_ips: Vec<String>,
 
-    /// Milliseconds to wait for ICE gathering before emitting the SDP answer.
+    /// Floor for the TURN-relay gather wait before the SDP answer.
     ///
-    /// `str0m 0.9` does not expose a `gathering-complete` event, so we sleep
-    /// before replying to let any server-reflexive or TURN-relay candidates
-    /// materialise. `0` keeps the legacy behaviour (answer immediately with
-    /// whatever host candidates were pre-added).
+    /// webrtc-rs waits on the first UDP relay (or gathering-complete),
+    /// not a blind sleep. Values below 10 s are raised to 10 s so a
+    /// slow allocate from OKE is not mistaken for "no TURN".
     #[arg(long, env = "ICE_GATHER_WAIT_MS", default_value_t = 0)]
     pub ice_gather_wait_ms: u64,
 
@@ -147,14 +150,17 @@ pub struct Cli {
     pub scrcpy_server_jar: Option<std::path::PathBuf>,
 
     /// Target absolute path on device for scrcpy-server.jar.
-    #[arg(long, env = "REMOTE_JAR_PATH", default_value = "/data/local/tmp/scrcpy-server.jar")]
+    #[arg(
+        long,
+        env = "REMOTE_JAR_PATH",
+        default_value = "/data/local/tmp/scrcpy-server.jar"
+    )]
     pub remote_jar_path: String,
 
     // ───────────────────── Agent Gateway bootstrap ─────────────────────
     //
     // These three fields are **required**. scrcpy-bridge refuses to start
     // without them — there is no legacy fallback path.
-
     /// Agent Gateway base URL (e.g. `https://agent-gateway.beeos.ai`).
     ///
     /// scrcpy-bridge calls `GET $AGENT_GATEWAY_URL/api/v1/device/bootstrap`

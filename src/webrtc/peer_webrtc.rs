@@ -21,7 +21,7 @@ use rtp::codecs::h264::{
     H264Packet, FUA_NALU_TYPE, FU_END_BITMASK, FU_START_BITMASK, NALU_TYPE_BITMASK,
 };
 use rtp::packetizer::Depacketizer;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock};
 use tracing::{debug, info, warn};
 use webrtc::api::interceptor_registry::{configure_nack, configure_rtcp_reports, configure_twcc};
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
@@ -93,8 +93,9 @@ pub struct PeerOptions {
     /// advertise hand-built host candidates.
     pub extra_local_ips: Vec<std::net::IpAddr>,
     /// Legacy gathering wait hint. TURN-backed sessions use at least ten
-    /// seconds for background relay validation. SDP answers are still
-    /// published immediately and candidates trickle independently.
+    /// seconds for background relay validation. Initial/ICE-restart
+    /// answers wait for the first UDP relay (or this deadline) so the
+    /// SDP already contains a usable candidate.
     pub ice_gather_wait: Duration,
 }
 
@@ -128,7 +129,7 @@ pub enum PeerCommand {
         kind: NegotiationKind,
         done: oneshot::Sender<std::result::Result<(), String>>,
     },
-    RemoteIce(String),
+    RemoteIce(RemoteIceInit),
     WriteVideo(VideoFrame),
     WriteVideoBinary(Vec<u8>),
     WriteAudio(AudioPacket),
@@ -184,6 +185,34 @@ pub enum PeerEvent {
     Error(String),
 }
 
+/// One trickle ICE candidate from the viewer, including the m-line
+/// identity the offer actually used. Hardcoding `sdpMid = "0"` drops
+/// candidates on any offer whose first mid is not `"0"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteIceInit {
+    pub candidate: String,
+    pub sdp_mid: Option<String>,
+    pub sdp_mline_index: Option<u16>,
+}
+
+impl RemoteIceInit {
+    pub fn from_parts(
+        candidate: impl Into<String>,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    ) -> Option<Self> {
+        let candidate = candidate.into();
+        if candidate.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+        })
+    }
+}
+
 #[derive(Default)]
 struct CandidateGateState {
     generation: u64,
@@ -204,6 +233,7 @@ struct CandidateGateState {
 #[derive(Clone)]
 struct LocalCandidateGate {
     state: Arc<Mutex<CandidateGateState>>,
+    ready: Arc<Notify>,
     evt_tx: broadcast::Sender<PeerEvent>,
     require_relay: bool,
     relay_deadline: Duration,
@@ -217,9 +247,45 @@ impl LocalCandidateGate {
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(CandidateGateState::default())),
+            ready: Arc::new(Notify::new()),
             evt_tx,
             require_relay,
             relay_deadline,
+        }
+    }
+
+    fn requires_relay(&self) -> bool {
+        self.require_relay
+    }
+
+    /// Block until a relay candidate exists, gathering finishes, or the
+    /// deadline fires. Subscribe to `Notify` before reading state so a
+    /// relay that lands between the check and the wait is not missed.
+    async fn wait_for_relay(&self) -> bool {
+        let deadline = Instant::now() + self.relay_deadline;
+        loop {
+            let notified = self.ready.notified();
+            {
+                let state = self.state.lock().await;
+                if state.relay_seen {
+                    return true;
+                }
+                if state.gathering_complete {
+                    return false;
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let state = self.state.lock().await;
+                return state.relay_seen;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep(remaining) => {
+                    let state = self.state.lock().await;
+                    return state.relay_seen;
+                }
+            }
         }
     }
 
@@ -273,6 +339,9 @@ impl LocalCandidateGate {
                 false
             }
         };
+        if is_relay {
+            self.ready.notify_waiters();
+        }
         if publish_now {
             let _ = self.evt_tx.send(PeerEvent::LocalIce(candidate));
         }
@@ -284,6 +353,7 @@ impl LocalCandidateGate {
             state.gathering_complete = true;
             state.generation
         };
+        self.ready.notify_waiters();
         self.fail_if_relay_missing(generation, "gathering completed")
             .await;
     }
@@ -352,7 +422,7 @@ impl WebRtcPeer {
             .map_err(|error| anyhow!(error))
     }
 
-    pub async fn add_remote_ice(&self, candidate: String) -> Result<()> {
+    pub async fn add_remote_ice(&self, candidate: RemoteIceInit) -> Result<()> {
         self.send(PeerCommand::RemoteIce(candidate)).await
     }
 
@@ -816,16 +886,18 @@ async fn run_peer(
                 let _ = done.send(acknowledgement);
                 result?;
             }
-            PeerCommand::RemoteIce(candidate) => {
-                if candidate.trim().is_empty() {
-                    continue;
-                }
-                info!(candidate = %candidate, "received remote ICE candidate");
+            PeerCommand::RemoteIce(init) => {
+                info!(
+                    candidate = %init.candidate,
+                    sdp_mid = ?init.sdp_mid,
+                    sdp_mline_index = ?init.sdp_mline_index,
+                    "received remote ICE candidate"
+                );
                 if let Err(error) = pc
                     .add_ice_candidate(RTCIceCandidateInit {
-                        candidate,
-                        sdp_mid: Some("0".to_owned()),
-                        sdp_mline_index: Some(0),
+                        candidate: init.candidate,
+                        sdp_mid: init.sdp_mid.or_else(|| Some("0".to_owned())),
+                        sdp_mline_index: init.sdp_mline_index.or(Some(0)),
                         ..Default::default()
                     })
                     .await
@@ -1299,11 +1371,29 @@ async fn accept_offer(
         .await
         .context("set local description")?;
 
+    // Relay-only pairs cannot check until this side has a TURN
+    // allocation. Publishing an empty answer and trickling 2s later
+    // leaves webrtc-rs with remote-before-local pairs that never
+    // form. Wait for the relay, then republish the local SDP so the
+    // candidate is in the answer itself.
+    if kind.starts_ice_generation() && candidate_gate.requires_relay() {
+        let gathered = candidate_gate.wait_for_relay().await;
+        info!(gathered_relay = gathered, "ICE gather before answer");
+    }
+
     let local = pc
         .local_description()
         .await
         .context("missing local description after answer")?;
-    info!(?kind, "answer SDP ready; ICE candidates will trickle");
+    let candidate_count = local
+        .sdp
+        .lines()
+        .filter(|line| line.starts_with("a=candidate:"))
+        .count();
+    info!(
+        ?kind,
+        candidate_count, "answer SDP ready; ICE candidates will trickle"
+    );
     candidate_gate.publish_answer(local.sdp).await;
     Ok(())
 }
@@ -1734,6 +1824,38 @@ a=rtpmap:102 H264/90000\r\n";
         peer.close().await;
         client.close().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_relay_returns_when_relay_arrives() {
+        let (evt_tx, _evt_rx) = broadcast::channel(8);
+        let gate = LocalCandidateGate::new(evt_tx, true, Duration::from_secs(2));
+        gate.begin_answer(true).await;
+        let waiter = gate.clone();
+        let wait = tokio::spawn(async move { waiter.wait_for_relay().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        gate.add_candidate("candidate:relay".to_owned(), true).await;
+        let gathered = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("wait_for_relay joined")
+            .expect("wait_for_relay task");
+        assert!(gathered);
+    }
+
+    #[tokio::test]
+    async fn wait_for_relay_returns_false_when_gathering_ends_without_relay() {
+        let (evt_tx, _evt_rx) = broadcast::channel(8);
+        let gate = LocalCandidateGate::new(evt_tx, true, Duration::from_secs(2));
+        gate.begin_answer(true).await;
+        let waiter = gate.clone();
+        let wait = tokio::spawn(async move { waiter.wait_for_relay().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        gate.gathering_complete().await;
+        let gathered = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("wait_for_relay joined")
+            .expect("wait_for_relay task");
+        assert!(!gathered);
     }
 
     #[tokio::test]
