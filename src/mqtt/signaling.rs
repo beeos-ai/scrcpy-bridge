@@ -151,6 +151,12 @@ pub enum SignalRequest {
     /// Trickle ICE candidate from the browser.
     Ice {
         candidate: serde_json::Value,
+        /// Present when the viewer puts mid next to a string `candidate`
+        /// (desktop-viewer). Nested `{candidate, sdpMid}` is also accepted.
+        #[serde(default, rename = "sdpMid")]
+        sdp_mid: Option<String>,
+        #[serde(default, rename = "sdpMLineIndex")]
+        sdp_mline_index: Option<u16>,
     },
     /// Browser asked us to close the peer (optional).
     Close {
@@ -223,7 +229,9 @@ impl MqttSignaling {
         cfg: MqttSignalingConfig,
     ) -> Result<(Self, mpsc::Receiver<SignalRequest>)> {
         if cfg.topic_prefix.trim().is_empty() {
-            return Err(anyhow!("MqttSignalingConfig.topic_prefix must not be empty"));
+            return Err(anyhow!(
+                "MqttSignalingConfig.topic_prefix must not be empty"
+            ));
         }
         let (sig_tx, rx) = mpsc::channel::<SignalRequest>(32);
         let shared = Arc::new(Shared {
@@ -334,7 +342,10 @@ async fn teardown(session: Session) {
     // closes the socket regardless.
     let _ = client.try_disconnect();
     let _ = shutdown.send(());
-    if tokio::time::timeout(TEARDOWN_GRACE, &mut task).await.is_err() {
+    if tokio::time::timeout(TEARDOWN_GRACE, &mut task)
+        .await
+        .is_err()
+    {
         warn!("mqtt event-loop task did not exit within grace — aborting");
         task.abort();
         // Observe the cancellation so the JoinHandle is not dropped mid-air.
@@ -354,9 +365,8 @@ fn spawn_watchdog(shared: std::sync::Weak<Shared>) {
                 return;
             };
 
-            let stale =
-                now_ms().saturating_sub(shared.last_ok_ms.load(Ordering::Relaxed))
-                    > STALE_AFTER.as_millis() as u64;
+            let stale = now_ms().saturating_sub(shared.last_ok_ms.load(Ordering::Relaxed))
+                > STALE_AFTER.as_millis() as u64;
             let empty = shared.session.read().await.is_none();
             if !stale && !empty {
                 continue;
@@ -366,15 +376,17 @@ fn spawn_watchdog(shared: std::sync::Weak<Shared>) {
             // rotation may have already installed a fresh session while we
             // were waiting, and tearing that one down would be pure churn.
             let guard = shared.rebuild_mu.lock().await;
-            let stale =
-                now_ms().saturating_sub(shared.last_ok_ms.load(Ordering::Relaxed))
-                    > STALE_AFTER.as_millis() as u64;
+            let stale = now_ms().saturating_sub(shared.last_ok_ms.load(Ordering::Relaxed))
+                > STALE_AFTER.as_millis() as u64;
             let empty = shared.session.read().await.is_none();
             if !stale && !empty {
                 continue;
             }
 
-            warn!(stale, empty, "mqtt watchdog: session unhealthy — rebuilding");
+            warn!(
+                stale,
+                empty, "mqtt watchdog: session unhealthy — rebuilding"
+            );
             MQTT_WATCHDOG_REBUILDS_TOTAL.inc();
             shared.connected.store(false, Ordering::Relaxed);
             match rebuild_locked(&shared).await {
@@ -675,8 +687,7 @@ mod tests {
 
     #[test]
     fn close_payload_with_viewer_id_parses() {
-        let raw =
-            r#"{"type":"close","reason":"client disconnect","viewerId":"abc-123"}"#;
+        let raw = r#"{"type":"close","reason":"client disconnect","viewerId":"abc-123"}"#;
         let req: SignalRequest = serde_json::from_str(raw).expect("parse close");
         match req {
             SignalRequest::Close { reason, viewer_id } => {
@@ -708,8 +719,7 @@ mod tests {
         // This is the race where viewer A closes a stale tab after
         // viewer B has already taken over the session. The bridge's
         // owner check must see the mismatched id verbatim.
-        let raw =
-            r#"{"type":"close","reason":"unmount","viewerId":"stale-viewer-A"}"#;
+        let raw = r#"{"type":"close","reason":"unmount","viewerId":"stale-viewer-A"}"#;
         let req: SignalRequest = serde_json::from_str(raw).expect("parse stale close");
         match req {
             SignalRequest::Close { viewer_id, .. } => {
@@ -824,7 +834,10 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     enum BrokerCmd {
-        Publish { topic: String, payload: Vec<u8> },
+        Publish {
+            topic: String,
+            payload: Vec<u8>,
+        },
         /// Drop the TCP connection without a DISCONNECT (simulates an EMQX
         /// pod replacement / NLB reset — the production incident shape).
         Kill,
@@ -897,7 +910,9 @@ mod tests {
     /// handshake (answered with `connack_code`) is surfaced on the returned
     /// receiver. `connack_code = 0` accepts; `5` = NotAuthorized.
     async fn spawn_mock_broker(connack_code: u8) -> (SocketAddr, mpsc::Receiver<BrokerConn>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock broker");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock broker");
         let addr = listener.local_addr().unwrap();
         let (conn_tx, conn_rx) = mpsc::channel::<BrokerConn>(8);
         tokio::spawn(async move {
@@ -1027,12 +1042,16 @@ mod tests {
         let flag = cfg.connected_flag.clone();
 
         let (_mqtt, mut sig_rx) = MqttSignaling::connect(cfg).await.expect("connect");
-        assert!(flag.load(Ordering::Relaxed), "flag must be raised on ack'd connect");
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "flag must be raised on ack'd connect"
+        );
 
         let mut conn = conns.recv().await.expect("broker saw no connection");
         // SUBACK was already required for connect() to return; the sub
         // notification is buffered on the conn.
-        conn.await_subscription("devices/it-happy/signaling/request").await;
+        conn.await_subscription("devices/it-happy/signaling/request")
+            .await;
 
         conn.publish(
             "devices/it-happy/signaling/request",
@@ -1062,7 +1081,9 @@ mod tests {
             .await
             .expect("client never reconnected")
             .expect("broker closed");
-        conn2.await_subscription("devices/it-resub/signaling/request").await;
+        conn2
+            .await_subscription("devices/it-resub/signaling/request")
+            .await;
 
         // Delivery works on the NEW connection.
         conn2
@@ -1098,7 +1119,9 @@ mod tests {
             .await
             .expect("no post-rotation connection")
             .expect("broker closed");
-        conn2.await_subscription("devices/it-rotate/signaling/request").await;
+        conn2
+            .await_subscription("devices/it-rotate/signaling/request")
+            .await;
 
         // Old session was torn down (teardown drops its socket): the mock's
         // conn task exits on EOF, closing its command channel.

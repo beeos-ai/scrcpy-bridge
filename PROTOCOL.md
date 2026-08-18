@@ -103,6 +103,12 @@ Runtime ExtraEnv steers the viewer list without an app release:
 Bootstrap ICE (this sidecar) is never filtered that way: the bridge
 must keep UDP TURN.
 
+The sidecar is the ICE answerer. A relay-only pair cannot check until
+this process has a UDP TURN allocation (~2.5 s from OKE). The answer
+therefore waits for that relay and embeds it in SDP. Trickle is still
+published as a backup. Viewer candidates that arrive before the peer
+exists are buffered, not dropped.
+
 ## C. Media
 
 Public offer MUST include:
