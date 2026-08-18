@@ -48,6 +48,8 @@ Runtime ExtraEnv (SKU / ConfigMap) steers those three fields without an app rele
 - `VIDEO_TRANSPORT` = `auto` \| `rtp` \| `datachannel`
 - `VIDEO_TRANSPORT_FALLBACK_MS` = 1000–30000 (default 8000)
 - `VIDEO_DC_RELIABILITY` = `unreliable` \| `reliable`
+- `VIEWER_TURN_TRANSPORT` = `tcp` (default) \| `udp` \| `all`
+- `VIEWER_ICE_TRANSPORT_POLICY` = `relay` (default when `tcp`) \| `all`
 
 Optional query the last frozen client should send so the server can pick
 a profile forever without another app release:
@@ -72,6 +74,34 @@ Topic prefix comes from `deviceTopic`. Payloads:
 ICE restart is a new `offer` on the **same** `RTCPeerConnection` whose
 SDP changes `ice-ufrag` / `ice-pwd`. The boolean `iceRestart` field is
 not part of the contract; the bridge keys off DTLS fingerprint + ufrag.
+A full PeerConnection rebuild changes the DTLS fingerprint and MUST be
+the last resort: it drops SCTP/control and looks like "taps do nothing"
+until the new handshake finishes.
+
+### ICE / TURN split (server-owned)
+
+`TURN_URLS` on Runtime is the union list (UDP TURN + TCP TURN + STUN).
+The two sides of the PeerConnection do **not** consume it the same way:
+
+| Side | Stack | What it can allocate |
+|------|--------|----------------------|
+| Bridge (this process) | webrtc-rs 0.17 | UDP `turn:` only. TCP TURN / TURNS are dropped. |
+| Viewer (iOS / Android / web) | libwebrtc | UDP and TCP TURN. |
+
+webrtc-rs `gather_candidates_relay` is UDP-`turn:` only (TCP is a
+documented TODO). Enabling `NetworkType::Tcp4` does not fix that.
+The working pair on lossy/UDP-hostile networks is therefore:
+
+- viewer: TCP TURN allocation (`turn:…?transport=tcp`, `iceTransportPolicy=relay`)
+- bridge: UDP TURN allocation on the same coturn
+
+Runtime ExtraEnv steers the viewer list without an app release:
+
+- `VIEWER_TURN_TRANSPORT` = `tcp` (default) \| `udp` \| `all`
+- `VIEWER_ICE_TRANSPORT_POLICY` = `relay` \| `all`
+
+Bootstrap ICE (this sidecar) is never filtered that way: the bridge
+must keep UDP TURN.
 
 ## C. Media
 
