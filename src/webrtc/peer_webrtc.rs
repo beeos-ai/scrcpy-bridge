@@ -699,6 +699,10 @@ async fn run_peer(
 
     // OKE is IPv4-only. Limiting gathering to UDP4 also avoids an upstream
     // resolver failure where an unavailable IPv6 route aborts IPv4 TURN.
+    // Tcp4 is intentionally omitted: webrtc-rs 0.17 cannot allocate
+    // TURN/TCP (`gather_candidates_relay` only implements UDP `turn:`),
+    // and host TCP candidates on a private pod address are unusable from
+    // the public Internet. Viewers use libwebrtc TURN/TCP instead.
     let mut setting_engine = SettingEngine::default();
     setting_engine.set_network_types(vec![NetworkType::Udp4]);
     let api = APIBuilder::new()
@@ -707,10 +711,18 @@ async fn run_peer(
         .with_setting_engine(setting_engine)
         .build();
 
-    let force_relay = has_turn_server(&opts.ice_servers);
+    let (usable_ice_servers, dropped_ice_urls) =
+        ice_servers_supported_by_webrtc_rs(&opts.ice_servers);
+    if !dropped_ice_urls.is_empty() {
+        warn!(
+            dropped = dropped_ice_urls.len(),
+            urls = ?dropped_ice_urls,
+            "dropping ICE URLs webrtc-rs cannot gather (TCP TURN / TURNS)"
+        );
+    }
+    let force_relay = has_turn_server(&usable_ice_servers);
     let config = RTCConfiguration {
-        ice_servers: opts
-            .ice_servers
+        ice_servers: usable_ice_servers
             .iter()
             .map(|server| RTCIceServer {
                 urls: server.urls.clone(),
@@ -726,7 +738,8 @@ async fn run_peer(
         ..Default::default()
     };
     info!(
-        ice_servers = opts.ice_servers.len(),
+        ice_servers = usable_ice_servers.len(),
+        dropped_ice_urls = dropped_ice_urls.len(),
         policy = if force_relay { "relay" } else { "all" },
         local_bind = %opts.local_bind,
         extra_local_ips = opts.extra_local_ips.len(),
@@ -1355,11 +1368,81 @@ fn h264_camera_contract(sdp: &str) -> Result<H264CameraContract> {
 
 fn has_turn_server(servers: &[IceServer]) -> bool {
     servers.iter().any(|server| {
-        server.urls.iter().any(|url| {
-            let lower = url.trim().to_ascii_lowercase();
-            lower.starts_with("turn:") || lower.starts_with("turns:")
-        })
+        server
+            .urls
+            .iter()
+            .any(|url| ice_url_scheme(url).is_turn() && webrtc_rs_supports_ice_url(url))
     })
+}
+
+/// webrtc-rs 0.17 `gather_candidates_relay` only implements UDP `turn:`.
+/// `turn:?transport=tcp` and `turns:` parse, then log
+/// "Unable to handle URL" and produce no candidate. Strip them before
+/// `RTCConfiguration` so gathering stays on the working UDP allocation.
+/// Viewers still use TCP TURN via stream-params; the pair is
+/// viewer-TCP-alloc ↔ bridge-UDP-alloc on the same coturn.
+fn ice_servers_supported_by_webrtc_rs(servers: &[IceServer]) -> (Vec<IceServer>, Vec<String>) {
+    let mut dropped_urls = Vec::new();
+    let mut usable_servers = Vec::new();
+    for server in servers {
+        let mut urls = Vec::new();
+        for url in &server.urls {
+            if webrtc_rs_supports_ice_url(url) {
+                urls.push(url.clone());
+            } else if !url.trim().is_empty() {
+                dropped_urls.push(url.clone());
+            }
+        }
+        if urls.is_empty() {
+            continue;
+        }
+        usable_servers.push(IceServer {
+            urls,
+            username: server.username.clone(),
+            credential: server.credential.clone(),
+        });
+    }
+    (usable_servers, dropped_urls)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IceUrlScheme {
+    Stun,
+    Turn,
+    Other,
+}
+
+impl IceUrlScheme {
+    fn is_turn(self) -> bool {
+        matches!(self, Self::Turn)
+    }
+}
+
+fn ice_url_scheme(url: &str) -> IceUrlScheme {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower.starts_with("stun:") || lower.starts_with("stuns:") {
+        IceUrlScheme::Stun
+    } else if lower.starts_with("turn:") || lower.starts_with("turns:") {
+        IceUrlScheme::Turn
+    } else {
+        IceUrlScheme::Other
+    }
+}
+
+fn webrtc_rs_supports_ice_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    match ice_url_scheme(&lower) {
+        IceUrlScheme::Stun => !lower.starts_with("stuns:"),
+        IceUrlScheme::Turn => lower.starts_with("turn:") && !turn_url_requests_tcp(&lower),
+        IceUrlScheme::Other => false,
+    }
+}
+
+fn turn_url_requests_tcp(lower_url: &str) -> bool {
+    lower_url.contains("transport=tcp")
 }
 
 fn relay_validation_deadline(legacy_hint: Duration) -> Duration {
@@ -1714,13 +1797,71 @@ a=rtpmap:102 H264/90000\r\n";
             username: None,
             credential: None,
         };
-        let turn = IceServer {
+        let turn_udp = IceServer {
+            urls: vec!["turn:turn.example.com:3478".to_owned()],
+            username: Some("u".to_owned()),
+            credential: Some("p".to_owned()),
+        };
+        let turn_tcp = IceServer {
             urls: vec!["TURNS:turn.example.com:5349?transport=tcp".to_owned()],
             username: Some("u".to_owned()),
             credential: Some("p".to_owned()),
         };
         assert!(!has_turn_server(std::slice::from_ref(&stun)));
-        assert!(has_turn_server(&[stun, turn]));
+        assert!(has_turn_server(&[stun.clone(), turn_udp]));
+        assert!(
+            !has_turn_server(std::slice::from_ref(&turn_tcp)),
+            "TCP TURN is not a webrtc-rs gatherable relay"
+        );
+    }
+
+    #[test]
+    fn webrtc_rs_keeps_udp_turn_and_drops_tcp() {
+        let mixed = vec![IceServer {
+            urls: vec![
+                "stun:stun.l.google.com:19302".to_owned(),
+                "turn:turn.beeos.ai:3478".to_owned(),
+                "turn:turn.beeos.ai:3478?transport=tcp".to_owned(),
+                "turns:turn.beeos.ai:5349".to_owned(),
+            ],
+            username: Some("u".to_owned()),
+            credential: Some("p".to_owned()),
+        }];
+        let (usable, dropped) = ice_servers_supported_by_webrtc_rs(&mixed);
+        assert_eq!(usable.len(), 1);
+        assert_eq!(
+            usable[0].urls,
+            vec![
+                "stun:stun.l.google.com:19302".to_owned(),
+                "turn:turn.beeos.ai:3478".to_owned(),
+            ]
+        );
+        assert_eq!(
+            dropped,
+            vec![
+                "turn:turn.beeos.ai:3478?transport=tcp".to_owned(),
+                "turns:turn.beeos.ai:5349".to_owned(),
+            ]
+        );
+        assert!(has_turn_server(&usable));
+    }
+
+    #[test]
+    fn webrtc_rs_support_matrix_matches_gather_candidates_relay() {
+        assert!(webrtc_rs_supports_ice_url("stun:stun.example:3478"));
+        assert!(webrtc_rs_supports_ice_url("turn:turn.example:3478"));
+        assert!(webrtc_rs_supports_ice_url(
+            "turn:turn.example:3478?transport=udp"
+        ));
+        assert!(!webrtc_rs_supports_ice_url(
+            "turn:turn.example:3478?transport=tcp"
+        ));
+        assert!(!webrtc_rs_supports_ice_url(
+            "TURN:turn.example:3478?transport=TCP"
+        ));
+        assert!(!webrtc_rs_supports_ice_url("turns:turn.example:5349"));
+        assert!(!webrtc_rs_supports_ice_url("stuns:stun.example:5349"));
+        assert!(!webrtc_rs_supports_ice_url(""));
     }
 
     #[test]
