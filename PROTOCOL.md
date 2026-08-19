@@ -78,6 +78,15 @@ A full PeerConnection rebuild changes the DTLS fingerprint and MUST be
 the last resort: it drops SCTP/control and looks like "taps do nothing"
 until the new handshake finishes.
 
+Viewers MUST NOT ICE-restart while their ICE is already `connected` /
+`completed`. `restartIce()` invalidates the live generation; this
+process then closes the current ICE agent and waits for a new UDP TURN
+relay (~2.5s). A timeout that fires after ICE has come back MUST keep
+the peer — a second restart is an automatic reconnect.
+
+`close` ends the session. Emit it when the user leaves the surface, not
+when UI flags or tokens refresh.
+
 ### ICE / TURN split (server-owned)
 
 `TURN_URLS` on Runtime is the union list (UDP TURN + TCP TURN + STUN).
