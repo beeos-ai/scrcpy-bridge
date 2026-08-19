@@ -3,8 +3,11 @@
 //! Lifecycle:
 //!   1. Connect MQTT signaling.
 //!   2. Wait for an SDP offer from the browser (first offer = first viewer).
-//!   3. Start scrcpy server on the device, open video/audio/control sockets.
-//!   4. Spawn a WebRTC peer (`str0m`), pass H.264 AUs from scrcpy into it.
+//!   3. ICE gather (TURN relay) and scrcpy start run **in parallel**. The
+//!      MQTT answer is published as soon as a UDP relay exists — it must
+//!      not wait for `app_process`. Encoder sockets attach after both
+//!      complete. Wait-for-relay stays: an empty answer never pairs.
+//!   4. Pass H.264 AUs from scrcpy into the WebRTC peer.
 //!   5. Forward DataChannel control messages back to the scrcpy control
 //!      socket (no IPC, no Python involved).
 //!   6. When the viewer disconnects, keep scrcpy running for a grace period
@@ -21,7 +24,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::{timeout, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -46,8 +49,8 @@ use crate::observability::{
 };
 use crate::scrcpy::protocol::{KeyAction, TouchAction};
 use crate::scrcpy::{
-    AudioReader, ControlSocket, ScrcpyServer, ScrcpyServerConfig, ScrcpyShutdown, VideoFrame,
-    VideoReader,
+    AudioReader, ControlSocket, ScrcpyServer, ScrcpyServerConfig, ScrcpySessionParts,
+    ScrcpyShutdown, VideoFrame, VideoReader,
 };
 use crate::webrtc::{
     CameraFrame, IceServer, NegotiationKind, PeerEvent, PeerOptions, RemoteIceInit, VideoTransport,
@@ -1100,83 +1103,106 @@ impl Bridge {
             );
         }
 
-        // 1. Start a fresh scrcpy session. Every offer gets a clean
-        //    app_process + sockets — simpler invariants and matches how
-        //    the Python agent behaves.
+        // ICE gather does not need the encoder. Starting them in series
+        // made every answer wait ~5.6s (scrcpy then TURN). Publish the
+        // MQTT answer as soon as a UDP relay exists so the viewer can
+        // check while app_process is still coming up.
         let adb = Adb {
             serial: self.cli.adb_serial.clone(),
             host: self.cli.adb_host.clone(),
             port: self.cli.adb_port,
         };
         let cfg_snapshot = scrcpy_cfg.read().await.clone();
-        let scrcpy_t0 = Instant::now();
-        info!(
-            event = "bridge.scrcpy_start_begin",
-            viewer = %viewer_id,
-            trace_id = %trace_id,
-            bitrate = cfg_snapshot.bitrate,
-            max_width = cfg_snapshot.max_width,
-            max_size = cfg_snapshot.resolved_max_size(),
-            max_fps = cfg_snapshot.max_fps,
-            "starting scrcpy server"
-        );
-        let mut server = ScrcpyServer::new(adb, cfg_snapshot);
-        server.start().await.context("start scrcpy server")?;
-        info!(
-            event = "bridge.scrcpy_start_end",
-            viewer = %viewer_id,
-            trace_id = %trace_id,
-            elapsed_ms = scrcpy_t0.elapsed().as_millis() as u64,
-            "scrcpy server started"
-        );
-        self.health.scrcpy_running.store(true, Ordering::Relaxed);
-        SCRCPY_RUNNING.set(1);
-        SCRCPY_RECONNECTS_TOTAL.inc();
+        let extra_local_ips = self.resolve_extra_local_ips();
+        let ice_servers = self.ice_servers.read().await.clone();
+        let ice_gather_wait = Duration::from_millis(self.cli.ice_gather_wait_ms);
 
-        let parts = server.split();
-        let video_reader = parts.video;
-        let audio_reader = parts.audio;
-        let control_slot: ControlSlot = Arc::new(RwLock::new(parts.control));
-        let mut shutdown = parts.shutdown;
-
-        // 2. Spawn WebRTC peer.
-        //
-        // Fallibility budget: once `server.start()` above succeeds we
-        // hold a live `app_process` child + an adb reverse-forward
-        // rule. Any `?`-propagated failure from here on (peer spawn
-        // refused by str0m, accept_offer rejected the SDP, ...) must
-        // reap them before returning, or the next offer's
-        // `ScrcpyServer::new + start` would collide on the same adb
-        // forward port. The async block consolidates the two fallible
-        // ops so there's a single cleanup site.
-        let construct = async {
-            let extra_local_ips = self.resolve_extra_local_ips();
-            let ice_servers = self.ice_servers.read().await.clone();
-            let peer_opts = PeerOptions {
-                ice_servers,
-                local_bind: "0.0.0.0:0".parse().unwrap(),
-                extra_local_ips,
-                ice_gather_wait: Duration::from_millis(self.cli.ice_gather_wait_ms),
-            };
-            let peer = WebRtcPeer::spawn(peer_opts)?;
-            peer.accept_offer(offer_sdp, NegotiationKind::Initial)
+        let ice_t0 = Instant::now();
+        let peer_fut = {
+            let mqtt = mqtt.clone();
+            let viewer_id = viewer_id.clone();
+            let trace_id = trace_id.clone();
+            let dtls_fp_short = dtls_fp_short.clone();
+            async move {
+                let peer = spawn_peer_and_publish_answer(
+                    PeerOptions {
+                        ice_servers,
+                        local_bind: "0.0.0.0:0".parse().unwrap(),
+                        extra_local_ips,
+                        ice_gather_wait,
+                    },
+                    offer_sdp,
+                    mqtt.as_ref(),
+                    &viewer_id,
+                    &trace_id,
+                    &dtls_fp_short,
+                    offer_t0,
+                )
                 .await?;
-            anyhow::Ok(peer)
+                anyhow::Ok((peer, ice_t0.elapsed()))
+            }
         };
-        let peer = match construct.await {
-            Ok(p) => p,
-            Err(e) => {
+        let scrcpy_fut = {
+            let viewer_id = viewer_id.clone();
+            let trace_id = trace_id.clone();
+            async move { start_scrcpy_encoder(adb, cfg_snapshot, &viewer_id, &trace_id).await }
+        };
+
+        let (peer, parts) = match tokio::join!(peer_fut, scrcpy_fut) {
+            (Ok((peer, ice_elapsed)), Ok((parts, scrcpy_elapsed))) => {
+                info!(
+                    event = "bridge.ice_encoder_parallel",
+                    viewer = %viewer_id,
+                    trace_id = %trace_id,
+                    ice_elapsed_ms = ice_elapsed.as_millis() as u64,
+                    scrcpy_elapsed_ms = scrcpy_elapsed.as_millis() as u64,
+                    "ICE answer and scrcpy start finished in parallel"
+                );
+                (peer, parts)
+            }
+            (Ok((peer, _)), Err(e)) => {
                 warn!(
                     error = format!("{:#}", e),
                     viewer = %viewer_id,
-                    "new session construction failed — reaping scrcpy server + adb forward"
+                    "scrcpy start failed after ICE answer — closing peer"
                 );
-                shutdown.shutdown().await;
+                peer.close().await;
                 self.health.scrcpy_running.store(false, Ordering::Relaxed);
                 SCRCPY_RUNNING.set(0);
                 return Err(e);
             }
+            (Err(e), Ok((mut parts, _))) => {
+                warn!(
+                    error = format!("{:#}", e),
+                    viewer = %viewer_id,
+                    "ICE answer failed — reaping scrcpy server + adb forward"
+                );
+                parts.shutdown.shutdown().await;
+                self.health.scrcpy_running.store(false, Ordering::Relaxed);
+                SCRCPY_RUNNING.set(0);
+                return Err(e);
+            }
+            (Err(ice_err), Err(scrcpy_err)) => {
+                warn!(
+                    ice_error = format!("{:#}", ice_err),
+                    scrcpy_error = format!("{:#}", scrcpy_err),
+                    viewer = %viewer_id,
+                    "ICE answer and scrcpy start both failed"
+                );
+                self.health.scrcpy_running.store(false, Ordering::Relaxed);
+                SCRCPY_RUNNING.set(0);
+                return Err(ice_err);
+            }
         };
+
+        self.health.scrcpy_running.store(true, Ordering::Relaxed);
+        SCRCPY_RUNNING.set(1);
+        SCRCPY_RECONNECTS_TOTAL.inc();
+
+        let video_reader = parts.video;
+        let audio_reader = parts.audio;
+        let control_slot: ControlSlot = Arc::new(RwLock::new(parts.control));
+        let shutdown = parts.shutdown;
 
         // 3. Per-session plumbing.
         let cancel = CancellationToken::new();
@@ -1870,6 +1896,131 @@ async fn session_owner(current_session: &Arc<Mutex<Option<Session>>>) -> Option<
         .await
         .as_ref()
         .map(|session| (session.viewer_id.clone(), session.encoder_generation))
+}
+
+async fn start_scrcpy_encoder(
+    adb: Adb,
+    cfg: ScrcpyServerConfig,
+    viewer_id: &str,
+    trace_id: &str,
+) -> anyhow::Result<(ScrcpySessionParts, Duration)> {
+    let scrcpy_t0 = Instant::now();
+    info!(
+        event = "bridge.scrcpy_start_begin",
+        viewer = %viewer_id,
+        trace_id = %trace_id,
+        bitrate = cfg.bitrate,
+        max_width = cfg.max_width,
+        max_size = cfg.resolved_max_size(),
+        max_fps = cfg.max_fps,
+        "starting scrcpy server"
+    );
+    let mut server = ScrcpyServer::new(adb, cfg);
+    server.start().await.context("start scrcpy server")?;
+    let elapsed = scrcpy_t0.elapsed();
+    info!(
+        event = "bridge.scrcpy_start_end",
+        viewer = %viewer_id,
+        trace_id = %trace_id,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "scrcpy server started"
+    );
+    Ok((server.split(), elapsed))
+}
+
+async fn spawn_peer_and_publish_answer(
+    opts: PeerOptions,
+    offer_sdp: String,
+    mqtt: &MqttSignaling,
+    viewer_id: &str,
+    trace_id: &str,
+    dtls_fp_short: &str,
+    offer_t0: Instant,
+) -> anyhow::Result<WebRtcPeer> {
+    let peer = WebRtcPeer::spawn(opts)?;
+    peer.accept_offer(offer_sdp, NegotiationKind::Initial)
+        .await
+        .context("accept offer / wait for relay")?;
+    publish_first_answer(&peer, mqtt, viewer_id, trace_id, dtls_fp_short, offer_t0).await?;
+    Ok(peer)
+}
+
+/// Drain the peer event stream until the wait-for-relay answer is published
+/// to MQTT. Called before the session event pump starts so the viewer is
+/// not blocked on scrcpy `app_process`.
+async fn publish_first_answer(
+    peer: &WebRtcPeer,
+    mqtt: &MqttSignaling,
+    viewer_id: &str,
+    trace_id: &str,
+    dtls_fp_short: &str,
+    offer_t0: Instant,
+) -> anyhow::Result<()> {
+    loop {
+        let event = timeout(Duration::from_secs(15), peer.next_event())
+            .await
+            .context("timed out waiting for answer SDP")?
+            .ok_or_else(|| anyhow::anyhow!("peer closed before publishing answer"))?;
+        match event {
+            PeerEvent::Answer(sdp) => {
+                let sdp_bytes = sdp.len();
+                mqtt.publish_response(&SignalResponse::Answer { sdp })
+                    .await
+                    .context("publish answer")?;
+                info!(
+                    event = "bridge.answer_sent",
+                    viewer = %viewer_id,
+                    trace_id = %trace_id,
+                    dtls_fp_short = %dtls_fp_short,
+                    sdp_bytes,
+                    elapsed_ms = offer_t0.elapsed().as_millis() as u64,
+                    "answer published"
+                );
+                return Ok(());
+            }
+            PeerEvent::LocalIce(cand) => {
+                let payload = serde_json::json!({
+                    "candidate": cand,
+                    "sdpMid": "0",
+                    "sdpMLineIndex": 0,
+                });
+                if let Err(e) = mqtt
+                    .publish_response(&SignalResponse::Ice { candidate: payload })
+                    .await
+                {
+                    warn!(error = %e, "publish local ice before event pump");
+                }
+            }
+            PeerEvent::Error(error) => {
+                return Err(anyhow::anyhow!(error)).context("peer error before answer");
+            }
+            other => {
+                // The first Answer is sent as soon as wait-for-relay
+                // finishes, before the viewer can check. Anything else
+                // here is unexpected and is dropped (not re-queued).
+                warn!(
+                    event = "bridge.answer_drain_unexpected",
+                    kind = %peer_event_kind(&other),
+                    "unexpected peer event while waiting to publish the first answer"
+                );
+            }
+        }
+    }
+}
+
+fn peer_event_kind(event: &PeerEvent) -> &'static str {
+    match event {
+        PeerEvent::Answer(_) => "answer",
+        PeerEvent::LocalIce(_) => "local_ice",
+        PeerEvent::Connected => "connected",
+        PeerEvent::StreamReady => "stream_ready",
+        PeerEvent::Disconnected => "disconnected",
+        PeerEvent::ControlMessage(_) => "control_message",
+        PeerEvent::ControlChannelOpen => "control_channel_open",
+        PeerEvent::VideoDataChannelOpen => "video_data_channel_open",
+        PeerEvent::KeyframeRequested => "keyframe_requested",
+        PeerEvent::Error(_) => "error",
+    }
 }
 
 fn spawn_media_pumps(
@@ -3364,6 +3515,17 @@ mod tests {
             Some(FP_B),
             IcePhase::Connected,
         ));
+    }
+
+    #[test]
+    fn peer_event_kind_covers_non_answer_variants() {
+        assert_eq!(peer_event_kind(&PeerEvent::Connected), "connected");
+        assert_eq!(peer_event_kind(&PeerEvent::StreamReady), "stream_ready");
+        assert_eq!(peer_event_kind(&PeerEvent::Disconnected), "disconnected");
+        assert_eq!(
+            peer_event_kind(&PeerEvent::KeyframeRequested),
+            "keyframe_requested"
+        );
     }
 
     #[test]
