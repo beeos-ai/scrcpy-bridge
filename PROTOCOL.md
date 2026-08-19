@@ -85,9 +85,7 @@ relay (~2.5s). A timeout that fires after ICE has come back MUST keep
 the peer — a second restart is an automatic reconnect.
 
 `close` ends the session. Emit it when the user leaves the surface, not
-when UI flags refresh (`enabled`, viewport, token refetch). Android
-ExpoView detach currently maps to `close reason=dispose`, so the JS
-owner keeps the native view mounted for the workspace lifetime.
+when UI flags or tokens refresh.
 
 ### ICE / TURN split (server-owned)
 
