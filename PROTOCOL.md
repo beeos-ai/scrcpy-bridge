@@ -118,6 +118,11 @@ therefore waits for that relay and embeds it in SDP. Trickle is still
 published as a backup. Viewer candidates that arrive before the peer
 exists are buffered, not dropped.
 
+ICE gather and scrcpy `app_process` start in parallel. The MQTT answer
+is published as soon as the UDP relay exists — it must not wait for
+the encoder. Media sockets attach after both complete. An empty answer
+still never pairs; wait-for-relay is unchanged.
+
 One process owns one media session. A same-`viewerId` offer with a
 **new** DTLS fingerprint is a second PeerConnection (iOS remount /
 params refetch / two views), not an ICE restart. While ICE is still
