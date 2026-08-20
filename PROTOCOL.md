@@ -113,10 +113,17 @@ Bootstrap ICE (this sidecar) is never filtered that way: the bridge
 must keep UDP TURN.
 
 The sidecar is the ICE answerer. A relay-only pair cannot check until
-this process has a UDP TURN allocation (~2.5 s from OKE). The answer
-therefore waits for that relay and embeds it in SDP. Trickle is still
-published as a backup. Viewer candidates that arrive before the peer
-exists are buffered, not dropped.
+this process has a UDP TURN allocation. The answer therefore waits for
+that relay and embeds it in SDP. Trickle is still published as a
+backup. Viewer candidates that arrive before the peer exists are
+buffered, not dropped.
+
+Agent Gateway bootstrap (viewport cap) is **not** on the answer path.
+ICE gather uses the last cached ICE servers. TURN hostnames are
+resolved to IPv4 when bootstrap refreshes so webrtc-rs allocate does
+not call `getaddrinfo` on `8.8.8.8`. scrcpy start may wait for the
+in-flight bootstrap so the first encoder is SKU ∩ viewport; ICE does
+not. Keep-PC encoder restart still applies a later viewport change.
 
 ICE gather and scrcpy `app_process` start in parallel. The MQTT answer
 is published as soon as the UDP relay exists — it must not wait for

@@ -13,8 +13,10 @@
 //! machine. The public API is message-passing (offer / ice / close via
 //! an mpsc channel, events via a broadcast channel).
 
+pub mod ice_url;
 pub mod peer_webrtc;
 
+pub use ice_url::resolve_ice_hosts_to_ipv4;
 pub use peer_webrtc::{
     BweSnapshot, CameraFrame, IceServer, NegotiationKind, PeerCommand, PeerEvent, PeerOptions,
     RemoteIceInit, VideoTransport, WebRtcPeer,

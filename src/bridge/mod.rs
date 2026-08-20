@@ -5,8 +5,9 @@
 //!   2. Wait for an SDP offer from the browser (first offer = first viewer).
 //!   3. ICE gather (TURN relay) and scrcpy start run **in parallel**. The
 //!      MQTT answer is published as soon as a UDP relay exists — it must
-//!      not wait for `app_process`. Encoder sockets attach after both
-//!      complete. Wait-for-relay stays: an empty answer never pairs.
+//!      not wait for `app_process` or Agent Gateway bootstrap. Encoder
+//!      sockets attach after both complete. Wait-for-relay stays: an
+//!      empty answer never pairs.
 //!   4. Pass H.264 AUs from scrcpy into the WebRTC peer.
 //!   5. Forward DataChannel control messages back to the scrcpy control
 //!      socket (no IPC, no Python involved).
@@ -53,8 +54,8 @@ use crate::scrcpy::{
     ScrcpyShutdown, VideoFrame, VideoReader,
 };
 use crate::webrtc::{
-    CameraFrame, IceServer, NegotiationKind, PeerEvent, PeerOptions, RemoteIceInit, VideoTransport,
-    WebRtcPeer,
+    resolve_ice_hosts_to_ipv4, CameraFrame, IceServer, NegotiationKind, PeerEvent, PeerOptions,
+    RemoteIceInit, VideoTransport, WebRtcPeer,
 };
 
 use self::bwe::{
@@ -308,8 +309,9 @@ pub struct Bridge {
     /// datachannel (re)opens, so late-joining viewers auto-start capture.
     cam_in_use: Arc<std::sync::atomic::AtomicBool>,
     /// Shared Agent Gateway client. Offers re-fetch stream-params `video`
-    /// so a viewer GET that persisted a viewport applies on the next
-    /// encoder start, not on the next JWT refresh ~10 minutes later.
+    /// in parallel with ICE gather so a viewer GET that persisted a
+    /// viewport applies on this encoder start, not on the next JWT
+    /// refresh ~10 minutes later.
     bootstrap_client: Option<BootstrapClient>,
 }
 
@@ -343,8 +345,12 @@ impl Bridge {
         // when a local operator explicitly supplied an extra entry that
         // bootstrap didn't include).
         {
-            let merged = merge_ice_servers(&initial_bootstrap.ice_servers, &self.cli);
-            *self.ice_servers.write().await = merged;
+            store_resolved_ice_servers(
+                &self.ice_servers,
+                &initial_bootstrap.ice_servers,
+                &self.cli,
+            )
+            .await;
         }
 
         // 2. MQTT signaling. The handle is cloneable via Arc and supports
@@ -839,17 +845,13 @@ impl Bridge {
             "received WebRTC offer"
         );
 
-        // Viewer GET stream-params persists the viewport on Runtime.
-        // Re-fetch bootstrap so this offer starts (or keep-PC restarts)
-        // the encoder at SKU ∩ that viewport, not the pod ExtraEnv.
-        let profile_changed = self.refresh_encoder_from_bootstrap(scrcpy_cfg).await;
-        if profile_changed {
-            info!(
-                event = "bridge.offer_encoder_cap_updated",
-                viewer = %viewer_id,
-                "offer encoder cap updated from bootstrap video"
-            );
-        }
+        // Viewport lives on Runtime (viewer GET stream-params). Refresh
+        // it in the background so ICE gather is not blocked on China→
+        // Singapore HTTPS (~2.5s). Fast-path ICE restart applies a
+        // keep-PC encoder restart if the cap changed; cold start waits
+        // for this task before `app_process` so the first encoder is
+        // already at SKU ∩ viewport.
+        let bootstrap_join = self.spawn_offer_bootstrap_refresh(scrcpy_cfg.clone());
 
         // Fast path — same viewer, same RTCPeerConnection, live peer:
         //   * The viewer side just re-ran `createOffer({iceRestart:
@@ -925,32 +927,12 @@ impl Bridge {
                                     session.remote_ice_ufrag = offer_ice_ufrag;
                                 }
                             }
-                            if profile_changed {
-                                if let Some(generation) =
-                                    session_generation(current_session, &viewer_id).await
-                                {
-                                    info!(
-                                        event = "bridge.offer_video_changed",
-                                        viewer = %viewer_id,
-                                        generation,
-                                        "viewport cap changed on ICE restart — keep-PC encoder restart"
-                                    );
-                                    if let Err(e) = internal_tx
-                                        .send(BridgeInternalEvent::RestartEncoder {
-                                            viewer_id: viewer_id.clone(),
-                                            generation,
-                                            reason: "viewport",
-                                            target: None,
-                                        })
-                                        .await
-                                    {
-                                        warn!(
-                                            error = %e,
-                                            "failed to queue viewport encoder restart"
-                                        );
-                                    }
-                                }
-                            }
+                            defer_viewport_encoder_restart(
+                                bootstrap_join,
+                                viewer_id.clone(),
+                                current_session.clone(),
+                                internal_tx.clone(),
+                            );
                             info!(
                                 event = "bridge.fast_path_accept_ok",
                                 viewer = %viewer_id,
@@ -989,6 +971,12 @@ impl Bridge {
                         session_fp_short = %fingerprint_short(session_fingerprint.as_deref()),
                         offer_fp_short = %dtls_fp_short,
                         "same-viewer new PeerConnection while session is live — keeping the working PC"
+                    );
+                    defer_viewport_encoder_restart(
+                        bootstrap_join,
+                        viewer_id.clone(),
+                        current_session.clone(),
+                        internal_tx.clone(),
                     );
                     return Ok(());
                 } else {
@@ -1103,16 +1091,15 @@ impl Bridge {
             );
         }
 
-        // ICE gather does not need the encoder. Starting them in series
-        // made every answer wait ~5.6s (scrcpy then TURN). Publish the
-        // MQTT answer as soon as a UDP relay exists so the viewer can
-        // check while app_process is still coming up.
+        // ICE gather does not need the encoder or a bootstrap round-trip.
+        // Starting ICE after either made every answer wait ~5s. Publish
+        // the MQTT answer as soon as a UDP relay exists so the viewer
+        // can check while app_process is still coming up.
         let adb = Adb {
             serial: self.cli.adb_serial.clone(),
             host: self.cli.adb_host.clone(),
             port: self.cli.adb_port,
         };
-        let cfg_snapshot = scrcpy_cfg.read().await.clone();
         let extra_local_ips = self.resolve_extra_local_ips();
         let ice_servers = self.ice_servers.read().await.clone();
         let ice_gather_wait = Duration::from_millis(self.cli.ice_gather_wait_ms);
@@ -1145,7 +1132,27 @@ impl Bridge {
         let scrcpy_fut = {
             let viewer_id = viewer_id.clone();
             let trace_id = trace_id.clone();
-            async move { start_scrcpy_encoder(adb, cfg_snapshot, &viewer_id, &trace_id).await }
+            let scrcpy_cfg = scrcpy_cfg.clone();
+            async move {
+                match bootstrap_join.await {
+                    Ok(true) => {
+                        info!(
+                            event = "bridge.offer_encoder_cap_updated",
+                            viewer = %viewer_id,
+                            "offer encoder cap updated from bootstrap video"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "offer bootstrap refresh task failed; starting encoder with last cap"
+                        );
+                    }
+                }
+                let cfg_snapshot = scrcpy_cfg.read().await.clone();
+                start_scrcpy_encoder(adb, cfg_snapshot, &viewer_id, &trace_id).await
+            }
         };
 
         let (peer, parts) = match tokio::join!(peer_fut, scrcpy_fut) {
@@ -1419,38 +1426,41 @@ impl Bridge {
         Ok((creds, resp))
     }
 
-    /// Re-fetch Agent Gateway bootstrap and apply `video` to the next
-    /// encoder start. Failures keep the last cap and are logged.
-    async fn refresh_encoder_from_bootstrap(
+    /// Re-fetch Agent Gateway `video` off the ICE path. The join handle
+    /// is `true` when the encoder cap changed.
+    fn spawn_offer_bootstrap_refresh(
         &self,
-        scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
-    ) -> bool {
-        let Some(client) = self.bootstrap_client.clone() else {
-            return false;
-        };
-        match client.fetch().await {
-            Ok(resp) => {
-                let mut cfg = scrcpy_cfg.write().await;
-                let changed = apply_bootstrap_video(&mut cfg, resp.video.as_ref());
-                if changed {
-                    info!(
-                        event = "bridge.bootstrap_video_applied",
-                        max_width = cfg.max_width,
-                        bitrate = cfg.bitrate,
-                        max_fps = cfg.max_fps,
-                        "encoder cap updated from bootstrap video"
-                    );
+        scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
+    ) -> tokio::task::JoinHandle<bool> {
+        let client = self.bootstrap_client.clone();
+        tokio::spawn(async move {
+            let Some(client) = client else {
+                return false;
+            };
+            match client.fetch().await {
+                Ok(resp) => {
+                    let mut cfg = scrcpy_cfg.write().await;
+                    let changed = apply_bootstrap_video(&mut cfg, resp.video.as_ref());
+                    if changed {
+                        info!(
+                            event = "bridge.bootstrap_video_applied",
+                            max_width = cfg.max_width,
+                            bitrate = cfg.bitrate,
+                            max_fps = cfg.max_fps,
+                            "encoder cap updated from bootstrap video"
+                        );
+                    }
+                    changed
                 }
-                changed
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "bootstrap video refresh failed; keeping last encoder cap"
+                    );
+                    false
+                }
             }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "bootstrap video refresh failed; keeping last encoder cap"
-                );
-                false
-            }
-        }
+        })
     }
 
     /// Spawn a background task that periodically refreshes the MQTT JWT via
@@ -1502,8 +1512,8 @@ impl Bridge {
                         // returned by Runtime also expire with the JWT,
                         // so the next `on_offer` must see the fresh
                         // username/credential pair.
-                        let merged = merge_ice_servers(&resp.ice_servers, &cli_snapshot);
-                        *ice_store.write().await = merged;
+                        store_resolved_ice_servers(&ice_store, &resp.ice_servers, &cli_snapshot)
+                            .await;
 
                         let profile_changed = {
                             let mut cfg = scrcpy_cfg.write().await;
@@ -1577,6 +1587,62 @@ impl Bridge {
 
         Ok(())
     }
+}
+
+fn defer_viewport_encoder_restart(
+    bootstrap_join: tokio::task::JoinHandle<bool>,
+    viewer_id: String,
+    current_session: Arc<Mutex<Option<Session>>>,
+    internal_tx: mpsc::Sender<BridgeInternalEvent>,
+) {
+    tokio::spawn(async move {
+        let changed = match bootstrap_join.await {
+            Ok(changed) => changed,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "offer bootstrap refresh task failed"
+                );
+                return;
+            }
+        };
+        if !changed {
+            return;
+        }
+        let Some(generation) = session_generation(&current_session, &viewer_id).await else {
+            return;
+        };
+        info!(
+            event = "bridge.offer_video_changed",
+            viewer = %viewer_id,
+            generation,
+            "viewport cap changed on ICE restart — keep-PC encoder restart"
+        );
+        if let Err(error) = internal_tx
+            .send(BridgeInternalEvent::RestartEncoder {
+                viewer_id,
+                generation,
+                reason: "viewport",
+                target: None,
+            })
+            .await
+        {
+            warn!(
+                error = %error,
+                "failed to queue viewport encoder restart"
+            );
+        }
+    });
+}
+
+async fn store_resolved_ice_servers(
+    ice_store: &Arc<RwLock<Vec<IceServer>>>,
+    bootstrap: &[IceServerPayload],
+    cli: &Cli,
+) {
+    let merged = merge_ice_servers(bootstrap, cli);
+    let resolved = resolve_ice_hosts_to_ipv4(merged).await;
+    *ice_store.write().await = resolved;
 }
 
 /// Merge the Agent Gateway bootstrap `iceServers` list (primary, Runtime-
