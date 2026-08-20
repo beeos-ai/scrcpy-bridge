@@ -118,17 +118,14 @@ that relay and embeds it in SDP. Trickle is still published as a
 backup. Viewer candidates that arrive before the peer exists are
 buffered, not dropped.
 
-Agent Gateway bootstrap (viewport cap) is **not** on the answer path.
-ICE gather uses the last cached ICE servers. TURN hostnames are
-resolved to IPv4 when bootstrap refreshes so webrtc-rs allocate does
-not call `getaddrinfo` on `8.8.8.8`. scrcpy start may wait for the
-in-flight bootstrap so the first encoder is SKU ∩ viewport; ICE does
-not. Keep-PC encoder restart still applies a later viewport change.
-
-ICE gather and scrcpy `app_process` start in parallel. The MQTT answer
-is published as soon as the UDP relay exists — it must not wait for
-the encoder. Media sockets attach after both complete. An empty answer
-still never pairs; wait-for-relay is unchanged.
+The MQTT loop owns **signaling only**. After wait-for-relay it publishes
+the answer and installs the PeerConnection so trickle ICE can be
+applied immediately. Agent Gateway bootstrap and `app_process` attach
+the encoder on a background task; they must never `await` on the
+signaling loop. TURN hostnames are resolved to IPv4 when bootstrap
+stores ICE servers. Keep-PC encoder restart is the same attach path
+as first start. An empty answer still never pairs; wait-for-relay is
+unchanged.
 
 One process owns one media session. A same-`viewerId` offer with a
 **new** DTLS fingerprint is a second PeerConnection (iOS remount /

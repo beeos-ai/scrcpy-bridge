@@ -285,6 +285,17 @@ pub struct ScrcpyShutdown {
 }
 
 impl ScrcpyShutdown {
+    /// No process, no reverse-forward. Used when the ICE session exists
+    /// before `app_process` has been attached.
+    pub fn idle(adb: Adb) -> Self {
+        Self {
+            process: None,
+            stderr_log: None,
+            adb,
+            local_port: 0,
+        }
+    }
+
     pub async fn shutdown(&mut self) {
         if let Some(mut p) = self.process.take() {
             let _ = p.start_kill();
