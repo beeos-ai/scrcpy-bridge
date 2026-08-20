@@ -3,11 +3,12 @@
 //! Lifecycle:
 //!   1. Connect MQTT signaling.
 //!   2. Wait for an SDP offer from the browser (first offer = first viewer).
-//!   3. ICE gather (TURN relay) and scrcpy start run **in parallel**. The
-//!      MQTT answer is published as soon as a UDP relay exists — it must
-//!      not wait for `app_process` or Agent Gateway bootstrap. Encoder
-//!      sockets attach after both complete. Wait-for-relay stays: an
-//!      empty answer never pairs.
+//!   3. The MQTT loop owns **signaling only**. On offer it wait-for-relay,
+//!      publishes the answer, and installs the PeerConnection into the
+//!      session so trickle ICE can be applied immediately. `app_process`
+//!      and Agent Gateway bootstrap attach the encoder on a background
+//!      task — they must never `await` on the signaling loop.
+//!      Wait-for-relay stays: an empty answer never pairs.
 //!   4. Pass H.264 AUs from scrcpy into the WebRTC peer.
 //!   5. Forward DataChannel control messages back to the scrcpy control
 //!      socket (no IPC, no Python involved).
@@ -18,6 +19,7 @@
 
 mod bwe;
 
+use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +94,10 @@ const MQTT_USERNAME: &str = "device";
 /// backgrounding on mobile Safari, and transient network blips; short
 /// enough that a real device abandonment doesn't pin the encoder.
 const SESSION_GRACE: Duration = Duration::from_secs(30);
+
+/// Monotonic id for each installed ICE session. Encoder attach tasks
+/// that finish after a replace must not bind sockets to the new peer.
+static NEXT_INSTALL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Initial bootstrap runs while the pod's networking sidecars are still
 /// converging. Retry only transport-level failures; authentication and payload
@@ -559,48 +565,41 @@ impl Bridge {
                             reason,
                             target,
                         } => {
-                            let mut guard = current_session.lock().await;
-                            let should_run = guard.as_ref().is_some_and(|session| {
-                                session.viewer_id == viewer_id
-                                    && session.encoder_generation == generation
-                                    && !session.restarting_encoder.load(Ordering::Acquire)
-                            });
-                            if !should_run {
-                                debug!(
-                                    viewer = %viewer_id,
-                                    generation,
-                                    reason,
-                                    "stale encoder restart ignored"
-                                );
-                                continue;
-                            }
-                            let Some(session) = guard.as_mut() else { continue };
-                            match self
-                                .restart_encoder(
-                                    session,
-                                    &scrcpy_cfg,
-                                    &current_session,
-                                    &internal_tx,
-                                    reason,
-                                    target,
-                                )
-                                .await
-                            {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    error!(
-                                        error = format!("{:#}", e),
+                            let plan = {
+                                let mut guard = current_session.lock().await;
+                                let should_run = guard.as_ref().is_some_and(|session| {
+                                    session.viewer_id == viewer_id
+                                        && session.encoder_generation == generation
+                                        && !session.restarting_encoder.load(Ordering::Acquire)
+                                });
+                                if !should_run {
+                                    debug!(
                                         viewer = %viewer_id,
+                                        generation,
                                         reason,
-                                        "keep-PC encoder restart failed — tearing down session"
+                                        "stale encoder restart ignored"
                                     );
-                                    if let Some(session) = guard.take() {
-                                        drop(guard);
-                                        session.shutdown().await;
-                                        self.health.scrcpy_running.store(false, Ordering::Relaxed);
-                                        SCRCPY_RUNNING.set(0);
-                                    }
+                                    None
+                                } else if let Some(session) = guard.as_mut() {
+                                    Some(prepare_encoder_restart(session, target, reason))
+                                } else {
+                                    None
                                 }
+                            };
+                            if let Some((plan, old_shutdown)) = plan {
+                                let previous = Some(tokio::spawn(async move {
+                                    let mut old_shutdown = old_shutdown;
+                                    old_shutdown.shutdown().await;
+                                }));
+                                spawn_encoder_attach(
+                                    self.health.clone(),
+                                    scrcpy_cfg.clone(),
+                                    current_session.clone(),
+                                    internal_tx.clone(),
+                                    plan,
+                                    None,
+                                    previous,
+                                );
                             }
                         }
                     }
@@ -725,97 +724,6 @@ impl Bridge {
             override_jar: self.cli.scrcpy_server_jar.clone(),
             remote_jar_path: self.cli.remote_jar_path.clone(),
         }
-    }
-
-    /// Restart `app_process` with the current (or BWE-selected) profile
-    /// and rebind media pumps onto the existing `WebRtcPeer`. Never
-    /// called from `Session::shutdown` — that path still closes the PC.
-    async fn restart_encoder(
-        &self,
-        session: &mut Session,
-        scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
-        current_session: &Arc<Mutex<Option<Session>>>,
-        internal_tx: &mpsc::Sender<BridgeInternalEvent>,
-        reason: &'static str,
-        target: Option<EncoderRung>,
-    ) -> Result<()> {
-        debug_assert_eq!(
-            encoder_restart_kind(),
-            EncoderRestartKind::KeepPeerConnection
-        );
-        session.restarting_encoder.store(true, Ordering::Release);
-        session.encoder_generation = session.encoder_generation.wrapping_add(1);
-        let generation = session.encoder_generation;
-        session.encoder_cancel.cancel();
-
-        info!(
-            event = "bridge.encoder_restart_begin",
-            viewer = %session.viewer_id,
-            generation,
-            reason,
-            target_width = target.map(|r| r.max_width),
-            target_bitrate = target.map(|r| r.bitrate),
-            "restarting scrcpy encoder — PeerConnection kept"
-        );
-
-        session.shutdown.shutdown().await;
-
-        if let Some(rung) = target {
-            let mut cfg = scrcpy_cfg.write().await;
-            rung.apply(&mut cfg);
-        }
-        let cfg_snapshot = scrcpy_cfg.read().await.clone();
-        let mut server = ScrcpyServer::new(session.adb.clone(), cfg_snapshot.clone());
-        server.start().await.context("restart scrcpy encoder")?;
-        let parts = server.split();
-        session.shutdown = parts.shutdown;
-        *session.control.write().await = parts.control;
-        session.encoder_cancel = session.cancel.child_token();
-        session.keyframes_observed.store(0, Ordering::Relaxed);
-
-        spawn_media_pumps(
-            &mut session.tasks,
-            parts.video,
-            parts.audio,
-            session.peer.clone(),
-            session.encoder_cancel.clone(),
-            current_session.clone(),
-            session.viewer_id.clone(),
-            internal_tx.clone(),
-            session.keyframes_observed.clone(),
-            generation,
-            session.restarting_encoder.clone(),
-        );
-
-        if let Err(e) = session
-            .peer
-            .send_control_text(datachannel::build_stream_restarted())
-            .await
-        {
-            warn!(error = %e, "stream_restarted after encoder restart");
-        }
-        if let Some(ctrl) = session.control.read().await.clone() {
-            if let Err(e) = ctrl.reset_video().await {
-                warn!(error = %e, "reset_video after encoder restart");
-            }
-        }
-
-        session.restarting_encoder.store(false, Ordering::Release);
-        self.health.scrcpy_running.store(true, Ordering::Relaxed);
-        SCRCPY_RUNNING.set(1);
-        SCRCPY_RECONNECTS_TOTAL.inc();
-        ENCODER_RESTARTS_TOTAL.with_label_values(&[reason]).inc();
-        info!(
-            event = "bridge.encoder_restart_end",
-            viewer = %session.viewer_id,
-            generation,
-            reason,
-            max_width = cfg_snapshot.max_width,
-            max_size = cfg_snapshot.resolved_max_size(),
-            bitrate = cfg_snapshot.bitrate,
-            "encoder restart complete — PC still up"
-        );
-        Ok(())
     }
 
     async fn on_offer(
@@ -1017,10 +925,10 @@ impl Bridge {
         //      For this case we MUST rebuild silently: the client will
         //      receive the new answer and seamlessly resume.
         //
-        // Either way we atomically cancel + join + shut down the scrcpy
-        // side before starting the new session. This guarantees no
-        // zombie task ever touches a reborn scrcpy socket.
-        if let Some(old) = current_session.lock().await.take() {
+        // Tear the old session off the signaling loop: cancel+reap in a
+        // background task so trickle ICE for the new peer is not blocked.
+        // Encoder attach waits for that task before grabbing adb-forward.
+        let previous_session_shutdown = if let Some(old) = current_session.lock().await.take() {
             // Invalidate any grace window still pointing at the old
             // viewer — otherwise, if A was in grace and B just took
             // over, A's grace timer would expire later and shut down
@@ -1073,14 +981,17 @@ impl Bridge {
                 old_viewer = %old.viewer_id,
                 "beginning old session shutdown"
             );
-            old.shutdown().await;
+            let join = tokio::spawn(async move {
+                old.shutdown().await;
+            });
             info!(
-                event = "bridge.old_recycle_end",
+                event = "bridge.old_recycle_spawned",
                 viewer = %viewer_id,
                 trace_id = %trace_id,
                 elapsed_ms = recycle_t0.elapsed().as_millis() as u64,
-                "old session shutdown complete"
+                "old session shutdown running off the signaling loop"
             );
+            Some(join)
         } else {
             info!(
                 event = "bridge.session_replace_begin",
@@ -1089,167 +1000,124 @@ impl Bridge {
                 replace_kind = "cold",
                 "no existing session — cold start"
             );
-        }
+            None
+        };
 
-        // ICE gather does not need the encoder or a bootstrap round-trip.
-        // Starting ICE after either made every answer wait ~5s. Publish
-        // the MQTT answer as soon as a UDP relay exists so the viewer
-        // can check while app_process is still coming up.
+        // Signaling: wait-for-relay, publish answer, install the PC.
+        // Encoder I/O must not run here — it would stall trickle ICE.
+        let extra_local_ips = self.resolve_extra_local_ips();
+        let ice_servers = self.ice_servers.read().await.clone();
+        let ice_gather_wait = Duration::from_millis(self.cli.ice_gather_wait_ms);
+        let ice_t0 = Instant::now();
+        let peer = spawn_peer_and_publish_answer(
+            PeerOptions {
+                ice_servers,
+                local_bind: "0.0.0.0:0".parse().unwrap(),
+                extra_local_ips,
+                ice_gather_wait,
+            },
+            offer_sdp,
+            mqtt.as_ref(),
+            &viewer_id,
+            &trace_id,
+            &dtls_fp_short,
+            offer_t0,
+        )
+        .await?;
+        let ice_elapsed = ice_t0.elapsed();
+        info!(
+            event = "bridge.ice_session_installed",
+            viewer = %viewer_id,
+            trace_id = %trace_id,
+            ice_elapsed_ms = ice_elapsed.as_millis() as u64,
+            "ICE answer published; encoder attaches off the signaling loop"
+        );
+
         let adb = Adb {
             serial: self.cli.adb_serial.clone(),
             host: self.cli.adb_host.clone(),
             port: self.cli.adb_port,
         };
-        let extra_local_ips = self.resolve_extra_local_ips();
-        let ice_servers = self.ice_servers.read().await.clone();
-        let ice_gather_wait = Duration::from_millis(self.cli.ice_gather_wait_ms);
+        let plan = self.install_ice_session(
+            peer,
+            viewer_id.clone(),
+            offer_fingerprint,
+            offer_ice_ufrag,
+            adb,
+            mqtt.clone(),
+            scrcpy_cfg.clone(),
+            current_session.clone(),
+            internal_tx.clone(),
+            trace_id.clone(),
+            dtls_fp_short.clone(),
+            offer_t0,
+        )
+        .await;
 
-        let ice_t0 = Instant::now();
-        let peer_fut = {
-            let mqtt = mqtt.clone();
-            let viewer_id = viewer_id.clone();
-            let trace_id = trace_id.clone();
-            let dtls_fp_short = dtls_fp_short.clone();
-            async move {
-                let peer = spawn_peer_and_publish_answer(
-                    PeerOptions {
-                        ice_servers,
-                        local_bind: "0.0.0.0:0".parse().unwrap(),
-                        extra_local_ips,
-                        ice_gather_wait,
-                    },
-                    offer_sdp,
-                    mqtt.as_ref(),
-                    &viewer_id,
-                    &trace_id,
-                    &dtls_fp_short,
-                    offer_t0,
-                )
-                .await?;
-                anyhow::Ok((peer, ice_t0.elapsed()))
-            }
-        };
-        let scrcpy_fut = {
-            let viewer_id = viewer_id.clone();
-            let trace_id = trace_id.clone();
-            let scrcpy_cfg = scrcpy_cfg.clone();
-            async move {
-                match bootstrap_join.await {
-                    Ok(true) => {
-                        info!(
-                            event = "bridge.offer_encoder_cap_updated",
-                            viewer = %viewer_id,
-                            "offer encoder cap updated from bootstrap video"
-                        );
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        warn!(
-                            error = %error,
-                            "offer bootstrap refresh task failed; starting encoder with last cap"
-                        );
-                    }
-                }
-                let cfg_snapshot = scrcpy_cfg.read().await.clone();
-                start_scrcpy_encoder(adb, cfg_snapshot, &viewer_id, &trace_id).await
-            }
-        };
+        spawn_encoder_attach(
+            self.health.clone(),
+            scrcpy_cfg.clone(),
+            current_session.clone(),
+            internal_tx,
+            plan,
+            Some(bootstrap_join),
+            previous_session_shutdown,
+        );
+        Ok(())
+    }
 
-        let (peer, parts) = match tokio::join!(peer_fut, scrcpy_fut) {
-            (Ok((peer, ice_elapsed)), Ok((parts, scrcpy_elapsed))) => {
-                info!(
-                    event = "bridge.ice_encoder_parallel",
-                    viewer = %viewer_id,
-                    trace_id = %trace_id,
-                    ice_elapsed_ms = ice_elapsed.as_millis() as u64,
-                    scrcpy_elapsed_ms = scrcpy_elapsed.as_millis() as u64,
-                    "ICE answer and scrcpy start finished in parallel"
-                );
-                (peer, parts)
-            }
-            (Ok((peer, _)), Err(e)) => {
-                warn!(
-                    error = format!("{:#}", e),
-                    viewer = %viewer_id,
-                    "scrcpy start failed after ICE answer — closing peer"
-                );
-                peer.close().await;
-                self.health.scrcpy_running.store(false, Ordering::Relaxed);
-                SCRCPY_RUNNING.set(0);
-                return Err(e);
-            }
-            (Err(e), Ok((mut parts, _))) => {
-                warn!(
-                    error = format!("{:#}", e),
-                    viewer = %viewer_id,
-                    "ICE answer failed — reaping scrcpy server + adb forward"
-                );
-                parts.shutdown.shutdown().await;
-                self.health.scrcpy_running.store(false, Ordering::Relaxed);
-                SCRCPY_RUNNING.set(0);
-                return Err(e);
-            }
-            (Err(ice_err), Err(scrcpy_err)) => {
-                warn!(
-                    ice_error = format!("{:#}", ice_err),
-                    scrcpy_error = format!("{:#}", scrcpy_err),
-                    viewer = %viewer_id,
-                    "ICE answer and scrcpy start both failed"
-                );
-                self.health.scrcpy_running.store(false, Ordering::Relaxed);
-                SCRCPY_RUNNING.set(0);
-                return Err(ice_err);
-            }
-        };
-
-        self.health.scrcpy_running.store(true, Ordering::Relaxed);
-        SCRCPY_RUNNING.set(1);
-        SCRCPY_RECONNECTS_TOTAL.inc();
-
-        let video_reader = parts.video;
-        let audio_reader = parts.audio;
-        let control_slot: ControlSlot = Arc::new(RwLock::new(parts.control));
-        let shutdown = parts.shutdown;
-
-        // 3. Per-session plumbing.
+    /// Peer + event pump only. Encoder sockets bind later via
+    /// [`spawn_encoder_attach`]. Returns the attach plan for this install.
+    async fn install_ice_session(
+        &self,
+        peer: WebRtcPeer,
+        viewer_id: String,
+        offer_fingerprint: Option<String>,
+        offer_ice_ufrag: Option<String>,
+        adb: Adb,
+        mqtt: Arc<MqttSignaling>,
+        scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
+        current_session: Arc<Mutex<Option<Session>>>,
+        internal_tx: mpsc::Sender<BridgeInternalEvent>,
+        trace_id: String,
+        dtls_fp_short: String,
+        offer_t0: Instant,
+    ) -> EncoderAttachPlan {
+        let install_id = NEXT_INSTALL_ID.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let encoder_cancel = cancel.child_token();
         let mut tasks: JoinSet<()> = JoinSet::new();
-
-        // Shared count of IDR keyframes the video pump has actually shipped
-        // to the peer. The event pump reads it to confirm that a
-        // `reset_video` issued on PLI really produced a fresh IDR (vs. a
-        // silently-wedged scrcpy capture), driving the keyframe-recovery
-        // escalation in `run_event_pump`.
         let keyframes_observed = Arc::new(AtomicU64::new(0));
-        let restarting_encoder = Arc::new(AtomicBool::new(false));
-        let encoder_generation = 1_u64;
+        let restarting_encoder = Arc::new(AtomicBool::new(true));
         let ice_phase = Arc::new(AtomicU8::new(IcePhase::Checking as u8));
-        let adb_for_session = Adb {
-            serial: self.cli.adb_serial.clone(),
-            host: self.cli.adb_host.clone(),
-            port: self.cli.adb_port,
+        let control_slot: ControlSlot = Arc::new(RwLock::new(None));
+        let plan = EncoderAttachPlan {
+            install_id,
+            viewer_id: viewer_id.clone(),
+            trace_id: trace_id.clone(),
+            bind_generation: 1,
+            adb: adb.clone(),
+            apply_rung: None,
+            announce_restarted: false,
+            reason: "offer",
         };
 
-        // 3a. Event pump: peer -> MQTT + control forwarding + PLI handling.
         {
             let peer_for_evt = peer.clone();
-            let mqtt_evt = mqtt.clone();
-            let control_for_evt = control_slot.clone();
-            let scrcpy_cfg_for_evt = scrcpy_cfg.clone();
-            let health = self.health.clone();
-            let session_flag_for_evt = current_session.clone();
             let cancel_for_evt = cancel.clone();
+            let session_flag_for_evt = current_session.clone();
+            let health = self.health.clone();
             let scroll_sensitivity = self.cli.scroll_sensitivity;
             let viewer_for_evt = viewer_id.clone();
-            let trace_for_evt = trace_id.clone();
-            let offer_t0_for_evt = offer_t0;
-            let dtls_fp_for_evt = dtls_fp_short.clone();
-            let internal_tx_for_evt = internal_tx.clone();
-            let keyframes_for_evt = keyframes_observed.clone();
             let camera_sink_for_evt = self.camera_sink.clone();
             let cam_in_use_for_evt = self.cam_in_use.clone();
             let ice_phase_for_evt = ice_phase.clone();
+            let keyframes_for_evt = keyframes_observed.clone();
+            let control_for_evt = control_slot.clone();
+            let mqtt_evt = mqtt;
+            let scrcpy_cfg_for_evt = scrcpy_cfg;
+            let internal_tx_for_evt = internal_tx;
+            let trace_for_evt = trace_id;
             tasks.spawn(async move {
                 run_event_pump(
                     peer_for_evt,
@@ -1262,8 +1130,8 @@ impl Bridge {
                     scroll_sensitivity,
                     viewer_for_evt,
                     trace_for_evt,
-                    offer_t0_for_evt,
-                    dtls_fp_for_evt,
+                    offer_t0,
+                    dtls_fp_short,
                     internal_tx_for_evt,
                     keyframes_for_evt,
                     camera_sink_for_evt,
@@ -1274,21 +1142,8 @@ impl Bridge {
             });
         }
 
-        spawn_media_pumps(
-            &mut tasks,
-            video_reader,
-            audio_reader,
-            peer.clone(),
-            encoder_cancel.clone(),
-            current_session.clone(),
-            viewer_id.clone(),
-            internal_tx.clone(),
-            keyframes_observed.clone(),
-            encoder_generation,
-            restarting_encoder.clone(),
-        );
-
         *current_session.lock().await = Some(Session {
+            install_id,
             viewer_id,
             remote_fingerprint: offer_fingerprint,
             remote_ice_ufrag: offer_ice_ufrag,
@@ -1296,15 +1151,15 @@ impl Bridge {
             cancel,
             encoder_cancel,
             tasks,
-            shutdown,
-            adb: adb_for_session,
+            shutdown: ScrcpyShutdown::idle(adb),
+            adb: plan.adb.clone(),
             control: control_slot,
             keyframes_observed,
-            encoder_generation,
+            encoder_generation: 0,
             restarting_encoder,
             ice_phase,
         });
-        Ok(())
+        plan
     }
 
     /// Resolve the concrete IPs to advertise as ICE host candidates. Prefers
@@ -1730,6 +1585,9 @@ fn mask_broker(url: &str) -> String {
 /// 3. scrcpy process is reaped after — not before — its readers have
 ///    observed EOF and exited.
 pub(crate) struct Session {
+    /// Identity of this ICE install. Encoder attach tasks compare this
+    /// so a late `app_process` cannot bind to a replaced PeerConnection.
+    install_id: u64,
     /// Stable per-browser identifier, echoed back by the viewer on
     /// every Offer. Used by the grace-window state machine to
     /// distinguish "same viewer reconnecting" (keep scrcpy) from
@@ -1962,6 +1820,210 @@ async fn session_owner(current_session: &Arc<Mutex<Option<Session>>>) -> Option<
         .await
         .as_ref()
         .map(|session| (session.viewer_id.clone(), session.encoder_generation))
+}
+
+struct EncoderAttachPlan {
+    install_id: u64,
+    viewer_id: String,
+    trace_id: String,
+    bind_generation: u64,
+    adb: Adb,
+    apply_rung: Option<EncoderRung>,
+    announce_restarted: bool,
+    reason: &'static str,
+}
+
+fn prepare_encoder_restart(
+    session: &mut Session,
+    target: Option<EncoderRung>,
+    reason: &'static str,
+) -> (EncoderAttachPlan, ScrcpyShutdown) {
+    debug_assert_eq!(
+        encoder_restart_kind(),
+        EncoderRestartKind::KeepPeerConnection
+    );
+    session.restarting_encoder.store(true, Ordering::Release);
+    session.encoder_generation = session.encoder_generation.wrapping_add(1);
+    session.encoder_cancel.cancel();
+    let bind_generation = session.encoder_generation;
+    info!(
+        event = "bridge.encoder_restart_begin",
+        viewer = %session.viewer_id,
+        generation = bind_generation,
+        reason,
+        target_width = target.map(|rung| rung.max_width),
+        target_bitrate = target.map(|rung| rung.bitrate),
+        "restarting scrcpy encoder — PeerConnection kept"
+    );
+    let old_shutdown = mem::replace(
+        &mut session.shutdown,
+        ScrcpyShutdown::idle(session.adb.clone()),
+    );
+    let plan = EncoderAttachPlan {
+        install_id: session.install_id,
+        viewer_id: session.viewer_id.clone(),
+        trace_id: String::new(),
+        bind_generation,
+        adb: session.adb.clone(),
+        apply_rung: target,
+        announce_restarted: true,
+        reason,
+    };
+    (plan, old_shutdown)
+}
+
+fn spawn_encoder_attach(
+    health: HealthFlags,
+    scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
+    current_session: Arc<Mutex<Option<Session>>>,
+    internal_tx: mpsc::Sender<BridgeInternalEvent>,
+    plan: EncoderAttachPlan,
+    bootstrap_join: Option<tokio::task::JoinHandle<bool>>,
+    previous_session_shutdown: Option<tokio::task::JoinHandle<()>>,
+) {
+    tokio::spawn(async move {
+        if let Some(join) = previous_session_shutdown {
+            if let Err(error) = join.await {
+                warn!(
+                    error = %error,
+                    "previous session shutdown task failed"
+                );
+            }
+        }
+        if let Some(join) = bootstrap_join {
+            match join.await {
+                Ok(true) => {
+                    info!(
+                        event = "bridge.offer_encoder_cap_updated",
+                        viewer = %plan.viewer_id,
+                        "offer encoder cap updated from bootstrap video"
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "offer bootstrap refresh task failed; starting encoder with last cap"
+                    );
+                }
+            }
+        }
+        if let Some(rung) = plan.apply_rung {
+            let mut cfg = scrcpy_cfg.write().await;
+            rung.apply(&mut cfg);
+        }
+        let cfg_snapshot = scrcpy_cfg.read().await.clone();
+        let started = start_scrcpy_encoder(
+            plan.adb.clone(),
+            cfg_snapshot.clone(),
+            &plan.viewer_id,
+            &plan.trace_id,
+        )
+        .await;
+        let (parts, encoder_elapsed) = match started {
+            Ok(ok) => ok,
+            Err(error) => {
+                warn!(
+                    error = format!("{error:#}"),
+                    viewer = %plan.viewer_id,
+                    reason = plan.reason,
+                    "encoder start failed — PeerConnection kept without media"
+                );
+                if let Some(session) = current_session.lock().await.as_mut() {
+                    if session.install_id == plan.install_id {
+                        session.restarting_encoder.store(false, Ordering::Release);
+                    }
+                }
+                health.scrcpy_running.store(false, Ordering::Relaxed);
+                SCRCPY_RUNNING.set(0);
+                return;
+            }
+        };
+
+        let mut guard = current_session.lock().await;
+        let Some(session) = guard.as_mut() else {
+            drop(guard);
+            let mut leftover = parts.shutdown;
+            leftover.shutdown().await;
+            return;
+        };
+        if session.install_id != plan.install_id || session.viewer_id != plan.viewer_id {
+            drop(guard);
+            let mut leftover = parts.shutdown;
+            leftover.shutdown().await;
+            return;
+        }
+
+        bind_encoder_parts(
+            session,
+            parts,
+            &current_session,
+            &internal_tx,
+            plan.bind_generation,
+        )
+        .await;
+        session.encoder_generation = plan.bind_generation;
+        session.restarting_encoder.store(false, Ordering::Release);
+
+        if plan.announce_restarted {
+            if let Err(error) = session
+                .peer
+                .send_control_text(datachannel::build_stream_restarted())
+                .await
+            {
+                warn!(error = %error, "stream_restarted after encoder restart");
+            }
+            if let Some(ctrl) = session.control.read().await.clone() {
+                if let Err(error) = ctrl.reset_video().await {
+                    warn!(error = %error, "reset_video after encoder restart");
+                }
+            }
+            ENCODER_RESTARTS_TOTAL
+                .with_label_values(&[plan.reason])
+                .inc();
+        }
+
+        health.scrcpy_running.store(true, Ordering::Relaxed);
+        SCRCPY_RUNNING.set(1);
+        SCRCPY_RECONNECTS_TOTAL.inc();
+        info!(
+            event = "bridge.encoder_attached",
+            viewer = %plan.viewer_id,
+            install_id = plan.install_id,
+            generation = plan.bind_generation,
+            reason = plan.reason,
+            elapsed_ms = encoder_elapsed.as_millis() as u64,
+            max_width = cfg_snapshot.max_width,
+            bitrate = cfg_snapshot.bitrate,
+            "encoder bound to live PeerConnection"
+        );
+    });
+}
+
+async fn bind_encoder_parts(
+    session: &mut Session,
+    parts: ScrcpySessionParts,
+    current_session: &Arc<Mutex<Option<Session>>>,
+    internal_tx: &mpsc::Sender<BridgeInternalEvent>,
+    generation: u64,
+) {
+    session.shutdown = parts.shutdown;
+    *session.control.write().await = parts.control;
+    session.encoder_cancel = session.cancel.child_token();
+    session.keyframes_observed.store(0, Ordering::Relaxed);
+    spawn_media_pumps(
+        &mut session.tasks,
+        parts.video,
+        parts.audio,
+        session.peer.clone(),
+        session.encoder_cancel.clone(),
+        current_session.clone(),
+        session.viewer_id.clone(),
+        internal_tx.clone(),
+        session.keyframes_observed.clone(),
+        generation,
+        session.restarting_encoder.clone(),
+    );
 }
 
 async fn start_scrcpy_encoder(
@@ -3715,6 +3777,17 @@ mod tests {
             encoder_restart_kind(),
             EncoderRestartKind::KeepPeerConnection
         );
+    }
+
+    #[tokio::test]
+    async fn idle_scrcpy_shutdown_is_a_noop() {
+        let adb = Adb {
+            serial: "unused".into(),
+            host: "127.0.0.1".into(),
+            port: 5037,
+        };
+        let mut shutdown = ScrcpyShutdown::idle(adb);
+        shutdown.shutdown().await;
     }
 
     #[test]
