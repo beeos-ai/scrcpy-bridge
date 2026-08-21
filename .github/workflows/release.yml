@@ -42,6 +42,11 @@ jobs:
           export RUSTC_WRAPPER="${RUSTC_WRAPPER:-/usr/local/bin/shared-ci-sccache}"
           export SCCACHE_WRAPPER="${SCCACHE_WRAPPER:-$RUSTC_WRAPPER}"
           export SCCACHE_BINARY="${SCCACHE_BINARY:-$RUSTC_WRAPPER}"
+          export CARGO_HOME="${CARGO_HOME:-/opt/cargo}"
+          export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${CARGO_HOME}/target}"
+          export CROSS_CUSTOM_TOOLCHAIN="${CROSS_CUSTOM_TOOLCHAIN:-1}"
+          export RUSTUP_AUTO_INSTALL="${RUSTUP_AUTO_INSTALL:-0}"
+          export SCCACHE_DIR="${SCCACHE_DIR:-/var/lib/shared-ci/organizations/beeos-ai/rust-sccache}"
           test -n "$CARGO_HOME"
           test -n "$CARGO_TARGET_DIR"
           test "$CROSS_CUSTOM_TOOLCHAIN" = 1
