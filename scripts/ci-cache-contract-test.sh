@@ -15,9 +15,14 @@ grep -Fq '"SCCACHE_BINARY=/usr/local/bin/sccache"' "$cross_config"
 grep -Fq '"SCCACHE_WRAPPER=/usr/local/bin/shared-ci-sccache"' "$cross_config"
 grep -Fq '"SCCACHE_DIR"' "$cross_config"
 
-# Linux stays on shared-ci with two-way bounded target builds; macOS and
-# Windows retain their platform-native hosted runners.
+# Linux stays on shared-ci. Tag `cross` builds are serial so two docker
+# clients cannot deadlock the daemon. macOS/Windows stay hosted.
 test "$(grep -Fc 'runs-on: [self-hosted, linux, x64, oci, shared-ci, shared-ci-heavy]' "$workflow")" = 2
-grep -Fq 'if (( ${#pids[@]} == 2 ))' "$workflow"
+grep -Fq 'SCCACHE_DIR: /var/lib/shared-ci/organizations/beeos-ai/rust-sccache' "$workflow"
+grep -Fq 'cross build --target "$target" --profile dist --locked' "$workflow"
+if grep -Fq 'if (( ${#pids[@]} == 2 ))' "$workflow"; then
+  echo "parallel cross is forbidden: it hung 0.1.38 with Compile requests=0" >&2
+  exit 1
+fi
 grep -Fq 'runs-on: macos-14' "$workflow"
 grep -Fq 'runs-on: windows-2022' "$workflow"
