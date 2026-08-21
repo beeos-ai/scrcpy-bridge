@@ -36,6 +36,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Some shared-ci-heavy slots export sccache paths; others only
+          # install the binary. Default to the org wrapper so `set -u`
+          # does not fail the PR on a runner that skipped the env file.
+          export RUSTC_WRAPPER="${RUSTC_WRAPPER:-/usr/local/bin/shared-ci-sccache}"
+          export SCCACHE_WRAPPER="${SCCACHE_WRAPPER:-$RUSTC_WRAPPER}"
+          export SCCACHE_BINARY="${SCCACHE_BINARY:-$RUSTC_WRAPPER}"
           test -n "$CARGO_HOME"
           test -n "$CARGO_TARGET_DIR"
           test "$CROSS_CUSTOM_TOOLCHAIN" = 1
