@@ -21,13 +21,22 @@ jobs:
     name: Linux quality and binaries
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, oci, shared-ci, shared-ci-heavy]
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       RUSTUP_HOME: /opt/rustup
       RUSTUP_TOOLCHAIN: 1.96.0-x86_64-unknown-linux-gnu
       RUST_TOOLCHAIN_BIN: /opt/rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin
       RUSTDOC: /opt/rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin/rustdoc
       CROSS_CONFIG: .github/cross-shared-cache.toml
+      # Job-level so `cross` inherits the volume passthrough. Step-local
+      # `export` in Verify does not apply to Build; 0.1.38 tag builds
+      # then hung 30m on docker with sccache Compile requests=0.
+      RUSTC_WRAPPER: /usr/local/bin/shared-ci-sccache
+      SCCACHE_WRAPPER: /usr/local/bin/shared-ci-sccache
+      SCCACHE_BINARY: /usr/local/bin/shared-ci-sccache
+      SCCACHE_DIR: /var/lib/shared-ci/organizations/beeos-ai/rust-sccache
+      CROSS_CUSTOM_TOOLCHAIN: "1"
+      RUSTUP_AUTO_INSTALL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -89,16 +98,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pids=()
+          # Serial: two parallel `cross` clients share one docker daemon and
+          # hung 0.1.38 for 30m with no compile requests. Stream logs so a
+          # stuck pull is visible before the job timeout.
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            cross build --target "$target" --profile dist --locked >"$RUNNER_TEMP/${target}.log" 2>&1 &
-            pids+=("$!:$target")
-            if (( ${#pids[@]} == 2 )); then
-              for item in "${pids[@]}"; do pid="${item%%:*}"; target="${item#*:}"; wait "$pid" || { cat "$RUNNER_TEMP/${target}.log"; exit 1; }; done
-              pids=()
-            fi
+            echo "=== cross $target ==="
+            cross build --target "$target" --profile dist --locked
           done
-          for item in "${pids[@]}"; do pid="${item%%:*}"; target="${item#*:}"; wait "$pid" || { cat "$RUNNER_TEMP/${target}.log"; exit 1; }; done
       - name: Package Linux artifacts
         if: github.event_name == 'push'
         shell: bash
