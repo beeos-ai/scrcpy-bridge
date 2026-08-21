@@ -257,12 +257,11 @@ fn fast_path_eligible(session_fp: Option<&str>, offer_fp: Option<&str>) -> bool 
 
 /// ICE liveness of the one session this process owns.
 ///
-/// A new DTLS fingerprint is a new PeerConnection. That is a genuine
-/// reload only after the current PC has already lost ICE. While we are
-/// still Checking or Connected, the second offer is a duplicate iOS/web
-/// pipeline (Expo remount, react-query refetch, two views) sharing the
-/// same `viewerId`. Replacing the live session is what colleagues see
-/// as "connected then 连不上" every ~6 s.
+/// Checking / Connected vs Disconnected still drives skip-restart and
+/// session grace. It is **not** a gate on answering a new offer: a new
+/// DTLS fingerprint means the viewer already discarded the old
+/// PeerConnection, so the offer must take the silent full-rebuild path
+/// even while ICE still looks Connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IcePhase {
     Checking = 0,
@@ -278,17 +277,6 @@ impl IcePhase {
             _ => Self::Checking,
         }
     }
-}
-
-fn should_ignore_duplicate_offer(
-    same_viewer: bool,
-    session_fp: Option<&str>,
-    offer_fp: Option<&str>,
-    ice_phase: IcePhase,
-) -> bool {
-    let known_new_certificate =
-        matches!((session_fp, offer_fp), (Some(session), Some(offer)) if session != offer);
-    same_viewer && known_new_certificate && ice_phase != IcePhase::Disconnected
 }
 
 pub struct Bridge {
@@ -865,34 +853,19 @@ impl Bridge {
                             // as a different-viewer takeover.
                         }
                     }
-                } else if should_ignore_duplicate_offer(
-                    true,
-                    session_fingerprint.as_deref(),
-                    offer_fingerprint.as_deref(),
-                    ice_phase,
-                ) {
-                    info!(
-                        event = "bridge.duplicate_pc_ignored",
-                        viewer = %viewer_id,
-                        trace_id = %trace_id,
-                        ?ice_phase,
-                        session_fp_short = %fingerprint_short(session_fingerprint.as_deref()),
-                        offer_fp_short = %dtls_fp_short,
-                        "same-viewer new PeerConnection while session is live — keeping the working PC"
-                    );
-                    defer_viewport_encoder_restart(
-                        bootstrap_join,
-                        viewer_id.clone(),
-                        current_session.clone(),
-                        internal_tx.clone(),
-                    );
-                    return Ok(());
                 } else {
+                    // New DTLS fingerprint = the viewer already built a
+                    // new RTCPeerConnection (reload, iframe remount,
+                    // React effect). The old PC is gone on the client,
+                    // so we must answer: silent full rebuild. Dropping
+                    // this offer (`duplicate_pc_ignored`) left web
+                    // stuck on "Connecting..." until ICE consent died.
                     info!(
                         event = "bridge.session_full_rebuild",
                         viewer = %viewer_id,
                         trace_id = %trace_id,
                         reason = "dtls_fingerprint_changed",
+                        ?ice_phase,
                         session_fp_short = %fingerprint_short(session_fingerprint.as_deref()),
                         offer_fp_short = %dtls_fp_short,
                         "same-viewer offer with new DTLS fingerprint (page reload) — full rebuild"
@@ -3595,54 +3568,6 @@ mod tests {
         }
         assert_eq!(pending.len(), PendingRemoteIce::MAX_BUFFERED);
         assert!(pending.candidates[0].candidate.ends_with(":2"));
-    }
-
-    #[test]
-    fn duplicate_offer_ignored_while_checking_or_connected() {
-        assert!(should_ignore_duplicate_offer(
-            true,
-            Some(FP_A),
-            Some(FP_B),
-            IcePhase::Checking,
-        ));
-        assert!(should_ignore_duplicate_offer(
-            true,
-            Some(FP_A),
-            Some(FP_B),
-            IcePhase::Connected,
-        ));
-    }
-
-    #[test]
-    fn duplicate_offer_accepted_after_ice_lost() {
-        assert!(!should_ignore_duplicate_offer(
-            true,
-            Some(FP_A),
-            Some(FP_B),
-            IcePhase::Disconnected,
-        ));
-    }
-
-    #[test]
-    fn duplicate_offer_never_blocks_ice_restart_or_other_viewer() {
-        assert!(!should_ignore_duplicate_offer(
-            true,
-            Some(FP_A),
-            Some(FP_A),
-            IcePhase::Connected,
-        ));
-        assert!(!should_ignore_duplicate_offer(
-            false,
-            Some(FP_A),
-            Some(FP_B),
-            IcePhase::Connected,
-        ));
-        assert!(!should_ignore_duplicate_offer(
-            true,
-            None,
-            Some(FP_B),
-            IcePhase::Connected,
-        ));
     }
 
     #[test]

@@ -128,10 +128,12 @@ as first start. An empty answer still never pairs; wait-for-relay is
 unchanged.
 
 One process owns one media session. A same-`viewerId` offer with a
-**new** DTLS fingerprint is a second PeerConnection (iOS remount /
-params refetch / two views), not an ICE restart. While ICE is still
-Checking or Connected that offer is ignored. After ICE is lost it is
-accepted as a genuine reload.
+**new** DTLS fingerprint is a second PeerConnection (page reload,
+iframe remount, two views), not an ICE restart. The viewer has already
+discarded the old PC, so the bridge MUST answer: silent full rebuild
+(same `viewerId`, no `viewer_kicked`). Ignoring that offer leaves the
+new PC without an SDP answer and the viewer stuck on "Connecting...".
+Same-fingerprint ICE restart still keeps the PC.
 
 ## C. Media
 
