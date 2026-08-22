@@ -1990,6 +1990,11 @@ a=rtpmap:102 H264/90000\r\n";
 
     #[test]
     fn ice_timeouts_survive_a_missed_consent_rtt() {
+        // Pin exact values. A "tune it back toward the crate default"
+        // change reintroduces the 5s relay-UDP flap that freezes swipe.
+        assert_eq!(ICE_DISCONNECTED_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(ICE_FAILED_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(ICE_KEEPALIVE_INTERVAL, Duration::from_secs(2));
         assert!(
             ICE_DISCONNECTED_TIMEOUT > Duration::from_secs(5),
             "5s is the webrtc-ice default that flaps relay-UDP consent"
@@ -1998,8 +2003,19 @@ a=rtpmap:102 H264/90000\r\n";
             ICE_DISCONNECTED_TIMEOUT <= Duration::from_secs(30),
             "RFC 7675 consent expires at 30s"
         );
-        assert_eq!(ICE_KEEPALIVE_INTERVAL, Duration::from_secs(2));
         assert!(ICE_FAILED_TIMEOUT > ICE_DISCONNECTED_TIMEOUT);
+    }
+
+    #[test]
+    fn run_peer_installs_ice_timeouts_on_the_setting_engine() {
+        let src = include_str!("peer_webrtc.rs");
+        assert!(
+            src.contains("setting_engine.set_ice_timeouts("),
+            "ICE timeouts must be installed on SettingEngine, not left at webrtc-ice defaults"
+        );
+        assert!(src.contains("Some(ICE_DISCONNECTED_TIMEOUT)"));
+        assert!(src.contains("Some(ICE_FAILED_TIMEOUT)"));
+        assert!(src.contains("Some(ICE_KEEPALIVE_INTERVAL)"));
     }
 
     #[test]
