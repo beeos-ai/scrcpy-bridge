@@ -775,6 +775,20 @@ async fn run_peer(
     // the public Internet. Viewers use libwebrtc TURN/TCP instead.
     let mut setting_engine = SettingEngine::default();
     setting_engine.set_network_types(vec![NetworkType::Udp4]);
+    // webrtc-ice default disconnected_timeout is 5s. The production
+    // pair is viewer-TCP-TURN ↔ bridge-UDP-TURN on the same coturn.
+    // Consent STUN (RFC 7675) over that UDP allocation is lossy: one
+    // missed 5s window marks ICE disconnected, SCTP DataChannel stops
+    // delivering, sendControl no-ops, and the last video frame stays
+    // on screen — "swipe does nothing". RFC 7675 consent expires at
+    // 30s; 15s survives a missed RTT without waiting a minute to
+    // declare the pair dead. Keepalive stays 2s so UDP NAT mappings
+    // are refreshed independently of RTP.
+    setting_engine.set_ice_timeouts(
+        Some(ICE_DISCONNECTED_TIMEOUT),
+        Some(ICE_FAILED_TIMEOUT),
+        Some(ICE_KEEPALIVE_INTERVAL),
+    );
     let api = APIBuilder::new()
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
@@ -1539,6 +1553,12 @@ fn relay_validation_deadline(legacy_hint: Duration) -> Duration {
     Duration::from_secs(10).max(legacy_hint)
 }
 
+/// See `run_peer` ICE timeout comment. Must stay above webrtc-ice's
+/// 5s default and at or below RFC 7675's 30s consent expiry.
+const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
+const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(30);
+const ICE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+
 fn sample_duration(previous_pts: &mut Option<u64>, pts_us: u64, fallback: Duration) -> Duration {
     let duration = previous_pts
         .and_then(|previous| pts_us.checked_sub(previous))
@@ -1966,6 +1986,20 @@ a=rtpmap:102 H264/90000\r\n";
             ]
         );
         assert!(has_turn_server(&usable));
+    }
+
+    #[test]
+    fn ice_timeouts_survive_a_missed_consent_rtt() {
+        assert!(
+            ICE_DISCONNECTED_TIMEOUT > Duration::from_secs(5),
+            "5s is the webrtc-ice default that flaps relay-UDP consent"
+        );
+        assert!(
+            ICE_DISCONNECTED_TIMEOUT <= Duration::from_secs(30),
+            "RFC 7675 consent expires at 30s"
+        );
+        assert_eq!(ICE_KEEPALIVE_INTERVAL, Duration::from_secs(2));
+        assert!(ICE_FAILED_TIMEOUT > ICE_DISCONNECTED_TIMEOUT);
     }
 
     #[test]
