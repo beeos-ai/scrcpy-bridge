@@ -39,6 +39,11 @@ pub const UP_HOLD: Duration = Duration::from_secs(10);
 /// Floor between any encoder restart (BWE or recovery). Prevents a tight
 /// restart loop when the network is oscillating around a threshold.
 pub const MIN_SHIFT_GAP: Duration = Duration::from_secs(8);
+/// Floor between video-eof encoder restarts. Scrcpy 3.1 NPEs
+/// `SurfaceCapture.invalidate` when a new `app_process` starts while
+/// the previous capture listener is still tearing down (~600 ms attach
+/// loop). Two seconds lets the virtual display die cleanly.
+pub const MIN_EOF_RESTART_GAP: Duration = Duration::from_secs(2);
 
 /// 1080p downshifts when the estimate stays under 1.8 Mbps (plan v1).
 pub const DOWN_THRESHOLD_1080_BPS: u64 = 1_800_000;
@@ -134,6 +139,23 @@ impl BweController {
         LADDER[self.current_idx]
     }
 
+    /// SKU / viewport ceiling. Distinct from the live encoder width
+    /// after a BWE downshift — `ScrcpyServerConfig.max_width` is the
+    /// live rung and must not be fed back into `set_cap`.
+    pub fn cap_width(&self) -> u32 {
+        LADDER[self.cap_idx].max_width
+    }
+
+    /// Start the shift-gap clock *now*. Used when the first keyframe
+    /// lands so a TWCC estimate of ~600 kbps during ICE cannot downshift
+    /// 1080→720 four seconds into the session (that restart crash-loops
+    /// scrcpy on a 1280×800 HWC + `wm size` override).
+    pub fn lock_rung(&mut self, now: Instant) {
+        self.last_shift = now;
+        self.below_since = None;
+        self.above_since = None;
+    }
+
     /// Lower (or raise) the SKU / viewport ceiling. Clamps the live
     /// rung so BWE cannot upshift past a newly persisted 720p cap.
     pub fn set_cap(&mut self, cap_width: u32) {
@@ -209,6 +231,25 @@ fn up_threshold(next: EncoderRung) -> u64 {
 pub enum EncoderEofAction {
     Ignore,
     RestartKeepPc,
+}
+
+/// If a BWE (or other) downshift dies before the first keyframe, restart
+/// at the SKU cap instead of looping the crashing lower rung. `live_width`
+/// is the encoder that just died; `cap_width` is the SKU / viewport ceiling.
+pub fn revert_rung_after_failed_generation(
+    keyframes: u64,
+    live_width: u32,
+    cap_width: u32,
+) -> Option<EncoderRung> {
+    if keyframes > 0 {
+        return None;
+    }
+    let live_idx = rung_index_for_width(live_width);
+    let cap_idx = rung_index_for_width(cap_width);
+    if live_idx >= cap_idx {
+        return None;
+    }
+    Some(LADDER[cap_idx])
 }
 
 pub fn video_eof_action(restarting: bool, generation_matches: bool) -> EncoderEofAction {
@@ -390,5 +431,31 @@ mod tests {
             encoder_restart_kind(),
             EncoderRestartKind::KeepPeerConnection
         );
+    }
+
+    #[test]
+    fn failed_720_generation_reverts_to_1080_cap() {
+        assert_eq!(
+            revert_rung_after_failed_generation(0, 720, 1080),
+            Some(RUNG_1080)
+        );
+        assert_eq!(revert_rung_after_failed_generation(1, 720, 1080), None);
+        assert_eq!(revert_rung_after_failed_generation(0, 1080, 1080), None);
+        assert_eq!(revert_rung_after_failed_generation(0, 720, 720), None);
+    }
+
+    #[test]
+    fn lock_rung_blocks_immediate_downshift() {
+        let start = t0();
+        let mut ctl = BweController::new(1080, 1080, start);
+        ctl.lock_rung(start);
+        assert_eq!(
+            ctl.observe(Some(1_000_000), start + DOWN_HOLD),
+            BweDecision::Hold
+        );
+        match ctl.observe(Some(1_000_000), start + MIN_SHIFT_GAP + DOWN_HOLD) {
+            BweDecision::Downshift(rung) => assert_eq!(rung, RUNG_720),
+            other => panic!("expected downshift after gap, got {other:?}"),
+        }
     }
 }
