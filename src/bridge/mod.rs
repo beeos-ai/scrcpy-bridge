@@ -312,6 +312,9 @@ pub struct Bridge {
     /// `ScrcpyServerConfig.max_width`; this atomic stays at the cap so a
     /// failed 720p downshift can revert to 1080p instead of crash-looping.
     encoder_cap_width: Arc<AtomicU32>,
+    /// Session floor after a failed lower rung. `0` means 720p is still
+    /// allowed; raised to the SKU cap when 720p dies before a keyframe.
+    encoder_floor_width: Arc<AtomicU32>,
 }
 
 impl Bridge {
@@ -327,6 +330,7 @@ impl Bridge {
             cam_in_use: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bootstrap_client: None,
             encoder_cap_width,
+            encoder_floor_width: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -590,6 +594,8 @@ impl Bridge {
                                             live_width,
                                             cap_width,
                                         ) {
+                                            self.encoder_floor_width
+                                                .store(cap_width, Ordering::Relaxed);
                                             info!(
                                                 event = "bridge.failed_rung_reverted",
                                                 viewer = %viewer_id,
@@ -1154,6 +1160,7 @@ impl Bridge {
             let mqtt_evt = mqtt;
             let scrcpy_cfg_for_evt = scrcpy_cfg;
             let encoder_cap_for_evt = self.encoder_cap_width.clone();
+            let encoder_floor_for_evt = self.encoder_floor_width.clone();
             let internal_tx_for_evt = internal_tx;
             let trace_for_evt = trace_id;
             tasks.spawn(async move {
@@ -1163,6 +1170,7 @@ impl Bridge {
                     control_for_evt,
                     scrcpy_cfg_for_evt,
                     encoder_cap_for_evt,
+                    encoder_floor_for_evt,
                     session_flag_for_evt,
                     health,
                     cancel_for_evt,
@@ -2253,6 +2261,7 @@ async fn run_event_pump(
     control: ControlSlot,
     scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
     encoder_cap_width: Arc<AtomicU32>,
+    encoder_floor_width: Arc<AtomicU32>,
     current_session: Arc<Mutex<Option<Session>>>,
     health: HealthFlags,
     cancel: CancellationToken,
@@ -2305,6 +2314,7 @@ async fn run_event_pump(
                     bwe_armed = true;
                 }
                 bwe.set_cap(encoder_cap_width.load(Ordering::Relaxed));
+                bwe.set_floor(encoder_floor_width.load(Ordering::Relaxed));
                 let snapshot = peer.query_bwe().await;
                 let viewer_rx = VIEWER_BITRATE_BPS.get().max(0.0) as u64;
                 let estimate = combine_estimates(

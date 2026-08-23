@@ -79,20 +79,19 @@ pub fn rung_index_for_width(max_width: u32) -> usize {
     }
 }
 
-/// Combine sender-side WebRTC stats with the viewer's reported receive
-/// bitrate. Prefer the most conservative positive sample so a lying
-/// `availableOutgoingBitrate` of 0 does not block a real downshift.
+/// Combine sender-side send rate with the viewer's reported receive
+/// bitrate. `available_outgoing_bps` is GCC/ICE TWCC; on TURN-TCP it
+/// sits around 0.5 Mbps even while a 1080p encode is healthy, and
+/// `min()` then always downshifts 1080→720. That restart crash-loops
+/// scrcpy on Redroid HWC (`Physical 1280x800` + `wm size` override).
+/// Ignore the ICE sample. If neither send nor receive is populated,
+/// return `None` so BWE Holds instead of acting on a false floor.
 pub fn combine_estimates(
-    available_outgoing_bps: Option<u64>,
+    _available_outgoing_bps: Option<u64>,
     outbound_video_bps: Option<u64>,
     viewer_rx_bps: u64,
 ) -> Option<u64> {
-    let mut samples = Vec::with_capacity(3);
-    if let Some(bps) = available_outgoing_bps {
-        if bps > 0 {
-            samples.push(bps);
-        }
-    }
+    let mut samples = Vec::with_capacity(2);
     if viewer_rx_bps > 0 {
         samples.push(viewer_rx_bps);
     }
@@ -115,6 +114,9 @@ pub enum BweDecision {
 pub struct BweController {
     current_idx: usize,
     cap_idx: usize,
+    /// Lowest rung still allowed this session. Raised to the SKU cap
+    /// after a downshift dies before a keyframe so we never retry 720p.
+    floor_idx: usize,
     below_since: Option<Instant>,
     above_since: Option<Instant>,
     last_shift: Instant,
@@ -129,6 +131,7 @@ impl BweController {
         Self {
             current_idx,
             cap_idx,
+            floor_idx: 0,
             below_since: None,
             above_since: None,
             last_shift: now - MIN_SHIFT_GAP,
@@ -160,8 +163,25 @@ impl BweController {
     /// rung so BWE cannot upshift past a newly persisted 720p cap.
     pub fn set_cap(&mut self, cap_width: u32) {
         self.cap_idx = rung_index_for_width(cap_width);
+        if self.floor_idx > self.cap_idx {
+            self.floor_idx = self.cap_idx;
+        }
         if self.current_idx > self.cap_idx {
             self.current_idx = self.cap_idx;
+        }
+    }
+
+    /// Ban every rung below `floor_width` for the rest of this session.
+    /// `0` means "no extra floor" (ladder index 0 / 720p still allowed).
+    pub fn set_floor(&mut self, floor_width: u32) {
+        let floor_idx = if floor_width == 0 {
+            0
+        } else {
+            rung_index_for_width(floor_width)
+        };
+        self.floor_idx = floor_idx.min(self.cap_idx);
+        if self.current_idx < self.floor_idx {
+            self.current_idx = self.floor_idx;
         }
     }
 
@@ -204,7 +224,7 @@ impl BweController {
     }
 
     fn can_downshift(&self) -> bool {
-        self.current_idx > 0
+        self.current_idx > self.floor_idx
     }
 
     fn can_upshift(&self) -> bool {
@@ -292,13 +312,20 @@ mod tests {
     }
 
     #[test]
-    fn combine_picks_minimum_positive_sample() {
+    fn combine_picks_minimum_positive_send_or_receive() {
         assert_eq!(
             combine_estimates(Some(4_000_000), Some(3_000_000), 1_200_000),
             Some(1_200_000)
         );
         assert_eq!(combine_estimates(Some(0), None, 0), None);
         assert_eq!(combine_estimates(None, Some(2_500_000), 0), Some(2_500_000));
+        // TURN-TCP ICE TWCC ~0.5 Mbps must not veto a healthy send rate,
+        // and must not downshift when it is the only sample.
+        assert_eq!(
+            combine_estimates(Some(518_000), Some(3_000_000), 0),
+            Some(3_000_000)
+        );
+        assert_eq!(combine_estimates(Some(518_000), None, 0), None);
     }
 
     #[test]
@@ -457,5 +484,27 @@ mod tests {
             BweDecision::Downshift(rung) => assert_eq!(rung, RUNG_720),
             other => panic!("expected downshift after gap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_floor_bans_720_after_failed_downshift() {
+        let start = t0();
+        let mut ctl = BweController::new(1080, 1080, start);
+        assert!(matches!(
+            ctl.observe(Some(1_000_000), start),
+            BweDecision::Hold
+        ));
+        assert!(matches!(
+            ctl.observe(Some(1_000_000), start + DOWN_HOLD),
+            BweDecision::Downshift(_)
+        ));
+        assert_eq!(ctl.current_rung(), RUNG_720);
+        ctl.set_floor(1080);
+        assert_eq!(ctl.current_rung(), RUNG_1080);
+        assert_eq!(
+            ctl.observe(Some(100_000), start + Duration::from_secs(30)),
+            BweDecision::Hold
+        );
+        assert_eq!(ctl.current_rung(), RUNG_1080);
     }
 }
