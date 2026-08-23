@@ -2030,11 +2030,12 @@ fn spawn_encoder_attach(
             {
                 warn!(error = %error, "stream_restarted after encoder restart");
             }
-            if let Some(ctrl) = session.control.read().await.clone() {
-                if let Err(error) = ctrl.reset_video().await {
-                    warn!(error = %error, "reset_video after encoder restart");
-                }
-            }
+            // Do not `reset_video` here. The new `app_process` has not
+            // attached `SurfaceCapture`'s listener yet; scrcpy 3.1 NPEs
+            // in `invalidate()` and the control thread dies, which is
+            // the video-eof crash-loop on Redroid HWC. The new encoder
+            // emits a natural IDR. `StreamReady` / PLI only reset after
+            // `keyframes_observed > 0`, which proves the listener exists.
             ENCODER_RESTARTS_TOTAL
                 .with_label_values(&[plan.reason])
                 .inc();
