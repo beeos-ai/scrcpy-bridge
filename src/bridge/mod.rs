@@ -20,7 +20,7 @@
 mod bwe;
 
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,8 +61,9 @@ use crate::webrtc::{
 };
 
 use self::bwe::{
-    combine_estimates, encoder_restart_kind, video_eof_action, BweController, BweDecision,
-    EncoderEofAction, EncoderRestartKind, EncoderRung,
+    combine_estimates, encoder_restart_kind, revert_rung_after_failed_generation, video_eof_action,
+    BweController, BweDecision, EncoderEofAction, EncoderRestartKind, EncoderRung,
+    MIN_EOF_RESTART_GAP,
 };
 
 type ControlSlot = Arc<RwLock<Option<Arc<ControlSocket>>>>;
@@ -307,11 +308,16 @@ pub struct Bridge {
     /// viewport applies on this encoder start, not on the next JWT
     /// refresh ~10 minutes later.
     bootstrap_client: Option<BootstrapClient>,
+    /// SKU / viewport encoder ceiling. BWE writes the *live* rung into
+    /// `ScrcpyServerConfig.max_width`; this atomic stays at the cap so a
+    /// failed 720p downshift can revert to 1080p instead of crash-looping.
+    encoder_cap_width: Arc<AtomicU32>,
 }
 
 impl Bridge {
     pub fn new(cli: Cli, health: HealthFlags) -> Self {
         let (camera_sink, cam_events) = CameraSink::spawn(cli.camera_sink_addr.clone());
+        let encoder_cap_width = Arc::new(AtomicU32::new(cli.max_width));
         Self {
             cli,
             health,
@@ -320,6 +326,7 @@ impl Bridge {
             cam_events: Some(cam_events),
             cam_in_use: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bootstrap_client: None,
+            encoder_cap_width,
         }
     }
 
@@ -410,6 +417,8 @@ impl Bridge {
             );
         }
         let scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>> = Arc::new(RwLock::new(initial_cfg));
+        self.encoder_cap_width
+            .store(scrcpy_cfg.read().await.max_width, Ordering::Relaxed);
 
         // Health signals from the per-session event pump flow through a
         // single mpsc so grace-window decisions live in one place. Cloned
@@ -569,7 +578,61 @@ impl Bridge {
                                     );
                                     None
                                 } else if let Some(session) = guard.as_mut() {
-                                    Some(prepare_encoder_restart(session, target, reason))
+                                    if matches!(reason, "video-eof" | "video-error") {
+                                        let keyframes =
+                                            session.keyframes_observed.load(Ordering::Relaxed);
+                                        let lived = session.last_encoder_attached.elapsed();
+                                        let live_width = scrcpy_cfg.read().await.max_width;
+                                        let cap_width =
+                                            self.encoder_cap_width.load(Ordering::Relaxed);
+                                        if let Some(rung) = revert_rung_after_failed_generation(
+                                            keyframes,
+                                            live_width,
+                                            cap_width,
+                                        ) {
+                                            info!(
+                                                event = "bridge.failed_rung_reverted",
+                                                viewer = %viewer_id,
+                                                generation,
+                                                from_width = live_width,
+                                                to_width = rung.max_width,
+                                                "encoder died before a keyframe — reverting to SKU cap"
+                                            );
+                                            Some(prepare_encoder_restart(session, Some(rung), reason))
+                                        } else if keyframes == 0 && lived < MIN_EOF_RESTART_GAP {
+                                            let wait = MIN_EOF_RESTART_GAP.saturating_sub(lived);
+                                            let tx = internal_tx.clone();
+                                            let delayed_viewer = viewer_id.clone();
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(wait).await;
+                                                if let Err(e) = tx
+                                                    .send(BridgeInternalEvent::RestartEncoder {
+                                                        viewer_id: delayed_viewer,
+                                                        generation,
+                                                        reason,
+                                                        target: None,
+                                                    })
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        error = %e,
+                                                        "failed to requeue delayed eof encoder restart"
+                                                    );
+                                                }
+                                            });
+                                            debug!(
+                                                viewer = %viewer_id,
+                                                generation,
+                                                wait_ms = wait.as_millis() as u64,
+                                                "delaying eof encoder restart — previous generation died too fast"
+                                            );
+                                            None
+                                        } else {
+                                            Some(prepare_encoder_restart(session, target, reason))
+                                        }
+                                    } else {
+                                        Some(prepare_encoder_restart(session, target, reason))
+                                    }
                                 } else {
                                     None
                                 }
@@ -1011,21 +1074,22 @@ impl Bridge {
             host: self.cli.adb_host.clone(),
             port: self.cli.adb_port,
         };
-        let plan = self.install_ice_session(
-            peer,
-            viewer_id.clone(),
-            offer_fingerprint,
-            offer_ice_ufrag,
-            adb,
-            mqtt.clone(),
-            scrcpy_cfg.clone(),
-            current_session.clone(),
-            internal_tx.clone(),
-            trace_id.clone(),
-            dtls_fp_short.clone(),
-            offer_t0,
-        )
-        .await;
+        let plan = self
+            .install_ice_session(
+                peer,
+                viewer_id.clone(),
+                offer_fingerprint,
+                offer_ice_ufrag,
+                adb,
+                mqtt.clone(),
+                scrcpy_cfg.clone(),
+                current_session.clone(),
+                internal_tx.clone(),
+                trace_id.clone(),
+                dtls_fp_short.clone(),
+                offer_t0,
+            )
+            .await;
 
         spawn_encoder_attach(
             self.health.clone(),
@@ -1089,6 +1153,7 @@ impl Bridge {
             let control_for_evt = control_slot.clone();
             let mqtt_evt = mqtt;
             let scrcpy_cfg_for_evt = scrcpy_cfg;
+            let encoder_cap_for_evt = self.encoder_cap_width.clone();
             let internal_tx_for_evt = internal_tx;
             let trace_for_evt = trace_id;
             tasks.spawn(async move {
@@ -1097,6 +1162,7 @@ impl Bridge {
                     mqtt_evt,
                     control_for_evt,
                     scrcpy_cfg_for_evt,
+                    encoder_cap_for_evt,
                     session_flag_for_evt,
                     health,
                     cancel_for_evt,
@@ -1130,6 +1196,7 @@ impl Bridge {
             keyframes_observed,
             encoder_generation: 0,
             restarting_encoder,
+            last_encoder_attached: std::time::Instant::now(),
             ice_phase,
         });
         plan
@@ -1261,6 +1328,7 @@ impl Bridge {
         scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
     ) -> tokio::task::JoinHandle<bool> {
         let client = self.bootstrap_client.clone();
+        let cap_width = self.encoder_cap_width.clone();
         tokio::spawn(async move {
             let Some(client) = client else {
                 return false;
@@ -1270,6 +1338,7 @@ impl Bridge {
                     let mut cfg = scrcpy_cfg.write().await;
                     let changed = apply_bootstrap_video(&mut cfg, resp.video.as_ref());
                     if changed {
+                        cap_width.store(cfg.max_width, Ordering::Relaxed);
                         info!(
                             event = "bridge.bootstrap_video_applied",
                             max_width = cfg.max_width,
@@ -1332,6 +1401,7 @@ impl Bridge {
         let health = self.health.clone();
         let ice_store = self.ice_servers.clone();
         let cli_snapshot = self.cli.clone();
+        let encoder_cap = self.encoder_cap_width.clone();
         tokio::spawn(async move {
             while let Some(evt) = rx.recv().await {
                 match evt {
@@ -1345,7 +1415,11 @@ impl Bridge {
 
                         let profile_changed = {
                             let mut cfg = scrcpy_cfg.write().await;
-                            apply_bootstrap_video(&mut cfg, resp.video.as_ref())
+                            let changed = apply_bootstrap_video(&mut cfg, resp.video.as_ref());
+                            if changed {
+                                encoder_cap.store(cfg.max_width, Ordering::Relaxed);
+                            }
+                            changed
                         };
                         if profile_changed {
                             if let Some((viewer_id, generation)) =
@@ -1591,6 +1665,7 @@ pub(crate) struct Session {
     keyframes_observed: Arc<AtomicU64>,
     encoder_generation: u64,
     restarting_encoder: Arc<AtomicBool>,
+    last_encoder_attached: std::time::Instant,
     /// Shared with the event pump so `on_offer` can refuse a second
     /// PeerConnection while this one is still checking or connected.
     ice_phase: Arc<AtomicU8>,
@@ -1936,6 +2011,7 @@ fn spawn_encoder_attach(
         )
         .await;
         session.encoder_generation = plan.bind_generation;
+        session.last_encoder_attached = std::time::Instant::now();
         session.restarting_encoder.store(false, Ordering::Release);
 
         if plan.announce_restarted {
@@ -2176,6 +2252,7 @@ async fn run_event_pump(
     mqtt: Arc<MqttSignaling>,
     control: ControlSlot,
     scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
+    encoder_cap_width: Arc<AtomicU32>,
     current_session: Arc<Mutex<Option<Session>>>,
     health: HealthFlags,
     cancel: CancellationToken,
@@ -2206,9 +2283,10 @@ async fn run_event_pump(
     recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut bwe_tick = tokio::time::interval(Duration::from_secs(1));
     bwe_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let cap_width = scrcpy_cfg.read().await.max_width;
+    let cap_width = encoder_cap_width.load(Ordering::Relaxed);
     let live_width = cap_width;
     let mut bwe = BweController::new(cap_width, live_width, std::time::Instant::now());
+    let mut bwe_armed = false;
     let mut ice_disconnected_at: Option<Instant> = None;
 
     loop {
@@ -2219,8 +2297,14 @@ async fn run_event_pump(
                 return;
             }
             _ = bwe_tick.tick() => {
-                let cap_width = scrcpy_cfg.read().await.max_width;
-                bwe.set_cap(cap_width);
+                if keyframes_observed.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                if !bwe_armed {
+                    bwe.lock_rung(std::time::Instant::now());
+                    bwe_armed = true;
+                }
+                bwe.set_cap(encoder_cap_width.load(Ordering::Relaxed));
                 let snapshot = peer.query_bwe().await;
                 let viewer_rx = VIEWER_BITRATE_BPS.get().max(0.0) as u64;
                 let estimate = combine_estimates(
