@@ -5,6 +5,8 @@
 
 use anyhow::Result;
 use bytes::{BufMut, BytesMut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -13,6 +15,9 @@ use super::protocol::{ControlType, KeyAction, TouchAction};
 
 pub struct ControlSocket {
     writer: Mutex<tokio::net::tcp::OwnedWriteHalf>,
+    connected_at: Instant,
+    last_video_reset: Mutex<Option<Instant>>,
+    video_ready: AtomicBool,
     /// Background task that drains the server → client half of the socket so
     /// the kernel's receive buffer never fills up.
     _drainer: tokio::task::JoinHandle<()>,
@@ -31,6 +36,9 @@ impl ControlSocket {
             }
         });
         Self {
+            connected_at: Instant::now(),
+            last_video_reset: Mutex::new(None),
+            video_ready: AtomicBool::new(false),
             writer: Mutex::new(write_half),
             _drainer: drainer,
         }
@@ -159,9 +167,30 @@ impl ControlSocket {
     }
 
     /// Ask the encoder for a fresh IDR (clears any decoder-side freeze).
-    pub async fn reset_video(&self) -> Result<()> {
-        self.send(&[ControlType::ResetVideo as u8]).await
+    pub fn mark_video_ready(&self) {
+        self.video_ready.store(true, Ordering::Release);
     }
+
+    /// Returns false when capture startup or rate limiting prevented a send.
+    pub async fn reset_video(&self) -> Result<bool> {
+        // PLI, datachannel and recovery paths share this socket. Separate
+        // caller throttles can otherwise overlap scrcpy capture teardown.
+        let mut last = self.last_video_reset.lock().await;
+        let now = Instant::now();
+        if !self.video_ready.load(Ordering::Acquire)
+            || !video_reset_allowed(self.connected_at, *last, now)
+        {
+            return Ok(false);
+        }
+        self.send(&[ControlType::ResetVideo as u8]).await?;
+        *last = Some(now);
+        Ok(true)
+    }
+}
+
+fn video_reset_allowed(connected_at: Instant, last: Option<Instant>, now: Instant) -> bool {
+    now.duration_since(connected_at) >= Duration::from_secs(2)
+        && last.map_or(true, |at| now.duration_since(at) >= Duration::from_secs(1))
 }
 
 fn float_to_i16_fp(v: f32) -> i16 {
@@ -215,6 +244,51 @@ fn utf8_chunks(s: &str, max_bytes: usize) -> impl Iterator<Item = &str> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn reset_reports_only_commands_actually_sent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let mut control = ControlSocket::new(client.unwrap());
+        let (mut server, _) = accepted.unwrap();
+        assert!(!control.reset_video().await.unwrap());
+        control.connected_at -= Duration::from_secs(3);
+        assert!(!control.reset_video().await.unwrap());
+        control.mark_video_ready();
+        assert!(control.reset_video().await.unwrap());
+        assert_eq!(
+            server.read_u8().await.unwrap(),
+            ControlType::ResetVideo as u8
+        );
+        assert!(!control.reset_video().await.unwrap());
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            server.try_read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn video_reset_gate_protects_startup_and_all_request_paths() {
+        let start = std::time::Instant::now();
+        assert!(!super::video_reset_allowed(
+            start,
+            None,
+            start + std::time::Duration::from_secs(1),
+        ));
+        let first = start + std::time::Duration::from_secs(2);
+        assert!(super::video_reset_allowed(start, None, first));
+        assert!(!super::video_reset_allowed(
+            start,
+            Some(first),
+            first + std::time::Duration::from_millis(500),
+        ));
+        assert!(super::video_reset_allowed(
+            start,
+            Some(first),
+            first + std::time::Duration::from_secs(1),
+        ));
+    }
     use super::*;
 
     #[test]
@@ -244,9 +318,9 @@ mod tests {
     fn utf8_chunks_never_splits_multibyte_char() {
         // Each Chinese char is 3 bytes in UTF-8.
         let s = "你好世界啊"; // 5 chars * 3 bytes = 15 bytes
-        // Cap at 4 bytes: each chunk should fit exactly one 3-byte char
-        // (the 4th byte would start the next char, which is not a boundary
-        // if we stopped at byte 4 — we must walk back to byte 3).
+                              // Cap at 4 bytes: each chunk should fit exactly one 3-byte char
+                              // (the 4th byte would start the next char, which is not a boundary
+                              // if we stopped at byte 4 — we must walk back to byte 3).
         let chunks: Vec<&str> = utf8_chunks(s, 4).collect();
         for chunk in &chunks {
             assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());

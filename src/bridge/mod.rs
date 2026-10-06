@@ -100,6 +100,10 @@ const SESSION_GRACE: Duration = Duration::from_secs(30);
 /// that finish after a replace must not bind sockets to the new peer.
 static NEXT_INSTALL_ID: AtomicU64 = AtomicU64::new(1);
 
+fn encoder_event_matches(live: (u64, u64), event: (u64, u64)) -> bool {
+    live == event
+}
+
 /// Initial bootstrap runs while the pod's networking sidecars are still
 /// converging. Retry only transport-level failures; authentication and payload
 /// errors are deterministic and must fail immediately.
@@ -114,13 +118,14 @@ const INITIAL_BOOTSTRAP_MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
 enum BridgeInternalEvent {
     /// Peer reached `Connected` (or came back after an ICE blip). The
     /// main loop clears grace if it was armed for the matching viewer.
-    ViewerConnected { viewer_id: String },
+    ViewerConnected { viewer_id: String, install_id: u64 },
     /// Peer observed something that might turn into session death:
     /// `IceConnectionState::Disconnected` (transient) or `Failed`
     /// (requires ICE restart to recover). The main loop arms / extends
     /// the grace window; no teardown happens unless the window expires.
     ViewerUnhealthy {
         viewer_id: String,
+        install_id: u64,
         reason: &'static str,
     },
     /// The named viewer's session is being (or has already been) torn
@@ -130,11 +135,12 @@ enum BridgeInternalEvent {
     /// still pointing at the dead viewer so it can't expire later and
     /// accidentally shut down a freshly installed session belonging
     /// to someone else.
-    ClearGraceFor { viewer_id: String },
+    ClearGraceFor { viewer_id: String, install_id: u64 },
     /// Restart scrcpy (`app_process`) without closing the WebRTC peer.
     /// `generation` must still match `Session.encoder_generation` or the
     /// event is ignored (stale pump / overlapping BWE).
     RestartEncoder {
+        install_id: u64,
         viewer_id: String,
         generation: u64,
         reason: &'static str,
@@ -146,14 +152,20 @@ enum BridgeInternalEvent {
 /// beyond the main loop.
 struct SessionGrace {
     viewer_id: String,
+    install_id: u64,
     deadline: tokio::time::Instant,
     reason: &'static str,
 }
 
-fn arm_grace(slot: &mut Option<SessionGrace>, viewer_id: String, reason: &'static str) {
+fn arm_grace(
+    slot: &mut Option<SessionGrace>,
+    viewer_id: String,
+    install_id: u64,
+    reason: &'static str,
+) {
     let deadline = tokio::time::Instant::now() + SESSION_GRACE;
     match slot {
-        Some(g) if g.viewer_id == viewer_id => {
+        Some(g) if g.viewer_id == viewer_id && g.install_id == install_id => {
             // Extend the existing window — repeated health signals for
             // the same viewer reset the clock so a viewer that keeps
             // flapping doesn't get kicked out by our grace timer.
@@ -170,6 +182,7 @@ fn arm_grace(slot: &mut Option<SessionGrace>, viewer_id: String, reason: &'stati
             );
             *slot = Some(SessionGrace {
                 viewer_id,
+                install_id,
                 deadline,
                 reason,
             });
@@ -501,7 +514,7 @@ impl Bridge {
                         let mut guard = current_session.lock().await;
                         let owned = guard
                             .as_ref()
-                            .map(|s| s.viewer_id == g.viewer_id)
+                            .map(|s| s.viewer_id == g.viewer_id && s.install_id == g.install_id)
                             .unwrap_or(false);
                         if owned {
                             if let Some(session) = guard.take() {
@@ -532,27 +545,27 @@ impl Bridge {
                         break;
                     };
                     match ev {
-                        BridgeInternalEvent::ViewerConnected { viewer_id } => {
-                            if matches!(&grace, Some(g) if g.viewer_id == viewer_id) {
+                        BridgeInternalEvent::ViewerConnected { viewer_id, install_id } => {
+                            if matches!(&grace, Some(g) if g.viewer_id == viewer_id && g.install_id == install_id) {
                                 info!(viewer = %viewer_id, "viewer healthy again — cancelling grace");
                                 grace = None;
                             }
                         }
-                        BridgeInternalEvent::ViewerUnhealthy { viewer_id, reason } => {
+                        BridgeInternalEvent::ViewerUnhealthy { viewer_id, install_id, reason } => {
                             // Only arm grace if this viewer is still the
                             // owner of the active session. A stale event
                             // for an already-replaced viewer would keep
                             // the new viewer's session on the hook.
                             let still_owner = {
                                 let guard = current_session.lock().await;
-                                guard.as_ref().map(|s| s.viewer_id == viewer_id).unwrap_or(false)
+                                guard.as_ref().map(|s| s.viewer_id == viewer_id && s.install_id == install_id).unwrap_or(false)
                             };
                             if still_owner {
-                                arm_grace(&mut grace, viewer_id, reason);
+                                arm_grace(&mut grace, viewer_id, install_id, reason);
                             }
                         }
-                        BridgeInternalEvent::ClearGraceFor { viewer_id } => {
-                            if matches!(&grace, Some(g) if g.viewer_id == viewer_id) {
+                        BridgeInternalEvent::ClearGraceFor { viewer_id, install_id } => {
+                            if matches!(&grace, Some(g) if g.viewer_id == viewer_id && g.install_id == install_id) {
                                 info!(
                                     viewer = %viewer_id,
                                     "grace cleared — owning viewer is being torn down deliberately"
@@ -561,6 +574,7 @@ impl Bridge {
                             }
                         }
                         BridgeInternalEvent::RestartEncoder {
+                            install_id,
                             viewer_id,
                             generation,
                             reason,
@@ -569,8 +583,8 @@ impl Bridge {
                             let plan = {
                                 let mut guard = current_session.lock().await;
                                 let should_run = guard.as_ref().is_some_and(|session| {
-                                    session.viewer_id == viewer_id
-                                        && session.encoder_generation == generation
+                                    encoder_event_matches((session.install_id, session.encoder_generation), (install_id, generation))
+                                        && session.viewer_id == viewer_id
                                         && !session.restarting_encoder.load(Ordering::Acquire)
                                 });
                                 if !should_run {
@@ -613,6 +627,7 @@ impl Bridge {
                                                 tokio::time::sleep(wait).await;
                                                 if let Err(e) = tx
                                                     .send(BridgeInternalEvent::RestartEncoder {
+                                                        install_id,
                                                         viewer_id: delayed_viewer,
                                                         generation,
                                                         reason,
@@ -736,10 +751,10 @@ impl Bridge {
                             // grace against the live session.
                             let owner = {
                                 let guard = current_session.lock().await;
-                                guard.as_ref().map(|s| s.viewer_id.clone())
+                                guard.as_ref().map(|s| (s.viewer_id.clone(), s.install_id))
                             };
                             match owner {
-                                Some(v) => {
+                                Some((v, install_id)) => {
                                     if !viewer_id.is_empty() && viewer_id != v {
                                         info!(
                                             %reason,
@@ -749,7 +764,7 @@ impl Bridge {
                                         );
                                     } else {
                                         info!(%reason, viewer = %v, "viewer close — entering session grace");
-                                        arm_grace(&mut grace, v, "viewer close");
+                                        arm_grace(&mut grace, v, install_id, "viewer close");
                                     }
                                 }
                                 None => {
@@ -858,6 +873,7 @@ impl Bridge {
                     .filter(|s| s.viewer_id == viewer_id)
                     .map(|s| {
                         (
+                            s.install_id,
                             s.peer.clone(),
                             s.remote_fingerprint.clone(),
                             s.remote_ice_ufrag.clone(),
@@ -865,7 +881,9 @@ impl Bridge {
                         )
                     })
             };
-            if let Some((peer, session_fingerprint, session_ice_ufrag, ice_phase)) = peer_opt {
+            if let Some((install_id, peer, session_fingerprint, session_ice_ufrag, ice_phase)) =
+                peer_opt
+            {
                 if fast_path_eligible(session_fingerprint.as_deref(), offer_fingerprint.as_deref())
                 {
                     let kind = classify_in_place_negotiation(
@@ -888,13 +906,16 @@ impl Bridge {
                     match peer.accept_offer(offer_sdp.clone(), kind).await {
                         Ok(()) => {
                             if let Some(session) = current_session.lock().await.as_mut() {
-                                if session.viewer_id == viewer_id {
+                                if session.viewer_id == viewer_id
+                                    && session.install_id == install_id
+                                {
                                     session.remote_ice_ufrag = offer_ice_ufrag;
                                 }
                             }
                             defer_viewport_encoder_restart(
                                 bootstrap_join,
                                 viewer_id.clone(),
+                                install_id,
                                 current_session.clone(),
                                 internal_tx.clone(),
                             );
@@ -979,6 +1000,7 @@ impl Bridge {
             let _ = internal_tx
                 .send(BridgeInternalEvent::ClearGraceFor {
                     viewer_id: old.viewer_id.clone(),
+                    install_id: old.install_id,
                 })
                 .await;
             let replace_kind = if old.viewer_id != viewer_id {
@@ -1184,6 +1206,7 @@ impl Bridge {
                     camera_sink_for_evt,
                     cam_in_use_for_evt,
                     ice_phase_for_evt,
+                    install_id,
                 )
                 .await;
             });
@@ -1430,7 +1453,7 @@ impl Bridge {
                             changed
                         };
                         if profile_changed {
-                            if let Some((viewer_id, generation)) =
+                            if let Some((viewer_id, install_id, generation)) =
                                 session_owner(&current_session).await
                             {
                                 info!(
@@ -1441,6 +1464,7 @@ impl Bridge {
                                 );
                                 if let Err(e) = internal_tx
                                     .send(BridgeInternalEvent::RestartEncoder {
+                                        install_id,
                                         viewer_id,
                                         generation,
                                         reason: "bootstrap_video",
@@ -1502,6 +1526,7 @@ impl Bridge {
 fn defer_viewport_encoder_restart(
     bootstrap_join: tokio::task::JoinHandle<bool>,
     viewer_id: String,
+    owner_install_id: u64,
     current_session: Arc<Mutex<Option<Session>>>,
     internal_tx: mpsc::Sender<BridgeInternalEvent>,
 ) {
@@ -1519,9 +1544,13 @@ fn defer_viewport_encoder_restart(
         if !changed {
             return;
         }
-        let Some(generation) = session_generation(&current_session, &viewer_id).await else {
+        let Some((install_id, generation)) = session_generation(&current_session, &viewer_id).await
+        else {
             return;
         };
+        if install_id != owner_install_id {
+            return;
+        }
         info!(
             event = "bridge.offer_video_changed",
             viewer = %viewer_id,
@@ -1530,6 +1559,7 @@ fn defer_viewport_encoder_restart(
         );
         if let Err(error) = internal_tx
             .send(BridgeInternalEvent::RestartEncoder {
+                install_id,
                 viewer_id,
                 generation,
                 reason: "viewport",
@@ -1816,6 +1846,7 @@ async fn apply_video_transport(
     control: Option<&Arc<ControlSocket>>,
     next: VideoTransport,
     reason: &'static str,
+    keyframes_observed: u64,
 ) {
     let previous = peer.video_transport();
     if previous == next {
@@ -1834,7 +1865,9 @@ async fn apply_video_transport(
         "video transport applied"
     );
     peer.set_video_transport(next);
-    if should_reset_video_on_transport_switch(previous, next) {
+    if should_reset_video_on_transport_switch(previous, next)
+        && should_request_post_connect_keyframe(keyframes_observed)
+    {
         if let Some(ctrl) = control {
             info!(
                 reason,
@@ -1861,21 +1894,25 @@ async fn live_control(slot: &ControlSlot) -> Option<Arc<ControlSocket>> {
 async fn session_generation(
     current_session: &Arc<Mutex<Option<Session>>>,
     viewer_id: &str,
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     current_session
         .lock()
         .await
         .as_ref()
         .filter(|session| session.viewer_id == viewer_id)
-        .map(|session| session.encoder_generation)
+        .map(|session| (session.install_id, session.encoder_generation))
 }
 
-async fn session_owner(current_session: &Arc<Mutex<Option<Session>>>) -> Option<(String, u64)> {
-    current_session
-        .lock()
-        .await
-        .as_ref()
-        .map(|session| (session.viewer_id.clone(), session.encoder_generation))
+async fn session_owner(
+    current_session: &Arc<Mutex<Option<Session>>>,
+) -> Option<(String, u64, u64)> {
+    current_session.lock().await.as_ref().map(|session| {
+        (
+            session.viewer_id.clone(),
+            session.install_id,
+            session.encoder_generation,
+        )
+    })
 }
 
 struct EncoderAttachPlan {
@@ -1963,6 +2000,18 @@ fn spawn_encoder_attach(
                     );
                 }
             }
+        }
+        // A later offer may have replaced this session while shutdown/bootstrap
+        // was pending. Do not start a capture for an already abandoned owner.
+        let still_owner = current_session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|session| {
+                session.install_id == plan.install_id && session.viewer_id == plan.viewer_id
+            });
+        if !still_owner {
+            return;
         }
         if let Some(rung) = plan.apply_rung {
             let mut cfg = scrcpy_cfg.write().await;
@@ -2079,8 +2128,10 @@ async fn bind_encoder_parts(
         session.viewer_id.clone(),
         internal_tx.clone(),
         session.keyframes_observed.clone(),
+        session.install_id,
         generation,
         session.restarting_encoder.clone(),
+        session.control.clone(),
     );
 }
 
@@ -2219,8 +2270,10 @@ fn spawn_media_pumps(
     viewer_id: String,
     internal_tx: mpsc::Sender<BridgeInternalEvent>,
     keyframes_observed: Arc<AtomicU64>,
+    install_id: u64,
     generation: u64,
     restarting_encoder: Arc<AtomicBool>,
+    control: ControlSlot,
 ) {
     if let Some(reader) = video_reader {
         let peer_for_video = peer.clone();
@@ -2238,8 +2291,10 @@ fn spawn_media_pumps(
                 viewer_for_video,
                 internal_tx_for_video,
                 keyframes_for_video,
+                install_id,
                 generation,
                 restarting_encoder,
+                control,
             )
             .await;
         });
@@ -2276,6 +2331,7 @@ async fn run_event_pump(
     camera_sink: CameraSink,
     cam_in_use: Arc<std::sync::atomic::AtomicBool>,
     ice_phase: Arc<AtomicU8>,
+    owner_install_id: u64,
 ) {
     // Browsers emit PLI roughly every 200 ms after any packet loss. Scrcpy
     // needs ~1 encode cycle to emit a new IDR, so we rate-limit how often
@@ -2329,9 +2385,10 @@ async fn run_event_pump(
                 match bwe.observe(estimate, std::time::Instant::now()) {
                     BweDecision::Hold => {}
                     BweDecision::Downshift(rung) | BweDecision::Upshift(rung) => {
-                        if let Some(generation) =
+                        if let Some((install_id, generation)) =
                             session_generation(&current_session, &viewer_id).await
                         {
+                            if install_id != owner_install_id { continue; }
                             info!(
                                 event = "bridge.bwe_shift",
                                 viewer = %viewer_id,
@@ -2343,6 +2400,7 @@ async fn run_event_pump(
                             );
                             if let Err(e) = internal_tx
                                 .send(BridgeInternalEvent::RestartEncoder {
+                                    install_id,
                                     viewer_id: viewer_id.clone(),
                                     generation,
                                     reason: "bwe",
@@ -2375,12 +2433,26 @@ async fn run_event_pump(
                         recovery = None;
                     }
                     RecoveryDecision::Retry => {
+                        // Encoder recovery may have replaced the control socket;
+                        // wait for its first IDR before requesting another reset.
+                        if !should_request_post_connect_keyframe(seen) {
+                            continue;
+                        }
                         let next_attempt = attempts + 1;
                         warn!(attempt = next_attempt, "no IDR after reset_video — retrying");
                         if let Some(ctrl) = live_control(&control).await {
-                            if let Err(e) = ctrl.reset_video().await {
-                                warn!(error = %e, "scrcpy reset_video retry");
+                            match ctrl.reset_video().await {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(e) => {
+                                    warn!(error = %e, "scrcpy reset_video retry");
+                                    recovery = None;
+                                    continue;
+                                }
                             }
+                        } else {
+                            recovery = None;
+                            continue;
                         }
                         recovery = Some(VideoRecovery {
                             baseline: seen,
@@ -2398,11 +2470,13 @@ async fn run_event_pump(
                         recovery = None;
                         last_rebuild = Instant::now();
                         warn!("video stuck after repeated reset_video — keep-PC encoder restart");
-                        if let Some(generation) =
+                        if let Some((install_id, generation)) =
                             session_generation(&current_session, &viewer_id).await
                         {
+                            if install_id != owner_install_id { continue; }
                             if let Err(e) = internal_tx
                                 .send(BridgeInternalEvent::RestartEncoder {
+                                    install_id,
                                     viewer_id: viewer_id.clone(),
                                     generation,
                                     reason: "keyframe-stuck",
@@ -2418,6 +2492,7 @@ async fn run_event_pump(
             }
             evt = peer.next_event() => {
                 let Some(evt) = evt else { return };
+                if cancel.is_cancelled() { return; }
                 match evt {
                     PeerEvent::Answer(sdp) => {
                         let sdp_bytes = sdp.len();
@@ -2474,6 +2549,7 @@ async fn run_event_pump(
                         let _ = internal_tx
                             .send(BridgeInternalEvent::ViewerConnected {
                                 viewer_id: viewer_id.clone(),
+                                install_id: owner_install_id,
                             })
                             .await;
                     }
@@ -2496,15 +2572,17 @@ async fn run_event_pump(
                                     baseline,
                                     "stream ready after pre-connect IDR — requesting fresh keyframe"
                                 );
-                                if let Err(e) = ctrl.reset_video().await {
-                                    warn!(error = %e, "scrcpy reset_video on stream ready");
-                                } else {
-                                    POST_CONNECT_KEYFRAMES_TOTAL.inc();
-                                    recovery = Some(VideoRecovery {
-                                        baseline,
-                                        deadline: Instant::now() + RECOVERY_CONFIRM,
-                                        attempts: 1,
-                                    });
+                                match ctrl.reset_video().await {
+                                    Ok(true) => {
+                                        POST_CONNECT_KEYFRAMES_TOTAL.inc();
+                                        recovery = Some(VideoRecovery {
+                                            baseline,
+                                            deadline: Instant::now() + RECOVERY_CONFIRM,
+                                            attempts: 1,
+                                        });
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => warn!(error = %e, "scrcpy reset_video on stream ready"),
                                 }
                             }
                         } else {
@@ -2536,6 +2614,7 @@ async fn run_event_pump(
                         let _ = internal_tx
                             .send(BridgeInternalEvent::ViewerUnhealthy {
                                 viewer_id: viewer_id.clone(),
+                                install_id: owner_install_id,
                                 reason: "ice disconnected",
                             })
                             .await;
@@ -2550,6 +2629,7 @@ async fn run_event_pump(
                             &health,
                             scroll_sensitivity,
                             &camera_sink,
+                            keyframes_observed.load(Ordering::Relaxed),
                         )
                         .await
                         {
@@ -2583,11 +2663,15 @@ async fn run_event_pump(
                             ctrl.as_ref(),
                             VideoTransport::DataChannel,
                             "video-dc-open",
+                            keyframes_observed.load(Ordering::Relaxed),
                         )
                         .await;
                     }
                     PeerEvent::KeyframeRequested => {
                         PLI_COUNT_TOTAL.inc();
+                        if !should_request_post_connect_keyframe(keyframes_observed.load(Ordering::Relaxed)) {
+                            continue;
+                        }
                         // Already recovering: we drive reset_video on our own
                         // confirm-timeout schedule, so swallow the browser's
                         // PLI storm (it repeats every ~200 ms until an IDR
@@ -2605,8 +2689,13 @@ async fn run_event_pump(
                             // Snapshot BEFORE the reset so a fresh IDR strictly
                             // after this point is what confirms recovery.
                             let baseline = keyframes_observed.load(Ordering::Relaxed);
-                            if let Err(e) = ctrl.reset_video().await {
-                                warn!(error = %e, "scrcpy reset_video on PLI");
+                            match ctrl.reset_video().await {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(e) => {
+                                    warn!(error = %e, "scrcpy reset_video on PLI");
+                                    continue;
+                                }
                             }
                             recovery = Some(VideoRecovery {
                                 baseline,
@@ -2625,21 +2714,20 @@ async fn run_event_pump(
                         // `on_offer`. Without this the dead peer would linger
                         // with scrcpy still encoding into a closed socket.
                         warn!(%e, "peer error event — tearing down session for rebuild");
-                        let still_owner = {
-                            let guard = current_session.lock().await;
-                            guard.as_ref().map(|s| s.viewer_id == viewer_id).unwrap_or(false)
+                        let owned_session = {
+                            let mut guard = current_session.lock().await;
+                            if guard.as_ref().is_some_and(|s| s.viewer_id == viewer_id && s.install_id == owner_install_id) {
+                                guard.take()
+                            } else { None }
                         };
-                        if still_owner {
+                        if let Some(session) = owned_session {
                             let _ = internal_tx
                                 .send(BridgeInternalEvent::ClearGraceFor {
                                     viewer_id: viewer_id.clone(),
+                                    install_id: owner_install_id,
                                 })
                                 .await;
-                            if let Some(session) = current_session.lock().await.take() {
-                                tokio::spawn(async move {
-                                    session.shutdown().await;
-                                });
-                            }
+                            tokio::spawn(async move { session.shutdown().await; });
                             SCRCPY_RUNNING.set(0);
                         }
                         return;
@@ -2861,8 +2949,10 @@ async fn run_video_pump(
     viewer_id: String,
     internal_tx: mpsc::Sender<BridgeInternalEvent>,
     keyframes_observed: Arc<AtomicU64>,
+    install_id: u64,
     generation: u64,
     restarting_encoder: Arc<AtomicBool>,
+    control: ControlSlot,
 ) {
     let mut latest_config: Option<VideoFrame> = None;
     let mut previous_frame_was_config = false;
@@ -2881,6 +2971,18 @@ async fn run_video_pump(
                 }
             }
         };
+
+        if cancel.is_cancelled() {
+            break "cancelled";
+        }
+        if frame.is_keyframe {
+            if let Some(ctrl) = live_control(&control).await {
+                if cancel.is_cancelled() {
+                    break "cancelled";
+                }
+                ctrl.mark_video_ready();
+            }
+        }
 
         let kind = if frame.is_config {
             "config"
@@ -2921,6 +3023,9 @@ async fn run_video_pump(
         // so the recovery watchdog reads "confirmed" as "the decoder will
         // receive a fresh IDR", not merely "scrcpy emitted one we then
         // failed to ship".
+        if cancel.is_cancelled() {
+            break "cancelled";
+        }
         if is_keyframe {
             keyframes_observed.fetch_add(1, Ordering::Relaxed);
             let transport = peer.video_transport();
@@ -2949,7 +3054,7 @@ async fn run_video_pump(
             restarting_encoder.load(Ordering::Acquire),
             session_generation(&current_session, &viewer_id)
                 .await
-                .is_some_and(|live| live == generation),
+                .is_some_and(|live| encoder_event_matches(live, (install_id, generation))),
         );
         match action {
             EncoderEofAction::Ignore => {
@@ -2965,6 +3070,7 @@ async fn run_video_pump(
                 );
                 if let Err(e) = internal_tx
                     .send(BridgeInternalEvent::RestartEncoder {
+                        install_id,
                         viewer_id: viewer_id.clone(),
                         generation,
                         reason: exit_reason,
@@ -3092,6 +3198,7 @@ async fn forward_control(
     _health: &HealthFlags,
     scroll_sensitivity: f32,
     camera_sink: &CameraSink,
+    keyframes_observed: u64,
 ) -> Result<()> {
     let msg = datachannel::parse(text.as_bytes())?;
     let kind = msg_kind(&msg);
@@ -3142,7 +3249,14 @@ async fn forward_control(
             // message is usually a no-op after `video-dc-open`.
             match parse_video_transport_mode(mode) {
                 Some(next) => {
-                    apply_video_transport(peer, control, next, "set_video_transport").await;
+                    apply_video_transport(
+                        peer,
+                        control,
+                        next,
+                        "set_video_transport",
+                        keyframes_observed,
+                    )
+                    .await;
                 }
                 None => {
                     warn!(mode = %mode, "unknown set_video_transport mode; ignoring");
@@ -3151,6 +3265,9 @@ async fn forward_control(
             return Ok(());
         }
         ControlIn::RequestKeyframe => {
+            if !should_request_post_connect_keyframe(keyframes_observed) {
+                return Ok(());
+            }
             // iOS native client asked for a fresh IDR (e.g. after
             // displayLayer.failed or first NAL with no SPS). Forward as a
             // scrcpy `ResetVideo` control message. Throttled identically
@@ -3554,6 +3671,23 @@ mod tests {
     use std::io::Write;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn encoder_events_cannot_cross_installations_with_reused_generation() {
+        assert!(!encoder_event_matches((2, 1), (1, 1)));
+        assert!(!encoder_event_matches((2, 2), (2, 1)));
+        assert!(encoder_event_matches((2, 1), (2, 1)));
+    }
+
+    #[test]
+    fn grace_is_replaced_for_reinstalled_same_viewer() {
+        let mut grace = None;
+        arm_grace(&mut grace, "viewer".into(), 1, "old disconnect");
+        arm_grace(&mut grace, "viewer".into(), 2, "new disconnect");
+        let active = grace.unwrap();
+        assert_eq!(active.install_id, 2);
+        assert_eq!(active.reason, "new disconnect");
+    }
 
     // ── DTLS fingerprint / fast-path eligibility ────────────────────────────
 
