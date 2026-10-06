@@ -74,6 +74,7 @@ impl Default for ScrcpyServerConfig {
 pub struct ScrcpyServer {
     adb: Adb,
     cfg: ScrcpyServerConfig,
+    scid: u32,
     local_port: u16,
     process: Option<Child>,
     stderr_log: Option<JoinHandle<()>>,
@@ -83,10 +84,14 @@ pub struct ScrcpyServer {
 }
 
 impl ScrcpyServer {
-    pub fn new(adb: Adb, cfg: ScrcpyServerConfig) -> Self {
+    pub fn new(adb: Adb, mut cfg: ScrcpyServerConfig) -> Self {
+        let scid = rand::thread_rng().gen_range(1..=i32::MAX as u32);
+        // Overlapping reconnects must not unlink or kill the next capture.
+        cfg.remote_jar_path = session_jar_path(&cfg.remote_jar_path, scid);
         Self {
             adb,
             cfg,
+            scid,
             local_port: 0,
             process: None,
             stderr_log: None,
@@ -98,13 +103,20 @@ impl ScrcpyServer {
 
     /// End-to-end start: push jar, pick port, forward, launch, connect.
     pub async fn start(&mut self) -> Result<()> {
+        let result = self.start_inner().await;
+        if result.is_err() {
+            self.stop().await;
+        }
+        result
+    }
+
+    async fn start_inner(&mut self) -> Result<()> {
         self.push_server_jar().await?;
-        self.adb.kill_stale_scrcpy().await.ok();
 
         self.local_port = Self::pick_local_port();
         self.adb.remove_forward(self.local_port).await.ok();
         self.adb
-            .forward_abstract(self.local_port, "scrcpy")
+            .forward_abstract(self.local_port, &session_socket_name(self.scid))
             .await
             .context("adb forward tcp:local → localabstract:scrcpy")?;
 
@@ -115,7 +127,7 @@ impl ScrcpyServer {
 
         // Connection order is fixed by scrcpy with tunnel_forward=true:
         // video first, then audio (if enabled), then control (if enabled).
-        let video_stream = Self::connect_with_retry(self.local_port).await?;
+        let video_stream = Self::connect_video_with_retry(self.local_port).await?;
         self.video = Some(VideoReader::new(video_stream));
         info!(port = self.local_port, "scrcpy video socket connected");
 
@@ -125,7 +137,9 @@ impl ScrcpyServer {
                     self.audio = Some(AudioReader::new(s));
                     info!(port = self.local_port, "scrcpy audio socket connected");
                 }
-                Err(e) => warn!(error = %e, "audio socket connect failed — continuing without audio"),
+                Err(e) => {
+                    warn!(error = %e, "audio socket connect failed — continuing without audio")
+                }
             }
         }
 
@@ -154,6 +168,29 @@ impl ScrcpyServer {
             }
         }
         Err(anyhow!("could not connect to scrcpy on 127.0.0.1:{port}"))
+    }
+
+    async fn connect_video_with_retry(port: u16) -> Result<TcpStream> {
+        use tokio::io::AsyncReadExt;
+        // adb's forwarding listener accepts TCP even before the Android socket
+        // exists. scrcpy's dummy byte proves the server accepted this socket.
+        for attempt in 0..20 {
+            if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)).await {
+                let mut ready = [0u8; 1];
+                if matches!(
+                    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut ready))
+                        .await,
+                    Ok(Ok(_))
+                ) && ready == [0]
+                {
+                    return Ok(stream);
+                }
+            }
+            sleep(Duration::from_millis(250 + 50 * attempt)).await;
+        }
+        Err(anyhow!(
+            "scrcpy video readiness handshake failed on 127.0.0.1:{port}"
+        ))
     }
 
     async fn push_server_jar(&self) -> Result<()> {
@@ -191,6 +228,7 @@ impl ScrcpyServer {
             "/".to_string(),
             "com.genymobile.scrcpy.Server".to_string(),
             c.scrcpy_version.clone(),
+            format!("scid={:08x}", self.scid),
             "video_codec=h264".to_string(),
             format!("max_fps={}", c.max_fps),
             format!("max_size={}", c.resolved_max_size()),
@@ -205,7 +243,7 @@ impl ScrcpyServer {
             format!("control={}", c.control),
             "send_frame_meta=true".to_string(),
             "send_device_meta=false".to_string(),
-            "send_dummy_byte=false".to_string(),
+            "send_dummy_byte=true".to_string(),
             "send_codec_meta=false".to_string(),
         ];
 
@@ -217,10 +255,11 @@ impl ScrcpyServer {
 
         let mut child = cmd.spawn().context("spawn adb shell app_process")?;
 
-        if let Some(stderr) = child.stderr.take() {
-            let handle = tokio::spawn(pump_stderr(stderr));
-            self.stderr_log = Some(handle);
-        }
+        let stdout = child.stdout.take().context("capture scrcpy stdout")?;
+        let stderr = child.stderr.take().context("capture scrcpy stderr")?;
+        self.stderr_log = Some(tokio::spawn(async move {
+            tokio::join!(pump_server_output(stdout), pump_server_output(stderr));
+        }));
         self.process = Some(child);
         Ok(())
     }
@@ -311,10 +350,84 @@ impl ScrcpyShutdown {
     }
 }
 
-async fn pump_stderr(mut stderr: tokio::process::ChildStderr) {
+async fn pump_server_output<R: tokio::io::AsyncRead + Unpin>(output: R) {
     use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut r = BufReader::new(&mut stderr).lines();
+    let mut r = BufReader::new(output).lines();
     while let Ok(Some(line)) = r.next_line().await {
-        tracing::info!(target: "scrcpy_server", "{}", line);
+        if line.contains("ERROR:")
+            || line.contains("WARN:")
+            || line.trim_start().starts_with("at ")
+            || line.contains("Exception")
+        {
+            tracing::warn!(target: "scrcpy_bridge::bridge", "scrcpy-server: {}", line);
+        } else {
+            tracing::info!(target: "scrcpy_bridge::bridge", "scrcpy-server: {}", line);
+        }
+    }
+}
+
+fn session_socket_name(scid: u32) -> String {
+    format!("scrcpy_{scid:08x}")
+}
+
+fn session_jar_path(path: &str, scid: u32) -> String {
+    format!(
+        "{}-{scid:08x}.jar",
+        path.strip_suffix(".jar").unwrap_or(path)
+    )
+}
+
+#[cfg(test)]
+mod session_isolation_tests {
+    #[tokio::test]
+    async fn video_handshake_retries_forwarded_eof_and_consumes_only_dummy_byte() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(&[0, 42]).await.unwrap();
+        });
+        let mut stream = super::ScrcpyServer::connect_video_with_retry(port)
+            .await
+            .unwrap();
+        let mut payload = [0];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload, [42]);
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn output_pump_drains_more_than_the_pipe_capacity() {
+        use tokio::io::AsyncWriteExt;
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let pump = tokio::spawn(super::pump_server_output(reader));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            for _ in 0..100 {
+                writer
+                    .write_all(b"diagnostic line larger than one small pipe buffer\n")
+                    .await
+                    .unwrap();
+            }
+            drop(writer);
+            pump.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn captures_use_distinct_socket_and_cleanup_paths() {
+        assert_eq!(super::session_socket_name(0x123), "scrcpy_00000123");
+        assert_eq!(
+            super::session_jar_path("/data/local/tmp/server.jar", 0x123),
+            "/data/local/tmp/server-00000123.jar"
+        );
+        assert_ne!(super::session_socket_name(1), super::session_socket_name(2));
+        assert_ne!(
+            super::session_jar_path("server.jar", 1),
+            super::session_jar_path("server.jar", 2)
+        );
     }
 }
