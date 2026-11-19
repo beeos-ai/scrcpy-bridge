@@ -80,6 +80,7 @@ pub struct IceServer {
 
 #[derive(Debug, Clone)]
 pub struct PeerOptions {
+    pub force_relay: Option<bool>,
     /// ICE servers for the client; str0m doesn't relay through TURN itself,
     /// but we still surface them to the browser in the answer SDP.
     pub ice_servers: Vec<IceServer>,
@@ -99,6 +100,7 @@ impl Default for PeerOptions {
     fn default() -> Self {
         Self {
             ice_servers: vec![],
+            force_relay: None,
             local_bind: "0.0.0.0:0".parse().unwrap(),
             extra_local_ips: vec![],
             ice_gather_wait: Duration::ZERO,

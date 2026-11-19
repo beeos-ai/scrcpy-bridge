@@ -23,7 +23,12 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = Cli::parse_args();
-    init_tracing(&cli.log_format);
+    let log_writer = if cli.native_stdio {
+        fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    } else {
+        fmt::writer::BoxMakeWriter::new(std::io::stdout)
+    };
+    init_tracing(&cli.log_format, log_writer);
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -43,7 +48,7 @@ async fn main() -> Result<()> {
     // while, e.g. `pli_count_total`).
     observability::init_metrics();
 
-    if cli.metrics_port != 0 {
+    if !cli.native_stdio && cli.metrics_port != 0 {
         let addr: SocketAddr = format!("0.0.0.0:{}", cli.metrics_port).parse()?;
         let health_for_metrics = health.clone();
         tokio::spawn(async move {
@@ -53,8 +58,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Run the bridge. It owns the MQTT signaling loop, so returning from
-    // `run()` means the broker closed the connection for good.
+    // Run until the signaling connection closes or the process is interrupted.
     let bridge = Bridge::new(cli, health);
 
     tokio::select! {
@@ -66,12 +70,16 @@ async fn main() -> Result<()> {
     }
 }
 
-fn init_tracing(format: &str) {
+fn init_tracing(format: &str, writer: fmt::writer::BoxMakeWriter) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,rumqttc=warn,str0m=warn"));
     let registry = tracing_subscriber::registry().with(filter);
     match format {
-        "json" => registry.with(fmt::layer().json()).init(),
-        _ => registry.with(fmt::layer().compact()).init(),
+        "json" => registry
+            .with(fmt::layer().with_writer(writer).json())
+            .init(),
+        _ => registry
+            .with(fmt::layer().with_writer(writer).compact())
+            .init(),
     }
 }

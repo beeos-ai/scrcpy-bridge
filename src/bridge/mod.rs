@@ -55,6 +55,7 @@ use crate::scrcpy::{
     AudioReader, ControlSocket, ScrcpyServer, ScrcpyServerConfig, ScrcpySessionParts,
     ScrcpyShutdown, VideoFrame, VideoReader,
 };
+use crate::signaling::Signaling;
 use crate::webrtc::{
     resolve_ice_hosts_to_ipv4, CameraFrame, IceServer, NegotiationKind, PeerEvent, PeerOptions,
     RemoteIceInit, VideoTransport, WebRtcPeer,
@@ -348,66 +349,49 @@ impl Bridge {
     }
 
     pub async fn run(mut self) -> Result<()> {
-        // 1. Resolve initial broker credentials via Agent Gateway bootstrap.
-        //    Runtime issues a short-lived (~10 min) RS256 JWT authenticated
-        //    by Ed25519 identity keys. This is the only supported credential
-        //    source — no static `--mqtt-token` fallback exists. The response
-        //    also carries ICE servers so the caller doesn't need to pre-stuff
-        //    TURN creds into CLI flags.
-        let (initial_creds, initial_bootstrap) = self.resolve_initial_credentials().await?;
-        let initial_video = initial_bootstrap.video.clone();
-
-        // Seed the shared ICE server list. Bootstrap is the authoritative
-        // source — Runtime owns the TURN pool; CLI `--ice-urls` is
-        // dev-only and only fills in when bootstrap returned nothing (or
-        // when a local operator explicitly supplied an extra entry that
-        // bootstrap didn't include).
-        {
-            store_resolved_ice_servers(
-                &self.ice_servers,
-                &initial_bootstrap.ice_servers,
-                &self.cli,
+        let (mqtt, mut sig_rx, initial_video, initial_bootstrap) = if self.cli.native_stdio {
+            let (signal, rx, ice) = Signaling::stdio().await?;
+            // Native mode has no implicit public STUN configuration. The
+            // parent owns the complete short-lived ICE configuration.
+            self.cli.ice_urls.clear();
+            store_resolved_ice_servers(&self.ice_servers, &ice, &self.cli).await;
+            self.health.mqtt_connected.store(true, Ordering::Relaxed);
+            (Arc::new(signal), rx, None, None)
+        } else {
+            if self.cli.agent_gateway_url.is_empty()
+                || self.cli.bridge_private_key_file.is_empty()
+                || self.cli.bridge_public_key_file.is_empty()
+            {
+                anyhow::bail!("MQTT mode requires gateway and identity files");
+            }
+            let (creds, bootstrap) = self.resolve_initial_credentials().await?;
+            store_resolved_ice_servers(&self.ice_servers, &bootstrap.ice_servers, &self.cli).await;
+            let topic_prefix = bootstrap.device_topic.trim();
+            if topic_prefix.is_empty() {
+                anyhow::bail!("bootstrap response missing deviceTopic");
+            }
+            let (mqtt, rx) = MqttSignaling::connect(MqttSignalingConfig {
+                broker_url: creds.broker_url,
+                username: creds.username,
+                token: creds.token,
+                topic_prefix: topic_prefix.to_owned(),
+                client_id: format!("scrcpy-bridge-{}", self.cli.device_id),
+                connected_flag: self.health.mqtt_connected.clone(),
+            })
+            .await
+            .context("connect mqtt")?;
+            info!(
+                device_id = %self.cli.device_id,
+                topic_prefix,
+                "scrcpy-bridge online, waiting for offer"
+            );
+            (
+                Arc::new(Signaling::Mqtt(mqtt)),
+                rx,
+                bootstrap.video.clone(),
+                Some(bootstrap),
             )
-            .await;
-        }
-
-        // 2. MQTT signaling. The handle is cloneable via Arc and supports
-        //    hot credential rotation through `reconnect(...)` below.
-        //
-        // IMPORTANT: we use `initial_bootstrap.device_topic` — NOT
-        // `cli.device_id` — for all topic construction. Runtime builds the
-        // topic as `devices/device-<instanceUUID>` (see
-        // `services/runtime/.../device/provider.go`) and EMQX's JWT ACL is
-        // scoped to exactly that prefix. Feeding the bare instance UUID
-        // (which is what `cli.device_id` typically holds) would cause every
-        // subscribe/publish to be rejected by EMQX with `not authorized`.
-        let topic_prefix = initial_bootstrap.device_topic.trim();
-        if topic_prefix.is_empty() {
-            return Err(anyhow::anyhow!(
-                "bootstrap response missing deviceTopic — Runtime misconfigured or instance lacks stream params"
-            ));
-        }
-        let topic_prefix = topic_prefix.to_string();
-        // `MqttSignaling` owns the `mqtt_connected` health flag from here
-        // on: it is raised only after the broker acknowledged the
-        // subscription and dropped by the internal watchdog / failed
-        // rebuilds. No manual store here — single source of truth.
-        let (mqtt, mut sig_rx) = MqttSignaling::connect(MqttSignalingConfig {
-            broker_url: initial_creds.broker_url.clone(),
-            username: initial_creds.username.clone(),
-            token: initial_creds.token.clone(),
-            topic_prefix: topic_prefix.clone(),
-            client_id: format!("scrcpy-bridge-{}", self.cli.device_id),
-            connected_flag: self.health.mqtt_connected.clone(),
-        })
-        .await
-        .context("connect mqtt")?;
-        let mqtt = Arc::new(mqtt);
-        info!(
-            device_id = %self.cli.device_id,
-            topic_prefix = %topic_prefix,
-            "scrcpy-bridge online, waiting for offer"
-        );
+        };
 
         // 3. Session state (one active session at a time).
         //
@@ -447,15 +431,17 @@ impl Bridge {
         // 4. JWT refresher. Failure here is fatal — without it the
         //    session dies when the first MQTT token expires. The same
         //    loop applies a later viewport-selected `video` cap.
-        self.spawn_bootstrap_refresh(
-            initial_bootstrap,
-            mqtt.clone(),
-            scrcpy_cfg.clone(),
-            current_session.clone(),
-            internal_tx.clone(),
-        )
-        .await
-        .context("start bootstrap refresher")?;
+        if let Some(initial_bootstrap) = initial_bootstrap {
+            self.spawn_bootstrap_refresh(
+                initial_bootstrap,
+                mqtt.clone(),
+                scrcpy_cfg.clone(),
+                current_session.clone(),
+                internal_tx.clone(),
+            )
+            .await
+            .context("start bootstrap refresher")?;
+        }
 
         // Reverse camera-usage events (vHAL CMR1 kind=4): forward each edge
         // to the current viewer as a `camera_needed` datachannel message and
@@ -580,6 +566,26 @@ impl Bridge {
                             reason,
                             target,
                         } => {
+                            // Managed phone control cannot silently resurrect capture after
+                            // USB loss. Retire this exact encoder/peer and let BMA authorize
+                            // a new viewing connection with no inherited input lease.
+                            if mqtt.managed() && matches!(reason, "video-eof" | "video-error") {
+                                let retired = {
+                                    let mut guard = current_session.lock().await;
+                                    if guard.as_ref().is_some_and(|s| s.viewer_id == viewer_id
+                                        && encoder_event_matches((s.install_id, s.encoder_generation), (install_id, generation))) {
+                                        guard.take()
+                                    } else { None }
+                                };
+                                if let Some(session) = retired {
+                                    session.shutdown().await;
+                                    pending_remote_ice.clear();
+                                    grace = None;
+                                    self.health.scrcpy_running.store(false, Ordering::Relaxed);
+                                    mqtt.closed(&viewer_id).await?;
+                                }
+                                continue;
+                            }
                             let plan = {
                                 let mut guard = current_session.lock().await;
                                 let should_run = guard.as_ref().is_some_and(|session| {
@@ -685,6 +691,11 @@ impl Bridge {
                             viewer_id,
                             trace_id,
                         } => {
+                            if mqtt.managed() && current_session.lock().await.is_some() {
+                                // Native sessions never steal an existing viewer or
+                                // silently reuse its control authority.
+                                continue;
+                            }
                             // Offer arriving inside our grace window
                             // for the same viewer cancels it — the
                             // viewer is driving a successful recovery.
@@ -739,6 +750,19 @@ impl Bridge {
                             }
                         }
                         SignalRequest::Close { reason, viewer_id } => {
+                            if mqtt.managed() {
+                                let mut active = current_session.lock().await;
+                                if active.as_ref().is_some_and(|s| s.viewer_id == viewer_id) {
+                                    let session = active.take().unwrap();
+                                    drop(active);
+                                    session.shutdown().await;
+                                    pending_remote_ice.clear();
+                                    grace = None;
+                                    self.health.scrcpy_running.store(false, Ordering::Relaxed);
+                                    mqtt.closed(&viewer_id).await?;
+                                }
+                                continue;
+                            }
                             // Don't tear down immediately — a viewer
                             // "close" is frequently followed by an
                             // automatic reconnect (page nav, tab
@@ -776,6 +800,10 @@ impl Bridge {
                 }
             }
         }
+        let active_session = current_session.lock().await.take();
+        if let Some(session) = active_session {
+            session.shutdown().await;
+        }
         Ok(())
     }
 
@@ -803,7 +831,7 @@ impl Bridge {
         viewer_id: String,
         offer_sdp: String,
         trace_id: String,
-        mqtt: &Arc<MqttSignaling>,
+        mqtt: &Arc<Signaling>,
         current_session: &Arc<Mutex<Option<Session>>>,
         scrcpy_cfg: &Arc<RwLock<ScrcpyServerConfig>>,
         internal_tx: mpsc::Sender<BridgeInternalEvent>,
@@ -1075,6 +1103,7 @@ impl Bridge {
         let ice_t0 = Instant::now();
         let peer = spawn_peer_and_publish_answer(
             PeerOptions {
+                force_relay: mqtt.force_relay(),
                 ice_servers,
                 local_bind: "0.0.0.0:0".parse().unwrap(),
                 extra_local_ips,
@@ -1140,7 +1169,7 @@ impl Bridge {
         offer_fingerprint: Option<String>,
         offer_ice_ufrag: Option<String>,
         adb: Adb,
-        mqtt: Arc<MqttSignaling>,
+        mqtt: Arc<Signaling>,
         scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
         current_session: Arc<Mutex<Option<Session>>>,
         internal_tx: mpsc::Sender<BridgeInternalEvent>,
@@ -1399,7 +1428,7 @@ impl Bridge {
     async fn spawn_bootstrap_refresh(
         &self,
         initial: BootstrapResponse,
-        mqtt: Arc<MqttSignaling>,
+        mqtt: Arc<Signaling>,
         scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
         current_session: Arc<Mutex<Option<Session>>>,
         internal_tx: mpsc::Sender<BridgeInternalEvent>,
@@ -2168,7 +2197,7 @@ async fn start_scrcpy_encoder(
 async fn spawn_peer_and_publish_answer(
     opts: PeerOptions,
     offer_sdp: String,
-    mqtt: &MqttSignaling,
+    mqtt: &Signaling,
     viewer_id: &str,
     trace_id: &str,
     dtls_fp_short: &str,
@@ -2187,7 +2216,7 @@ async fn spawn_peer_and_publish_answer(
 /// not blocked on scrcpy `app_process`.
 async fn publish_first_answer(
     peer: &WebRtcPeer,
-    mqtt: &MqttSignaling,
+    mqtt: &Signaling,
     viewer_id: &str,
     trace_id: &str,
     dtls_fp_short: &str,
@@ -2313,7 +2342,7 @@ fn spawn_media_pumps(
 
 async fn run_event_pump(
     peer: WebRtcPeer,
-    mqtt: Arc<MqttSignaling>,
+    mqtt: Arc<Signaling>,
     control: ControlSlot,
     scrcpy_cfg: Arc<RwLock<ScrcpyServerConfig>>,
     encoder_cap_width: Arc<AtomicU32>,
@@ -2620,8 +2649,22 @@ async fn run_event_pump(
                             .await;
                     }
                     PeerEvent::ControlMessage(text) => {
+                        let parsed = datachannel::parse(text.as_bytes());
+                        let needs_gate = !matches!(parsed, Ok(ControlIn::Ping { .. } | ControlIn::Stats { .. } | ControlIn::ViewerReady { .. } | ControlIn::RequestKeyframe));
+                        let permit = if mqtt.managed() && needs_gate {
+                            match mqtt.authorize(&viewer_id, &text).await {
+                                Ok(id) => id,
+                                Err(_) => {
+                                    let input: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                                    let _ = peer.send_control_text(serde_json::json!({"type":"input_rejected", "request_id":input["request_id"], "reason":"control_not_authorized"}).to_string()).await;
+                                    continue;
+                                }
+                            }
+                        } else { None };
                         let ctrl = live_control(&control).await;
-                        if let Err(e) = forward_control(
+                        let outcome = if mqtt.managed() && needs_gate {
+                            native_control(&text, ctrl.as_ref()).await
+                        } else { forward_control(
                             &text,
                             ctrl.as_ref(),
                             &scrcpy_cfg,
@@ -2631,10 +2674,13 @@ async fn run_event_pump(
                             &camera_sink,
                             keyframes_observed.load(Ordering::Relaxed),
                         )
-                        .await
-                        {
-                            warn!(error = %e, "forward control");
+                        .await };
+                        if let Some(id) = permit {
+                            let _ = mqtt.input_result(&id, outcome.is_ok()).await;
+                            let input: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                            let _ = peer.send_control_text(serde_json::json!({"type":"input_result", "request_id":input["request_id"], "outcome":if outcome.is_ok() {"dispatched"} else {"unknown"}}).to_string()).await;
                         }
+                        if let Err(e) = outcome { warn!(error = %e, "forward control"); }
                     }
                     PeerEvent::ControlChannelOpen => {
                         // Replay the device-camera usage flag so a viewer
@@ -3190,6 +3236,107 @@ fn merge_scrcpy_configure(
 
 /// Translate a browser DataChannel message into scrcpy control socket calls
 /// or metrics updates. `peer` is used to send replies (pong, ack) back.
+/// Managed phone controls are complete gestures. No unbounded key/touch-down
+/// survives the authority callback, and an I/O failure is never swallowed.
+async fn native_control(text: &str, control: Option<&Arc<ControlSocket>>) -> Result<()> {
+    let control = control.ok_or_else(|| anyhow::anyhow!("phone control unavailable"))?;
+    let v: serde_json::Value = serde_json::from_str(text)?;
+    match v["type"].as_str().unwrap_or("") {
+        "tap" | "swipe" => {
+            let n = |key: &str| -> Result<i64> {
+                v[key]
+                    .as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("invalid coordinate"))
+            };
+            let (w, h, x, y) = (n("screenWidth")?, n("screenHeight")?, n("x")?, n("y")?);
+            let swipe = v["type"] == "swipe";
+            let (end_x, end_y) = if swipe {
+                (n("endX")?, n("endY")?)
+            } else {
+                (x, y)
+            };
+            let duration = if swipe { n("durationMs")? } else { 40 };
+            if !(1..=16384).contains(&w)
+                || !(1..=16384).contains(&h)
+                || !(20..=1000).contains(&duration)
+                || [x, end_x].iter().any(|p| *p < 0 || *p >= w)
+                || [y, end_y].iter().any(|p| *p < 0 || *p >= h)
+            {
+                anyhow::bail!("invalid gesture");
+            }
+            control
+                .inject_touch(
+                    TouchAction::Down,
+                    x as i32,
+                    y as i32,
+                    w as u16,
+                    h as u16,
+                    0,
+                    1.0,
+                )
+                .await?;
+            let movement = async {
+                let steps = if swipe { 10 } else { 1 };
+                for i in 1..=steps {
+                    tokio::time::sleep(Duration::from_millis((duration / steps) as u64)).await;
+                    if swipe {
+                        control
+                            .inject_touch(
+                                TouchAction::Move,
+                                (x + (end_x - x) * i / steps) as i32,
+                                (y + (end_y - y) * i / steps) as i32,
+                                w as u16,
+                                h as u16,
+                                0,
+                                1.0,
+                            )
+                            .await?;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            let release = control
+                .inject_touch(
+                    TouchAction::Up,
+                    end_x as i32,
+                    end_y as i32,
+                    w as u16,
+                    h as u16,
+                    0,
+                    0.0,
+                )
+                .await;
+            movement?;
+            release?;
+        }
+        "text" => {
+            let value = v["content"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid text"))?;
+            if value.len() > 4096 {
+                anyhow::bail!("text too large");
+            }
+            if value.is_ascii() {
+                control.inject_text(value).await?;
+            } else {
+                // Android key-event text injection cannot represent CJK. The
+                // native scrcpy paste path accepts UTF-8 under the same gate.
+                control.set_clipboard(value, true).await?;
+            }
+        }
+        "back" | "home" => {
+            let key = if v["type"] == "back" { 4 } else { 3 };
+            let down = control.inject_keycode(KeyAction::Down, key, 0, 0).await;
+            let up = control.inject_keycode(KeyAction::Up, key, 0, 0).await;
+            down?;
+            up?;
+        }
+        _ => anyhow::bail!("unsupported managed phone action"),
+    }
+    Ok(())
+}
+
 async fn forward_control(
     text: &str,
     control: Option<&Arc<ControlSocket>>,
@@ -4148,6 +4295,7 @@ mod tests {
     /// field. Individual tests override the subset they exercise.
     fn make_cli() -> Cli {
         Cli {
+            native_stdio: false,
             device_id: "dev-test".into(),
             adb_serial: "127.0.0.1:5555".into(),
             adb_host: "127.0.0.1".into(),

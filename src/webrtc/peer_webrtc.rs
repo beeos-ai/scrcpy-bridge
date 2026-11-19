@@ -85,6 +85,7 @@ pub struct IceServer {
 
 #[derive(Debug, Clone)]
 pub struct PeerOptions {
+    pub force_relay: Option<bool>,
     pub ice_servers: Vec<IceServer>,
     /// Retained for API compatibility with the old transport. webrtc-rs owns
     /// its sockets and binds an ephemeral IPv4 UDP port itself.
@@ -103,6 +104,7 @@ impl Default for PeerOptions {
     fn default() -> Self {
         Self {
             ice_servers: vec![],
+            force_relay: None,
             local_bind: "0.0.0.0:0".parse().expect("valid bind address"),
             extra_local_ips: vec![],
             ice_gather_wait: Duration::ZERO,
@@ -804,7 +806,9 @@ async fn run_peer(
             "dropping ICE URLs webrtc-rs cannot gather (TCP TURN / TURNS)"
         );
     }
-    let force_relay = has_turn_server(&usable_ice_servers);
+    let force_relay = opts
+        .force_relay
+        .unwrap_or_else(|| has_turn_server(&usable_ice_servers));
     let config = RTCConfiguration {
         ice_servers: usable_ice_servers
             .iter()
