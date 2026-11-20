@@ -249,6 +249,9 @@ impl ScrcpyServer {
 
         let mut cmd = Command::new("adb");
         cmd.args(&base_args);
+        // The parent may own a native signaling pipe on stdin. adb shell must
+        // never inherit it and consume authorization frames meant for us.
+        cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);

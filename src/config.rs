@@ -10,6 +10,10 @@ use clap::Parser;
     version
 )]
 pub struct Cli {
+    /// Use inherited JSON pipes for signaling and input authorization.
+    #[arg(long)]
+    pub native_stdio: bool,
+
     /// Device id. Used only for (a) the MQTT client id suffix
     /// (`scrcpy-bridge-<device_id>`) and (b) log tagging.
     ///
@@ -168,7 +172,12 @@ pub struct Cli {
     /// broker credentials. Authentication is Ed25519 using the private key
     /// at `--bridge-private-key-file` matching the public key bound to the
     /// instance on the control plane.
-    #[arg(long, env = "AGENT_GATEWAY_URL")]
+    #[arg(
+        long,
+        env = "AGENT_GATEWAY_URL",
+        required_unless_present = "native_stdio",
+        default_value = ""
+    )]
     pub agent_gateway_url: String,
 
     /// Path to the Ed25519 private key.
@@ -189,7 +198,12 @@ pub struct Cli {
     ///   extracts the appropriate field on each call. This is how
     ///   `beeos device attach` wires scrcpy-bridge alongside device-agent
     ///   without duplicating key material.
-    #[arg(long, env = "BRIDGE_PRIVATE_KEY_FILE")]
+    #[arg(
+        long,
+        env = "BRIDGE_PRIVATE_KEY_FILE",
+        required_unless_present = "native_stdio",
+        default_value = ""
+    )]
     pub bridge_private_key_file: String,
 
     /// Path to the matching Ed25519 public key.
@@ -199,7 +213,12 @@ pub struct Cli {
     /// resolve the instance without walking the key store on every
     /// request. For the `.key.json` layout this path MAY equal
     /// `--bridge-private-key-file`.
-    #[arg(long, env = "BRIDGE_PUBLIC_KEY_FILE")]
+    #[arg(
+        long,
+        env = "BRIDGE_PUBLIC_KEY_FILE",
+        required_unless_present = "native_stdio",
+        default_value = ""
+    )]
     pub bridge_public_key_file: String,
 
     /// Wheel-to-scroll sensitivity multiplier applied to the *coalesced*

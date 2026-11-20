@@ -3,7 +3,7 @@
 //! A standalone, Rust-native WebRTC gateway that translates scrcpy's Android
 //! screen-mirror protocol into a browser-consumable WebRTC stream.
 //!
-//! ### Zero-coupling design
+//! ### MQTT and managed signaling
 //!
 //! This process runs SIDE BY SIDE with the Python `device-agent`. The two are
 //! independent sibling processes that share nothing except:
@@ -11,7 +11,7 @@
 //!   2. the MQTT broker (disjoint topic subtrees)
 //!   3. the physical device (different ADB command paths)
 //!
-//! There is NO IPC. Either can crash without affecting the other.
+//! Managed mode uses inherited pipes for signaling and input authorization.
 //!
 //! ### Modules
 //!
@@ -40,6 +40,7 @@ pub mod datachannel;
 pub mod mqtt;
 pub mod observability;
 pub mod scrcpy;
+pub mod signaling;
 pub mod webrtc;
 
 /// Embedded scrcpy-server JAR, downloaded by `build.rs`.
