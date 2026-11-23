@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   mirror:
-    runs-on: [self-hosted, linux, x64, oci, shared-ci]
+    runs-on: ubuntu-24.04
     environment: production
     timeout-minutes: 20
     steps:
