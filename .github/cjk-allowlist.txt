@@ -1,0 +1,2 @@
+# CJK lines allowed in this English-only repository (scripts/cjk_check.py): <path glob> | <line regex or empty> | <reason>
+src/scrcpy/control.rs | | UTF-8 length test of the text control message with multi-byte CJK characters
